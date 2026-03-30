@@ -1,0 +1,63 @@
+# 数据集配置
+dataset:
+  name: "ClassicalMusicREMI"
+  version: "1.0"
+  description: "Classical music dataset for REMI-based music generation"
+  
+  # 数据源配置
+  sources:
+    - name: "Chopin Complete Works"
+      path: "./data/raw/chopin"
+      format: "musicxml"
+      expected_files: 250
+    
+    - name: "Bach Chorales"
+      path: "./data/raw/bach"
+      format: "musicxml"
+      expected_files: 371
+    
+    - name: "Beethoven Sonatas"
+      path: "./data/raw/beethoven"
+      format: "musicxml"
+      expected_files: 32
+  
+  # 预处理配置
+  preprocessing:
+    min_notes_per_file: 50
+    max_notes_per_file: 5000
+    max_sequence_length: 2048
+    min_tokens_per_sequence: 100
+    max_tokens_per_sequence: 2000
+    
+    # REMI转换配置
+    remi:
+      grid_size: 16
+      velocity_levels: 8
+      include_articulations: true
+      include_dynamics: true
+      include_ornaments: true
+      include_pedal: true
+  
+  # 数据集划分
+  splitting:
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+    random_seed: 42
+    stratify_by: ["composer", "genre"]  # 按作曲家和体裁分层
+  
+  # 存储配置
+  storage:
+    processed_dir: "./data/processed"
+    cache_dir: "./data/cache"
+    token_dir: "./data/processed/tokens"
+    metadata_dir: "./data/processed/metadata"
+    max_cache_size: "10GB"  # 最大缓存大小
+  
+  # 质量检查
+  quality_checks:
+    check_duplicates: true
+    check_corrupted: true
+    validate_musicxml: true
+    min_file_size_kb: 10
+    max_file_size_mb: 10
