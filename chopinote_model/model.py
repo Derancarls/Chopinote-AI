@@ -222,6 +222,7 @@ class MusicTransformer(nn.Module):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=self.config.pad_token_id,
-            reduction='mean',
+            reduction='sum',
         )
+        loss = loss / max(1, (shift_labels != self.config.pad_token_id).sum())
         return loss

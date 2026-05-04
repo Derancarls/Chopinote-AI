@@ -127,12 +127,16 @@ class MusicXMLToREMI:
 
                     # 渐强/渐弱记号 (hairpin)
                     elif isinstance(elem, dynamics.Crescendo):
-                        ht = 'cresc' if 'cresc' in elem.type.lower() else 'dim'
                         extra.append((measure_idx, pos, part_idx,
-                                      REMITokenizer.HAIRPIN, ht))
+                                      REMITokenizer.HAIRPIN, 'cresc'))
+                    elif isinstance(elem, dynamics.Diminuendo):
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.HAIRPIN, 'dim'))
 
                     # 速度标记
                     elif isinstance(elem, tempo.MetronomeMark):
+                        if elem.number is None:
+                            continue  # 跳过文字型速度标记 (如 "Andante")
                         bpm = int(round(max(30, min(240, elem.number))))
                         bpm = (bpm // 10) * 10  # 量化到 10 的倍数
                         extra.append((measure_idx, 0, part_idx,

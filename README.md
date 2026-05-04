@@ -4,6 +4,29 @@
 
 ---
 
+## v0.1.0-Beta4 (2026-05-04)
+
+### 新增
+- CLI 命令行续写工具 `chopinote-generate`（交互式参数、KV cache、tqdm 进度条）
+- `pyproject.toml`：`pip install -e .` 可一键安装依赖
+- 乐谱标记词表扩展（175 → 236）：谱号、力度、渐强/渐弱、演奏法、装饰音、踏板、连奏线、反复、跳转、速度
+
+### 修复
+- `converter.py`: `Diminuendo` 渐弱记号未被捕获，训练数据丢失渐弱事件
+- `converter.py`: `MetronomeMark.number is None` 时崩溃（文字型速度标记如 "Andante"）
+- `model.py`: 因果掩码在 KV cache 推理时错误应用（改为仅首次 forward 应用）
+- `train.py`: Weight tying 导致 Embedding 层梯度累加两次，等效学习率翻倍（Optimizer 参数去重）
+- `train.py`: CrossEntropy `reduction='mean'` 全 mask 时 NaN（改为 `sum` + 安全除法，共 3 处）
+- `train.py`: Scheduler 按 batch step 而非 optimizer step 调度，warmup 与 decay 提前结束
+- `generate.py`: 独立 `generate()` 无 KV cache，每步重算全序列注意力 O(T²)
+- `generate.py`: Session 状态泄漏（训练→评估切换后 `model.eval()` 未在后续训练步恢复）
+- `generate.py`: 删除无用 import（`key as key21`, `bar`）
+
+### 移除
+- `generate.py` 独立 `generate()` 函数改为使用 KV cache，兼容旧调用接口
+
+---
+
 ## v0.1.0-beta1 (2026-05-04)
 
 ### 新增

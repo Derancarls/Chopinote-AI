@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from music21 import stream, note, chord, meter, key as key21, clef, bar
+from music21 import stream, note, chord, meter, clef
 
 from .model import MusicTransformer
 from .config import ModelConfig
@@ -19,7 +19,7 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
              seed_tokens: list[int], max_bars: int = 32,
              max_new_tokens: int = 4096, temperature: float = 1.0,
              top_k: int = 20) -> list[int]:
-    """自回归生成 token 序列。
+    """自回归生成 token 序列 (使用 KV cache)。
 
     Args:
         model: 训练好的模型
@@ -40,25 +40,33 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
     bar_id = tokenizer.bar_token_id
     eos_id = tokenizer.eos_token_id
 
+    # 初始化 KV cache
+    kv_caches = [[None, None] for _ in range(model.config.n_layers)]
+
     generated = seed.clone()
     bar_count = seed_tokens.count(bar_id)
 
-    for _ in range(max_new_tokens):
-        # 如果序列太长，取最后 max_seq_len 个 token
-        ctx = generated[:, -model.config.max_seq_len:]
+    # 首轮 forward 处理全部 seed
+    next_token = seed
+    ctx_len = seed.size(1)
 
-        logits = model(ctx)  # (1, T, V)
-        next_logits = logits[:, -1, :] / temperature  # (1, V)
+    for _ in range(max_new_tokens):
+        if ctx_len > model.config.max_seq_len:
+            next_token = generated[:, -1:]
+
+        logits = model.forward(next_token, kv_caches=kv_caches)  # (1, T', V)
+        logits = logits[:, -1, :] / temperature  # (1, V)
 
         # top-k
         if top_k > 0:
-            vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
-            next_logits[next_logits < vals[:, -1:]] = float('-inf')
+            vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < vals[:, -1:]] = float('-inf')
 
-        probs = F.softmax(next_logits, dim=-1)
+        probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
 
         generated = torch.cat([generated, next_token], dim=1)
+        ctx_len = generated.size(1)
         token_id = next_token.item()
 
         if token_id == bar_id:

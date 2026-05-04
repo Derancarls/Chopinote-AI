@@ -36,8 +36,10 @@ class Trainer:
         self.train_config = train_config
         self.device = device
 
+        # 去重参数（weight tying 会导致同一 tensor 作为多个 Parameter 被 yield）
+        params = list(dict.fromkeys(model.parameters()))
         self.optimizer = AdamW(
-            model.parameters(),
+            params,
             lr=train_config.lr,
             weight_decay=0.1,
             betas=(0.9, 0.95),
@@ -122,8 +124,9 @@ class Trainer:
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
                     ignore_index=-100,
-                    reduction='mean',
+                    reduction='sum',
                 )
+                loss = loss / max(1, (labels != -100).sum())
                 # 先记录未除 grad_accum 的真实 loss，再做归一化 backward
                 total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
@@ -181,8 +184,9 @@ class Trainer:
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
                 ignore_index=-100,
-                reduction='mean',
+                reduction='sum',
             )
+            loss = loss / max(1, (labels != -100).sum())
             total_loss += loss.item()
             num_batches += 1
 
