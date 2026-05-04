@@ -57,7 +57,11 @@ class CausalSelfAttention(nn.Module):
         # attention scores
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))  # (B, H, T, T')
         T_k = k.size(2)
-        att = att.masked_fill(self.causal_mask[:, :, T - 1, :T_k] == 0, float('-inf'))
+
+        # 因果掩码：只在首次 forward（无 KV cache）时应用，
+        # 后续生成时 k 中只有历史 token，无需额外因果掩码
+        if kv_cache is None or kv_cache[0] is None:
+            att = att.masked_fill(self.causal_mask[:, :, :T, :T_k] == 0, float('-inf'))
 
         # padding mask
         if mask is not None:
