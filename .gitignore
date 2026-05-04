@@ -1,29 +1,35 @@
-__pycache__/
-*.pyc
-*.pyo
-.env
-.venv/
-venv/
-music_ai_env/
-
 # 项目临时文件
 structure.txt
 .DS_Store
 
-# 生成的训练数据
-data/processed/
-
 # Claude 配置
 .claude/
 
-# 随机生成的测试输出
-output_*.musicxml
+# Python 虚拟环境
+music_ai_env/
+music_ai_cuda_env/
+.venv/
+venv/
+
+# pip 构建产物
+*.egg-info/
 
 # 训练产物
 checkpoints/
+logs/
 
-# Python 3.12 CUDA 虚拟环境
-music_ai_cuda_env/
+# 生成数据
+data/processed/
+data/cache/
 
 # 原始数据文件
 chopinote_dataset/data/
+
+# 生成的乐谱输出
+output_*.musicxml
+test_output*.musicxml
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
