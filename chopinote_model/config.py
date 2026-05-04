@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数。"""
-    vocab_size: int = 175
+    vocab_size: int = 236
     d_model: int = 256
     n_layers: int = 6
     n_heads: int = 8

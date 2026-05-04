@@ -6,7 +6,10 @@ import os
 from typing import List, Tuple, Optional
 import logging
 
-from music21 import converter, stream, note, chord, clef
+from music21 import (
+    converter, stream, note, chord, clef,
+    dynamics, tempo, bar, expressions, spanner, repeat,
+)
 
 from .tokenizer import REMITokenizer
 
@@ -70,6 +73,20 @@ class MusicXMLToREMI:
             }
         return token_ids, metadata
 
+    def _clef_name(self, c) -> str:
+        """Clef 对象 → 规范名称 (treble/bass/alto/tenor)。"""
+        sign = c.sign.lower()
+        line = c.line if c.line is not None else 2
+        if sign == 'g':
+            return 'treble'
+        elif sign == 'f':
+            return 'bass'
+        elif sign == 'c':
+            return 'alto' if line == 3 else 'tenor' if line == 4 else f'c_{line}'
+        elif sign == 'percussion':
+            return 'percussion'
+        return sign
+
     def _score_to_events(self, score) -> List[Tuple[str, Optional[int]]]:
         """music21 Score → REMI 事件列表。"""
         parts = list(score.parts)
@@ -78,7 +95,10 @@ class MusicXMLToREMI:
 
         left_idx, right_idx = self._identify_hands(parts)
 
-        # 收集所有音符信息: (measure_idx, position, part_idx, pitch, vel_level, dur)
+        # 收集两类事件:
+        #   events: (measure, pos, part_idx, token_type, value) — 非音符标记
+        #   notes:  (measure, pos, part_idx, pitch, vel, dur) — 音符
+        extra: List[Tuple[int, int, int, str, Optional[int]]] = []
         all_notes: List[Tuple[int, int, int, int, int, int]] = []
 
         for part_idx, part in enumerate(parts):
@@ -88,16 +108,103 @@ class MusicXMLToREMI:
                     continue
 
                 positions_in_measure = max(1, int(measure_dur / self.quarter_per_position))
+                flat = measure.flatten()
 
-                for elem in measure.flatten().notesAndRests:
+                # ── 非音符标记提取 ──────────────────────────
+                for elem in flat:
+                    pos = min(positions_in_measure - 1,
+                              int(round(elem.offset / self.quarter_per_position)))
+
+                    # 谱号
+                    if isinstance(elem, clef.Clef):
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.CLEF, self._clef_name(elem)))
+
+                    # 力度记号 (pp, ff 等)
+                    elif isinstance(elem, dynamics.Dynamic):
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.DYNAMIC, elem.value))
+
+                    # 渐强/渐弱记号 (hairpin)
+                    elif isinstance(elem, dynamics.Crescendo):
+                        ht = 'cresc' if 'cresc' in elem.type.lower() else 'dim'
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.HAIRPIN, ht))
+
+                    # 速度标记
+                    elif isinstance(elem, tempo.MetronomeMark):
+                        bpm = int(round(max(30, min(240, elem.number))))
+                        bpm = (bpm // 10) * 10  # 量化到 10 的倍数
+                        extra.append((measure_idx, 0, part_idx,
+                                      REMITokenizer.TEMPO, bpm))
+
+                    # 反复小节线 (bar.Repeat 是 Barline 子类)
+                    elif isinstance(elem, bar.Repeat):
+                        extra.append((measure_idx, 0, part_idx,
+                                      REMITokenizer.REPEAT, elem.direction))
+
+                    # 普通小节线（跳过）
+                    elif isinstance(elem, bar.Barline):
+                        pass
+
+                    # 跳转标记 (Da Capo / Dal Segno / Segno / Coda / Fine)
+                    elif isinstance(elem, repeat.DaCapo):
+                        extra.append((measure_idx, 0, part_idx, REMITokenizer.JUMP, 'da_capo'))
+                    elif isinstance(elem, repeat.DalSegno):
+                        extra.append((measure_idx, 0, part_idx, REMITokenizer.JUMP, 'dal_segno'))
+                    elif isinstance(elem, repeat.Segno):
+                        extra.append((measure_idx, 0, part_idx, REMITokenizer.JUMP, 'segno'))
+                    elif isinstance(elem, repeat.Coda):
+                        extra.append((measure_idx, 0, part_idx, REMITokenizer.JUMP, 'coda'))
+                    elif isinstance(elem, repeat.Fine):
+                        extra.append((measure_idx, 0, part_idx, REMITokenizer.JUMP, 'fine'))
+
+                    # 反复括号 (Volta)
+                    elif isinstance(elem, spanner.RepeatBracket):
+                        extra.append((measure_idx, 0, part_idx,
+                                      REMITokenizer.REPEAT, f'volta_{elem.number}'))
+
+                    # 踏板
+                    elif isinstance(elem, expressions.PedalMark):
+                        ped_type = 'start' if getattr(elem, 'type', 0) in (0, 'start') else 'end'
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.PEDAL, ped_type))
+
+                    # 连奏线
+                    elif isinstance(elem, spanner.Slur):
+                        slur_type = 'start' if getattr(elem, 'type', 'start') == 'start' else 'end'
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.SLUR, slur_type))
+
+                    # 延长记号
+                    elif isinstance(elem, expressions.Fermata):
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.ARTIC, 'fermata'))
+
+                # ── 音符提取 ────────────────────────────────
+                for elem in flat.notesAndRests:
                     if isinstance(elem, note.Rest):
                         continue
 
-                    offset = elem.offset  # quarter length from measure start
+                    offset = elem.offset
                     pos = min(positions_in_measure - 1,
                               int(round(offset / self.quarter_per_position)))
 
-                    # 获取音符集合
+                    # 音符上的演奏法标记
+                    for art in elem.articulations:
+                        art_name = art.__class__.__name__.lower()
+                        if art_name in ('staccato', 'accent', 'tenuto', 'marcato', 'pizzicato'):
+                            extra.append((measure_idx, pos, part_idx,
+                                          REMITokenizer.ARTIC, art_name))
+
+                    # 音符上的装饰音
+                    for expr in getattr(elem, 'expressions', []):
+                        exp_name = expr.__class__.__name__.lower()
+                        if exp_name in ('trill', 'mordent', 'turn', 'tremolo'):
+                            extra.append((measure_idx, pos, part_idx,
+                                          REMITokenizer.ORNAMENT, exp_name))
+
+                    # 获取音高
                     if isinstance(elem, note.Note):
                         pitches = [elem.pitch.midi]
                     elif isinstance(elem, chord.Chord):
@@ -115,11 +222,17 @@ class MusicXMLToREMI:
                     for p in pitches:
                         all_notes.append((measure_idx, pos, part_idx, p, vel_level, dur_positions))
 
-        if not all_notes:
+        if not all_notes and not extra:
             return []
 
-        # 按 (measure, position, part_idx) 排序 → 保证输出顺序
-        all_notes.sort(key=lambda x: (x[0], x[1], x[2]))
+        # 合并两类事件，按 (measure, position, part_idx) 排序
+        merged: List[Tuple[int, int, int, str, tuple]] = []
+        for m_idx, pos, p_idx, ttype, val in extra:
+            merged.append((m_idx, pos, p_idx, 'x', (ttype, val)))
+        for m_idx, pos, p_idx, p, vl, dr in all_notes:
+            merged.append((m_idx, pos, p_idx, 'n', (p, vl, dr)))
+
+        merged.sort(key=lambda x: (x[0], x[1], x[2]))
 
         # 组装事件序列
         events: List[Tuple[str, Optional[int]]] = []
@@ -127,10 +240,10 @@ class MusicXMLToREMI:
         cur_pos = -1
         cur_part = -1
 
-        for measure_idx, pos, part_idx, pitch, vel_level, dur in all_notes:
-            if measure_idx != cur_measure:
+        for m, pos, p_idx, kind, data in merged:
+            if m != cur_measure:
                 events.append((REMITokenizer.BAR, None))
-                cur_measure = measure_idx
+                cur_measure = m
                 cur_pos = -1
                 cur_part = -1
 
@@ -139,15 +252,19 @@ class MusicXMLToREMI:
                 cur_pos = pos
                 cur_part = -1
 
-            # 同一 position 内手切换时才 track token
-            if part_idx != cur_part:
-                track = REMITokenizer.TRACK_R if part_idx == right_idx else REMITokenizer.TRACK_L
+            if p_idx != cur_part:
+                track = REMITokenizer.TRACK_R if p_idx == right_idx else REMITokenizer.TRACK_L
                 events.append((track, None))
-                cur_part = part_idx
+                cur_part = p_idx
 
-            events.append((REMITokenizer.NOTE_ON, pitch))
-            events.append((REMITokenizer.VELOCITY, vel_level))
-            events.append((REMITokenizer.DURATION, dur))
+            if kind == 'x':
+                ttype, val = data
+                events.append((ttype, val))
+            else:  # 'n' — note
+                pitch, vel_level, dur = data
+                events.append((REMITokenizer.NOTE_ON, pitch))
+                events.append((REMITokenizer.VELOCITY, vel_level))
+                events.append((REMITokenizer.DURATION, dur))
 
         return events
 
