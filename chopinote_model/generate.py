@@ -124,6 +124,12 @@ def tokens_to_notes(token_ids: list[int],
                 'duration': dur,
             })
             i += 1
+        elif etype in (REMITokenizer.CLEF, REMITokenizer.DYNAMIC, REMITokenizer.HAIRPIN,
+                       REMITokenizer.ARTIC, REMITokenizer.ORNAMENT,
+                       REMITokenizer.PEDAL, REMITokenizer.SLUR,
+                       REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO):
+            i += 1
+            continue
         else:
             i += 1
 
@@ -185,16 +191,21 @@ def notes_to_score(notes_list: list[dict],
 
                 if len(notes_at_pos) == 1:
                     n = notes_at_pos[0]
+                    # 限制时值不超出小节边界
+                    dur_clamped = min(n['duration'], grid_size - n['position'])
+                    dur_clamped = max(1, dur_clamped)
                     nt = note21.Note(n['pitch'])
-                    nt.duration = dur21.Duration(n['duration'] * quarter_per_pos)
+                    nt.duration = dur21.Duration(dur_clamped * quarter_per_pos)
                     nt.volume.velocity = min(127, n['velocity'] * 16)
                     meas.insert(offset, nt)
                 else:
                     # 和弦
                     chord_notes = []
                     for n in notes_at_pos:
+                        dur_clamped = min(n['duration'], grid_size - n['position'])
+                        dur_clamped = max(1, dur_clamped)
                         nt = note21.Note(n['pitch'])
-                        nt.duration = dur21.Duration(n['duration'] * quarter_per_pos)
+                        nt.duration = dur21.Duration(dur_clamped * quarter_per_pos)
                         chord_notes.append(nt)
                     ch = chord.Chord(chord_notes)
                     meas.insert(offset, ch)
