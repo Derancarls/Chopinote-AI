@@ -15,3 +15,6 @@ data/processed/
 
 # Claude 配置
 .claude/
+
+# 随机生成的测试输出
+output_*.musicxml
