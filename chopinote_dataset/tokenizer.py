@@ -32,6 +32,18 @@ class REMITokenizer:
     VELOCITY = '<Velocity'
     DURATION = '<Duration'
 
+    # --- 扩展 token 类型 ---
+    CLEF = '<Clef'              # 谱号: treble, bass, alto, tenor
+    DYNAMIC = '<Dynamic'        # 力度记号: ppp, pp, p, mp, mf, f, ff, fff, sfz, fp
+    HAIRPIN = '<Hairpin'        # 渐强/渐弱: cresc, dim
+    ARTIC = '<Artic'            # 演奏法: staccato, accent, tenuto, marcato, pizzicato, fermata
+    ORNAMENT = '<Ornament'      # 装饰音: trill, mordent, turn, tremolo
+    PEDAL = '<Pedal'            # 踏板: start, end
+    SLUR = '<Slur'              # 连奏线: start, end
+    REPEAT = '<Repeat'          # 反复: start, end, volta_1, volta_2
+    JUMP = '<Jump'              # 跳转: da_capo, dal_segno, segno, coda, fine
+    TEMPO = '<Tempo'            # 速度: 30-240, 步长 10
+
     def __init__(self, grid_size: int = 16, velocity_levels: int = 8):
         self.grid_size = grid_size
         self.velocity_levels = velocity_levels
@@ -84,6 +96,78 @@ class REMITokenizer:
         # <Duration 1> .. <Duration grid_size>
         for d in range(1, self.grid_size + 1):
             t = f'{self.DURATION} {d}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # ── 扩展 token 类型 ──────────────────────────────────
+
+        # <Clef treble>, <Clef bass>, <Clef alto>, <Clef tenor>
+        for clef_name in ('treble', 'bass', 'alto', 'tenor'):
+            t = f'{self.CLEF} {clef_name}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Dynamic ppp> .. <Dynamic fp>
+        for dyn in ('ppp', 'pp', 'p', 'mp', 'mf', 'f', 'ff', 'fff', 'sfz', 'fp'):
+            t = f'{self.DYNAMIC} {dyn}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Hairpin cresc>, <Hairpin dim>
+        for hp in ('cresc', 'dim'):
+            t = f'{self.HAIRPIN} {hp}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Artic staccato> .. <Artic fermata>
+        for art in ('staccato', 'accent', 'tenuto', 'marcato', 'pizzicato', 'fermata'):
+            t = f'{self.ARTIC} {art}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Ornament trill>, <Ornament mordent>, <Ornament turn>, <Ornament tremolo>
+        for orn in ('trill', 'mordent', 'turn', 'tremolo'):
+            t = f'{self.ORNAMENT} {orn}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Pedal start>, <Pedal end>
+        for ped in ('start', 'end'):
+            t = f'{self.PEDAL} {ped}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Slur start>, <Slur end>
+        for sl in ('start', 'end'):
+            t = f'{self.SLUR} {sl}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Repeat start>, <Repeat end>, <Repeat volta_1>, <Repeat volta_2>
+        for rpt in ('start', 'end', 'volta_1', 'volta_2'):
+            t = f'{self.REPEAT} {rpt}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Jump da_capo>, <Jump dal_segno>, <Jump segno>, <Jump coda>, <Jump fine>
+        for jmp in ('da_capo', 'dal_segno', 'segno', 'coda', 'fine'):
+            t = f'{self.JUMP} {jmp}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Tempo 30> .. <Tempo 240> (step 10)
+        for bpm in range(30, 241, 10):
+            t = f'{self.TEMPO} {bpm}>'
             self._token_to_id[t] = idx
             self._id_to_token[idx] = t
             idx += 1
@@ -148,4 +232,34 @@ class REMITokenizer:
             elif token.startswith(self.DURATION):
                 val = int(token[len(self.DURATION) + 1:-1])
                 events.append((self.DURATION, val))
+            elif token.startswith(self.CLEF):
+                val = token[len(self.CLEF) + 1:-1]
+                events.append((self.CLEF, val))
+            elif token.startswith(self.DYNAMIC):
+                val = token[len(self.DYNAMIC) + 1:-1]
+                events.append((self.DYNAMIC, val))
+            elif token.startswith(self.HAIRPIN):
+                val = token[len(self.HAIRPIN) + 1:-1]
+                events.append((self.HAIRPIN, val))
+            elif token.startswith(self.ARTIC):
+                val = token[len(self.ARTIC) + 1:-1]
+                events.append((self.ARTIC, val))
+            elif token.startswith(self.ORNAMENT):
+                val = token[len(self.ORNAMENT) + 1:-1]
+                events.append((self.ORNAMENT, val))
+            elif token.startswith(self.PEDAL):
+                val = token[len(self.PEDAL) + 1:-1]
+                events.append((self.PEDAL, val))
+            elif token.startswith(self.SLUR):
+                val = token[len(self.SLUR) + 1:-1]
+                events.append((self.SLUR, val))
+            elif token.startswith(self.REPEAT):
+                val = token[len(self.REPEAT) + 1:-1]
+                events.append((self.REPEAT, val))
+            elif token.startswith(self.JUMP):
+                val = token[len(self.JUMP) + 1:-1]
+                events.append((self.JUMP, val))
+            elif token.startswith(self.TEMPO):
+                val = int(token[len(self.TEMPO) + 1:-1])
+                events.append((self.TEMPO, val))
         return events

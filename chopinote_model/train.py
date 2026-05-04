@@ -42,12 +42,16 @@ class Trainer:
             weight_decay=0.1,
             betas=(0.9, 0.95),
         )
+        # 将 batch 为单位的步数转换为 optimizer-step 单位（scheduler 每 grad_accum 才 step 一次）
+        opt_total = max(1, train_config.total_steps // train_config.grad_accum_steps)
+        opt_warmup = max(1, train_config.warmup_steps // train_config.grad_accum_steps)
         self.scheduler = _get_scheduler(
-            self.optimizer, train_config.warmup_steps, train_config.total_steps
+            self.optimizer, opt_warmup, opt_total
         )
 
         self.global_step = 0
         self.best_loss = float('inf')
+        self._last_avg_loss = float('inf')
 
         # 创建输出目录
         Path(train_config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -79,7 +83,7 @@ class Trainer:
 
     def load_checkpoint(self, checkpoint_path: str):
         """恢复 checkpoint。"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -120,10 +124,10 @@ class Trainer:
                     ignore_index=-100,
                     reduction='mean',
                 )
+                # 先记录未除 grad_accum 的真实 loss，再做归一化 backward
+                total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
                 loss.backward()
-
-                total_loss += loss.item()
                 self.global_step += 1
 
                 if self.global_step % config.grad_accum_steps == 0:
@@ -135,6 +139,7 @@ class Trainer:
                 # logging
                 if self.global_step % config.logging_steps == 0:
                     avg_loss = total_loss / config.logging_steps
+                    self._last_avg_loss = avg_loss
                     elapsed = time.time() - start_time
                     logger.info(
                         f'Step {self.global_step}/{config.total_steps} | '
@@ -153,10 +158,10 @@ class Trainer:
 
                 # 保存
                 if self.global_step % config.save_steps == 0:
-                    self.save_checkpoint(total_loss)
+                    self.save_checkpoint(self._last_avg_loss)
 
         # 最终保存
-        self.save_checkpoint(total_loss)
+        self.save_checkpoint(self._last_avg_loss)
         logger.info('训练完成')
 
     @torch.no_grad()
