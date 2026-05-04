@@ -18,3 +18,12 @@ data/processed/
 
 # 随机生成的测试输出
 output_*.musicxml
+
+# 训练产物
+checkpoints/
+
+# Python 3.12 CUDA 虚拟环境
+music_ai_cuda_env/
+
+# 原始数据文件
+chopinote_dataset/data/

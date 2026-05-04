@@ -207,7 +207,6 @@ class MusicTransformer(nn.Module):
 
         return generated
 
-    @torch.no_grad()
     def compute_loss(self, input_ids: torch.Tensor,
                      attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """计算 next-token prediction loss。"""
