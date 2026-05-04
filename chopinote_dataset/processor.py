@@ -59,9 +59,16 @@ class MusicXMLPreprocessor:
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
-        # 初始化转换器和tokenizer
-        self.converter = MusicXMLToREMI()
-        self.tokenizer = REMITokenizer()
+        # 初始化转换器（从配置读取 REMI 参数）
+        remi_cfg = self.config['dataset']['preprocessing']['remi']
+        self.converter = MusicXMLToREMI(
+            grid_size=remi_cfg['grid_size'],
+            velocity_levels=remi_cfg['velocity_levels'],
+        )
+        self.tokenizer = REMITokenizer(
+            grid_size=remi_cfg['grid_size'],
+            velocity_levels=remi_cfg['velocity_levels'],
+        )
         
         # 创建目录
         self._create_directories()
@@ -170,7 +177,7 @@ class MusicXMLPreprocessor:
             
             # 5. 序列长度检查
             if not self._check_sequence_length(tokens):
-                logger.warning(f"序列长度不合适: {file_path}")
+                logger.warning(f"序列长度不合适: {file_path} ({len(tokens)} tokens)")
                 return None
             
             # 6. 保存结果

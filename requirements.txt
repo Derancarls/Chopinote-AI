@@ -1,0 +1,5 @@
+music21>=9.9
+numpy>=1.26
+tqdm>=4.67
+PyYAML>=6.0
+torch>=2.0
