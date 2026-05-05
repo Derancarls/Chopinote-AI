@@ -1,10 +1,10 @@
 """Decoder-only Transformer (GPT 风格) 用于音乐生成。"""
-import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
 
@@ -36,11 +36,10 @@ class CausalSelfAttention(nn.Module):
                 kv_cache: Optional[list] = None) -> torch.Tensor:
         B, T, C = x.shape
 
-        qkv = self.qkv(x)  # (B, T, 3*C)
-        q, k, v = qkv.chunk(3, dim=-1)  # each (B, T, C)
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
 
-        # split heads
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, D)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
@@ -54,26 +53,27 @@ class CausalSelfAttention(nn.Module):
             kv_cache[0] = k
             kv_cache[1] = v
 
-        # attention scores
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))  # (B, H, T, T')
-        T_k = k.size(2)
+        # FlashAttention（自动选择 cuDNN flash / mem-eff / math 后端）
+        if kv_cache is not None and kv_cache[0] is not None:
+            # 推理：单 token → 不需要因果掩码
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=0.0, is_causal=False,
+            )
+        else:
+            # 训练：因果掩码 + 可选 padding 掩码
+            attn_mask = None
+            if mask is not None:
+                causal = self.causal_mask[:, :, :T, :k.size(2)].bool()
+                padding = mask[:, None, None, :k.size(2)].bool()
+                attn_mask = causal & padding
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=attn_mask is None,
+            )
 
-        # 因果掩码：只在首次 forward（无 KV cache）时应用，
-        # 后续生成时 k 中只有历史 token，无需额外因果掩码
-        if kv_cache is None or kv_cache[0] is None:
-            att = att.masked_fill(self.causal_mask[:, :, :T, :T_k] == 0, float('-inf'))
-
-        # padding mask
-        if mask is not None:
-            # mask: (B, T_k) — 1=keep, 0=pad
-            att = att.masked_fill(mask[:, None, None, :T_k] == 0, float('-inf'))
-
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-
-        y = att @ v  # (B, H, T, D)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-
         return self.out_proj(y)
 
 
@@ -94,9 +94,16 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 kv_cache: Optional[list] = None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), mask, kv_cache)
+        if kv_cache is None and self.training:
+            x = x + checkpoint(self._ckpt_attn, self.ln1(x), mask, use_reentrant=False)
+        else:
+            x = x + self.attn(self.ln1(x), mask, kv_cache)
         x = x + self.ffn(self.ln2(x))
         return x
+
+    def _ckpt_attn(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """Gradient checkpointing 包装的注意力前向。"""
+        return self.attn(x, mask, None)
 
 
 class MusicTransformer(nn.Module):
@@ -164,53 +171,6 @@ class MusicTransformer(nn.Module):
 
         return logits
 
-    @torch.no_grad()
-    def generate(self, seed_tokens: torch.Tensor, max_new_tokens: int = 512,
-                 temperature: float = 1.0, top_k: Optional[int] = None,
-                 eos_token_id: int = 2, pad_token_id: int = 0) -> torch.Tensor:
-        """自回归生成。
-
-        Args:
-            seed_tokens: (1, T_seed) 初始 token 序列
-            max_new_tokens: 最多生成步数
-            temperature: 采样温度 (<1 更确定, >1 更随机)
-            top_k: 只从前 k 个最高概率 token 采样
-            eos_token_id: 遇到此 token 停止
-            pad_token_id: 填充 ID
-
-        Returns:
-            (1, T_total) 完整的生成序列
-        """
-        self.eval()
-        device = seed_tokens.device
-        B = seed_tokens.shape[0]
-
-        # 初始化 KV cache
-        kv_caches = [[None, None] for _ in range(self.config.n_layers)]
-
-        generated = seed_tokens.clone()
-        next_token = seed_tokens
-
-        for _ in range(max_new_tokens):
-            logits = self.forward(next_token, kv_caches=kv_caches)  # (1, 1, V)
-            logits = logits[:, -1, :] / temperature  # (1, V)
-
-            # top-k 过滤
-            if top_k is not None:
-                top_k = min(top_k, logits.size(-1))
-                values, _ = torch.topk(logits, top_k, dim=-1)
-                logits[logits < values[:, -1:]] = float('-inf')
-
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
-
-            generated = torch.cat([generated, next_token], dim=1)
-
-            if next_token.item() == eos_token_id:
-                break
-
-        return generated
-
     def compute_loss(self, input_ids: torch.Tensor,
                      attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """计算 next-token prediction loss。"""
@@ -221,8 +181,8 @@ class MusicTransformer(nn.Module):
         loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
-            ignore_index=self.config.pad_token_id,
+            ignore_index=-100,
             reduction='sum',
         )
-        loss = loss / max(1, (shift_labels != self.config.pad_token_id).sum())
+        loss = loss / max(1, (shift_labels != -100).sum())
         return loss

@@ -29,11 +29,12 @@ class REMITokenizer:
     MASK = '<MASK>'
     BAR = '<Bar>'
     POSITION = '<Position'
-    TRACK_L = '<Track_L>'
-    TRACK_R = '<Track_R>'
+    PROGRAM = '<Program'
     NOTE_ON = '<Note_ON'
     VELOCITY = '<Velocity'
     DURATION = '<Duration'
+
+    MAX_SUBTRACKS = 4   # 每乐器最多子轨数（_0 ~ _3）
 
     # --- 扩展 token 类型 ---
     CLEF = '<Clef'              # 谱号: treble, bass, alto, tenor
@@ -49,6 +50,15 @@ class REMITokenizer:
     TUPLET_START = '<TupletStart'  # 连音开始: ratio e.g. 3:2
     TUPLET_END = '<TupletEnd>'     # 连音结束
     TIMESIG = '<TimeSig'           # 拍号: e.g. 4/4, 3/4, 6/8
+    REST = '<Rest>'                # 休止符
+    GRACE_NOTE = '<GraceNote'      # 倚音: acciaccatura, appoggiatura, grace
+    KEY = '<Key'                   # 调号: C, G, D, A, E, B, F#, C#, F, Bb, Eb, Ab, Db, Gb, Cb (major) / Am, Em, ... (minor)
+
+    # 30 个标准调号
+    KEY_NAMES = [
+        'C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#', 'F', 'Bb', 'Eb', 'Ab', 'Db', 'Gb', 'Cb',
+        'Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'D#m', 'A#m', 'Dm', 'Gm', 'Cm', 'Fm', 'Bbm', 'Ebm', 'Abm',
+    ]
 
     # 预定义 tuplet 比率
     TUPLET_RATIOS = [
@@ -92,11 +102,18 @@ class REMITokenizer:
             self._id_to_token[idx] = t
             idx += 1
 
-        # <Track_L>, <Track_R>
-        for t in [self.TRACK_L, self.TRACK_R]:
+        # <Program 0> .. <Program 127>（子轨 0 隐含）
+        # <Program 0_1> .. <Program 127_3>（显式子轨）
+        for prog in range(128):
+            t = f'{self.PROGRAM} {prog}>'
             self._token_to_id[t] = idx
             self._id_to_token[idx] = t
             idx += 1
+            for sub in range(1, self.MAX_SUBTRACKS):
+                t = f'{self.PROGRAM} {prog}_{sub}>'
+                self._token_to_id[t] = idx
+                self._id_to_token[idx] = t
+                idx += 1
 
         # <Note_ON 0> .. <Note_ON 127>
         for pitch in range(128):
@@ -210,6 +227,25 @@ class REMITokenizer:
             self._id_to_token[idx] = t
             idx += 1
 
+        # <Rest>
+        self._token_to_id[self.REST] = idx
+        self._id_to_token[idx] = self.REST
+        idx += 1
+
+        # <GraceNote acciaccatura>, <GraceNote appoggiatura>, <GraceNote grace>
+        for gn in ('acciaccatura', 'appoggiatura', 'grace'):
+            t = f'{self.GRACE_NOTE} {gn}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Key C> .. <Key Abm>（30 个标准调号）
+        for key_name in self.KEY_NAMES:
+            t = f'{self.KEY} {key_name}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
     @property
     def vocab_size(self) -> int:
         return len(self._token_to_id)
@@ -256,8 +292,9 @@ class REMITokenizer:
             token = self.decode_token(tid)
             if token in (self.PAD, self.BOS, self.EOS, self.MASK, self.BAR):
                 events.append((token, None))
-            elif token in (self.TRACK_L, self.TRACK_R):
-                events.append((token, None))
+            elif token.startswith(self.PROGRAM):
+                val = token[len(self.PROGRAM) + 1:-1]  # e.g. "0" or "0_1"
+                events.append((self.PROGRAM, val))
             elif token.startswith(self.POSITION):
                 val = int(token[len(self.POSITION) + 1:-1])
                 events.append((self.POSITION, val))
@@ -308,4 +345,12 @@ class REMITokenizer:
             elif token.startswith(self.TIMESIG):
                 val = token[len(self.TIMESIG) + 1:-1]  # e.g. '4/4'
                 events.append((self.TIMESIG, val))
+            elif token == self.REST:
+                events.append((self.REST, None))
+            elif token.startswith(self.GRACE_NOTE):
+                val = token[len(self.GRACE_NOTE) + 1:-1]  # e.g. 'acciaccatura'
+                events.append((self.GRACE_NOTE, val))
+            elif token.startswith(self.KEY):
+                val = token[len(self.KEY) + 1:-1]  # e.g. 'C', 'Am'
+                events.append((self.KEY, val))
         return events

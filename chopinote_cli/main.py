@@ -132,6 +132,18 @@ def generate_with_progress(
     eos_id = tokenizer.eos_token_id
     bar_id = tokenizer.bar_token_id
 
+    # ── 音高限制准备 ──────────────────────────────────────────
+    from chopinote_model.generate import GM_INSTRUMENT_RANGES, _parse_program
+    note_on_ids = [tokenizer.encode_token(f'<Note_ON {p}>') for p in range(128)]
+    _prog_prefix = '<Program'
+    cur_program: int | None = None
+    for tid in reversed(seed_tokens[0].tolist()):
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith(_prog_prefix):
+            cur_program = _parse_program(ts)
+            break
+    # ──────────────────────────────────────────────────────────
+
     # KV cache 初始化
     kv_caches = [[None, None] for _ in range(model.config.n_layers)]
 
@@ -145,6 +157,15 @@ def generate_with_progress(
         logits = model.forward(next_token, kv_caches=kv_caches)
         logits = logits[:, -1, :] / temperature  # (1, V)
 
+        # ── 音高限制 ──────────────────────────────────────
+        if cur_program is not None and cur_program < 112:
+            rmin, rmax = GM_INSTRUMENT_RANGES.get(cur_program, (0, 127))
+            for pitch in range(rmin):
+                logits[0, note_on_ids[pitch]] = float('-inf')
+            for pitch in range(rmax + 1, 128):
+                logits[0, note_on_ids[pitch]] = float('-inf')
+        # ──────────────────────────────────────────────────
+
         if top_k > 0:
             k = min(top_k, logits.size(-1))
             vals, _ = torch.topk(logits, k, dim=-1)
@@ -155,6 +176,11 @@ def generate_with_progress(
 
         generated = torch.cat([generated, next_token], dim=1)
         token_id = next_token.item()
+
+        # 追踪 Program 变化
+        ts = tokenizer.decode_token(token_id)
+        if ts.startswith(_prog_prefix):
+            cur_program = _parse_program(ts)
 
         if token_id == bar_id:
             bar_count += 1
