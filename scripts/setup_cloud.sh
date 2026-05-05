@@ -4,7 +4,7 @@ set -e
 # ════════════════════════════════════════════════════════
 # Chopinote-AI 云服务器一键部署脚本
 # 用法:
-#   bash scripts/setup_cloud.sh                    # 交互式
+#   bash scripts/setup_cloud.sh                    # 手动上传 data.tar.gz 后运行
 #   bash scripts/setup_cloud.sh --data-url <URL>   # 自动下载数据
 # ════════════════════════════════════════════════════════
 
@@ -76,8 +76,21 @@ else
     echo "    2. 通过 AutoDL 网页上传 data.tar.gz"
     echo "    3. 重新运行本脚本"
     echo ""
+fi
 
-# ── 5. 输出汇总 ─────────────────────────────────────
+# ── 5. 解压 PDMX 原始数据 ────────────────────────────
+PDMX_TAR="data/raw/PDMX.tar.gz"
+PDMX_DIR="data/raw/pdmx_extracted"
+if [ -f "$PDMX_TAR" ] && [ ! -d "$PDMX_DIR" ]; then
+    info "解压 PDMX 原始数据..."
+    mkdir -p "$PDMX_DIR"
+    tar -xzf "$PDMX_TAR" -C "$PDMX_DIR"
+    info "PDMX 数据解压完成"
+elif [ -d "$PDMX_DIR" ]; then
+    info "PDMX 数据已存在，跳过解压"
+fi
+
+# ── 6. 输出汇总 ─────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════"
 echo "  部署完成！"
