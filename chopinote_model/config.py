@@ -4,13 +4,13 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ModelConfig:
-    """Decoder-only Transformer 超参数。"""
-    vocab_size: int = 271
-    d_model: int = 256
-    n_layers: int = 6
+    """Decoder-only Transformer 超参数（适配 RTX 5070 12GB）。"""
+    vocab_size: int = 815
+    d_model: int = 512
+    n_layers: int = 8
     n_heads: int = 8
-    d_ff: int = 1024
-    max_seq_len: int = 2048
+    d_ff: int = 2048
+    max_seq_len: int = 4096
     dropout: float = 0.1
     pad_token_id: int = 0
 
@@ -25,15 +25,15 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """训练配置（已适配 GTX 750 Ti 4GB VRAM）。"""
-    batch_size: int = 2
-    grad_accum_steps: int = 4
-    lr: float = 3e-4
-    warmup_steps: int = 1000
-    total_steps: int = 50000
+    """训练配置（适配 RTX 5070 12GB）。"""
+    batch_size: int = 4
+    grad_accum_steps: int = 8
+    lr: float = 2e-4
+    warmup_steps: int = 2000
+    total_steps: int = 100000
     logging_steps: int = 10
-    save_steps: int = 500
-    eval_steps: int = 500
+    save_steps: int = 1000
+    eval_steps: int = 1000
     output_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     data_dir: str = "data/processed"

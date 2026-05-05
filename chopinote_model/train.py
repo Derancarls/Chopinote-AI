@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.cuda.amp import autocast, GradScaler
 
 from .config import ModelConfig, TrainingConfig
 
@@ -44,6 +45,7 @@ class Trainer:
             weight_decay=0.1,
             betas=(0.9, 0.95),
         )
+        self.scaler = GradScaler(enabled=(device.type == 'cuda'))
         # 将 batch 为单位的步数转换为 optimizer-step 单位（scheduler 每 grad_accum 才 step 一次）
         opt_total = max(1, train_config.total_steps // train_config.grad_accum_steps)
         opt_warmup = max(1, train_config.warmup_steps // train_config.grad_accum_steps)
@@ -67,6 +69,7 @@ class Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
             'loss': loss,
             'config': self.model_config,
         }, path)
@@ -89,6 +92,8 @@ class Trainer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.global_step = checkpoint['step']
         self.best_loss = checkpoint.get('loss', float('inf'))
         logger.info(f'Resumed from checkpoint: {checkpoint_path} (step {self.global_step})')
@@ -110,6 +115,8 @@ class Trainer:
                     f'accum={config.grad_accum_steps} '
                     f'effective_batch={config.effective_batch_size}')
 
+        _vocab_checked = False
+
         while self.global_step < config.total_steps:
             for batch in train_dataloader:
                 if self.global_step >= config.total_steps:
@@ -119,23 +126,32 @@ class Trainer:
                 labels = batch['labels'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
 
-                logits = model(input_ids, attention_mask)
-                loss = nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
-                    ignore_index=-100,
-                    reduction='sum',
-                )
-                loss = loss / max(1, (labels != -100).sum())
+                # 首次 batch 校验 vocab_size
+                if not _vocab_checked:
+                    max_id = max(input_ids.max().item(), labels.max().item() if labels.numel() else 0)
+                    assert max_id < model.config.vocab_size, \
+                        f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}，请更新 ModelConfig.vocab_size 并重新生成 token 数据'
+                    _vocab_checked = True
+
+                with autocast(enabled=(self.device.type == 'cuda')):
+                    logits = model(input_ids, attention_mask)
+                    loss = nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1),
+                        ignore_index=-100,
+                        reduction='sum',
+                    )
+                    loss = loss / max(1, (labels != -100).sum())
                 # 先记录未除 grad_accum 的真实 loss，再做归一化 backward
                 total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
-                loss.backward()
+                self.scaler.scale(loss).backward()
                 self.global_step += 1
 
                 if self.global_step % config.grad_accum_steps == 0:
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
                     scheduler.step()
                     optimizer.zero_grad()
 
@@ -179,7 +195,8 @@ class Trainer:
             labels = batch['labels'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
 
-            logits = self.model(input_ids, attention_mask)
+            with autocast(enabled=(self.device.type == 'cuda')):
+                logits = self.model(input_ids, attention_mask)
             loss = nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
