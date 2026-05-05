@@ -4,6 +4,17 @@
 
 ---
 
+## v0.1.0-Beta5 (2026-05-05)
+
+### 新增
+- Tuplet 连音 token（`<TupletStart 3:2>` / `<TupletEnd>`）：20 种常见比率，支持三连音至 22 连音
+- 拍号 token（`<TimeSig 4/4>` 等 14 种）：词表标记小节拍号变化
+- `tokenizer.py`：词表 236 → 271，detokenize 支持所有新 token 类型
+- `converter.py`：Tuplet 检测（`duration.tuplets`）+ TimeSig 检测（`meter.TimeSignature`），事件合并按 priority 排序
+- `generate.py`：`tokens_to_notes()` 解析 TupletStart/TupletEnd 并标记音符；`notes_to_score()` 按比率缩放偏移和时值，输出 music21 `DurationTuplet`
+
+---
+
 ## v0.1.0-Beta4 (2026-05-04)
 
 ### 新增

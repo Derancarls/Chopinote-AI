@@ -89,6 +89,7 @@ def tokens_to_notes(token_ids: list[int],
     cur_bar = 0
     cur_pos = 0
     cur_track = 'L'
+    cur_tuplet = None  # (actual, normal) or None
     i = 0
 
     while i < len(events):
@@ -111,6 +112,16 @@ def tokens_to_notes(token_ids: list[int],
             cur_track = 'L' if etype == REMITokenizer.TRACK_L else 'R'
             i += 1
             continue
+        elif etype == REMITokenizer.TUPLET_START:
+            # evalue is a string like '3:2'
+            parts = evalue.split(':')
+            cur_tuplet = (int(parts[0]), int(parts[1]))
+            i += 1
+            continue
+        elif etype == REMITokenizer.TUPLET_END:
+            cur_tuplet = None
+            i += 1
+            continue
         elif etype == REMITokenizer.NOTE_ON:
             pitch = evalue
             # 接下来应该是 Velocity 和 Duration
@@ -130,12 +141,14 @@ def tokens_to_notes(token_ids: list[int],
                 'pitch': pitch,
                 'velocity': vel,
                 'duration': dur,
+                'tuplet': cur_tuplet,
             })
             i += 1
         elif etype in (REMITokenizer.CLEF, REMITokenizer.DYNAMIC, REMITokenizer.HAIRPIN,
                        REMITokenizer.ARTIC, REMITokenizer.ORNAMENT,
                        REMITokenizer.PEDAL, REMITokenizer.SLUR,
-                       REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO):
+                       REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO,
+                       REMITokenizer.TIMESIG):
             i += 1
             continue
         else:
@@ -188,6 +201,37 @@ def notes_to_score(notes_list: list[dict],
         l_notes = bars.get(bar_idx, {}).get('L', [])
 
         for hand_notes, meas in [(r_notes, m_right), (l_notes, m_left)]:
+            # Pre-compute tuplet-adjusted offsets and duration scales
+            hand_sorted = sorted(hand_notes, key=lambda n: (n['position'], n['pitch']))
+            for n in hand_sorted:
+                n['_adj_offset'] = n['position'] * quarter_per_pos
+                n['_adj_dur_scale'] = 1.0
+
+            i = 0
+            while i < len(hand_sorted):
+                n = hand_sorted[i]
+                if n.get('tuplet'):
+                    actual, normal = n['tuplet']
+                    j = i
+                    while j < len(hand_sorted) and hand_sorted[j].get('tuplet') == (actual, normal):
+                        j += 1
+                    start_pos = hand_sorted[i]['position']
+                    # unique positions in this tuplet group, in order
+                    seen_pos = []
+                    for k in range(i, j):
+                        p = hand_sorted[k]['position']
+                        if p not in seen_pos:
+                            seen_pos.append(p)
+                    for k in range(i, j):
+                        note = hand_sorted[k]
+                        pos_rank = seen_pos.index(note['position'])
+                        adj_pos = start_pos + pos_rank * (normal / actual)
+                        note['_adj_offset'] = adj_pos * quarter_per_pos
+                        note['_adj_dur_scale'] = normal / actual
+                    i = j
+                else:
+                    i += 1
+
             # 按 position 分组
             pos_groups: dict[int, list] = {}
             for n in hand_notes:
@@ -195,28 +239,37 @@ def notes_to_score(notes_list: list[dict],
 
             for pos in sorted(pos_groups.keys()):
                 notes_at_pos = pos_groups[pos]
-                offset = pos * quarter_per_pos
 
                 if len(notes_at_pos) == 1:
                     n = notes_at_pos[0]
-                    # 限制时值不超出小节边界
                     dur_clamped = min(n['duration'], grid_size - n['position'])
                     dur_clamped = max(1, dur_clamped)
                     nt = note21.Note(n['pitch'])
-                    nt.duration = dur21.Duration(dur_clamped * quarter_per_pos)
+                    nt.duration = dur21.Duration(dur_clamped * n['_adj_dur_scale'] * quarter_per_pos)
                     nt.volume.velocity = min(127, n['velocity'] * 16)
-                    meas.insert(offset, nt)
+                    meas.insert(n['_adj_offset'], nt)
+                    if n.get('tuplet'):
+                        actual, normal = n['tuplet']
+                        t = dur21.Tuplet()
+                        t.numberNotesActual = actual
+                        t.numberNotesNormal = normal
+                        nt.duration.tuplets = (t,)
                 else:
-                    # 和弦
                     chord_notes = []
                     for n in notes_at_pos:
                         dur_clamped = min(n['duration'], grid_size - n['position'])
                         dur_clamped = max(1, dur_clamped)
                         nt = note21.Note(n['pitch'])
-                        nt.duration = dur21.Duration(dur_clamped * quarter_per_pos)
+                        nt.duration = dur21.Duration(dur_clamped * n['_adj_dur_scale'] * quarter_per_pos)
                         chord_notes.append(nt)
                     ch = chord.Chord(chord_notes)
-                    meas.insert(offset, ch)
+                    meas.insert(notes_at_pos[0]['_adj_offset'], ch)
+                    if notes_at_pos[0].get('tuplet'):
+                        actual, normal = notes_at_pos[0]['tuplet']
+                        t = dur21.Tuplet()
+                        t.numberNotesActual = actual
+                        t.numberNotesNormal = normal
+                        ch.duration.tuplets = (t,)
 
         right_part.append(m_right)
         left_part.append(m_left)

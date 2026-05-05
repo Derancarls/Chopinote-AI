@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional
 import logging
 
 from music21 import (
-    converter, stream, note, chord, clef,
+    converter, stream, note, chord, clef, meter,
     dynamics, tempo, bar, expressions, spanner, repeat,
 )
 
@@ -100,6 +100,7 @@ class MusicXMLToREMI:
         #   notes:  (measure, pos, part_idx, pitch, vel, dur) — 音符
         extra: List[Tuple[int, int, int, str, Optional[int]]] = []
         all_notes: List[Tuple[int, int, int, int, int, int]] = []
+        last_timesig: Optional[str] = None
 
         for part_idx, part in enumerate(parts):
             for measure_idx, measure in enumerate(part.getElementsByClass('Measure')):
@@ -185,7 +186,17 @@ class MusicXMLToREMI:
                         extra.append((measure_idx, pos, part_idx,
                                       REMITokenizer.ARTIC, 'fermata'))
 
+                    # 拍号
+                    elif isinstance(elem, meter.TimeSignature):
+                        ts_str = f'{elem.numerator}/{elem.denominator}'
+                        if ts_str in REMITokenizer.TIME_SIGNATURES and ts_str != last_timesig:
+                            extra.append((measure_idx, 0, part_idx,
+                                          REMITokenizer.TIMESIG, ts_str))
+                            last_timesig = ts_str
+
                 # ── 音符提取 ────────────────────────────────
+                current_tuplet: Optional[str] = None
+                last_tuplet_pos: int = 0
                 for elem in flat.notesAndRests:
                     if isinstance(elem, note.Rest):
                         continue
@@ -226,17 +237,48 @@ class MusicXMLToREMI:
                     for p in pitches:
                         all_notes.append((measure_idx, pos, part_idx, p, vel_level, dur_positions))
 
+                    # Tuplet 检测
+                    tuplet_key = None
+                    if elem.duration.tuplets:
+                        t = elem.duration.tuplets[0]
+                        tuplet_key = f'{t.numberNotesActual}:{t.numberNotesNormal}'
+                        if tuplet_key not in REMITokenizer.TUPLET_RATIOS:
+                            tuplet_key = None
+
+                    if tuplet_key != current_tuplet:
+                        if current_tuplet is not None:
+                            extra.append((measure_idx, last_tuplet_pos, part_idx,
+                                          REMITokenizer.TUPLET_END, None))
+                        if tuplet_key is not None:
+                            extra.append((measure_idx, pos, part_idx,
+                                          REMITokenizer.TUPLET_START, tuplet_key))
+                        current_tuplet = tuplet_key
+
+                    if tuplet_key is not None:
+                        last_tuplet_pos = pos
+
+                if current_tuplet is not None:
+                    extra.append((measure_idx, last_tuplet_pos, part_idx,
+                                  REMITokenizer.TUPLET_END, None))
+
         if not all_notes and not extra:
             return []
 
-        # 合并两类事件，按 (measure, position, part_idx) 排序
-        merged: List[Tuple[int, int, int, str, tuple]] = []
+        # 合并两类事件，按 (measure, position, part_idx, priority) 排序
+        # priority: 0=TimeSig, 1=extra(TupletStart/clef/dynamic/etc), 2=note, 3=TupletEnd
+        merged: List[Tuple[int, int, int, int, str, tuple]] = []
         for m_idx, pos, p_idx, ttype, val in extra:
-            merged.append((m_idx, pos, p_idx, 'x', (ttype, val)))
+            if ttype == REMITokenizer.TUPLET_END:
+                priority = 3
+            elif ttype == REMITokenizer.TIMESIG:
+                priority = 0
+            else:
+                priority = 1
+            merged.append((m_idx, pos, p_idx, priority, 'x', (ttype, val)))
         for m_idx, pos, p_idx, p, vl, dr in all_notes:
-            merged.append((m_idx, pos, p_idx, 'n', (p, vl, dr)))
+            merged.append((m_idx, pos, p_idx, 2, 'n', (p, vl, dr)))
 
-        merged.sort(key=lambda x: (x[0], x[1], x[2]))
+        merged.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
 
         # 组装事件序列
         events: List[Tuple[str, Optional[int]]] = []
@@ -244,7 +286,7 @@ class MusicXMLToREMI:
         cur_pos = -1
         cur_part = -1
 
-        for m, pos, p_idx, kind, data in merged:
+        for m, pos, p_idx, _priority, kind, data in merged:
             if m != cur_measure:
                 events.append((REMITokenizer.BAR, None))
                 cur_measure = m
