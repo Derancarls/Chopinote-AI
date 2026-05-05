@@ -16,6 +16,9 @@ class REMITokenizer:
         <Note_ON P>                   — Note on with MIDI pitch (0-127)
         <Velocity V>                  — Velocity level (0 to velocity_levels-1)
         <Duration D>                  — Duration in position steps (1 to grid_size)
+        <TupletStart N:M>             — Tuplet start with ratio
+        <TupletEnd>                   — Tuplet end
+        <TimeSig N/M>                 — Time signature
 
     Vocabulary is built dynamically from grid_size and velocity_levels.
     """
@@ -43,6 +46,22 @@ class REMITokenizer:
     REPEAT = '<Repeat'          # 反复: start, end, volta_1, volta_2
     JUMP = '<Jump'              # 跳转: da_capo, dal_segno, segno, coda, fine
     TEMPO = '<Tempo'            # 速度: 30-240, 步长 10
+    TUPLET_START = '<TupletStart'  # 连音开始: ratio e.g. 3:2
+    TUPLET_END = '<TupletEnd>'     # 连音结束
+    TIMESIG = '<TimeSig'           # 拍号: e.g. 4/4, 3/4, 6/8
+
+    # 预定义 tuplet 比率
+    TUPLET_RATIOS = [
+        '3:2', '5:4', '6:4', '7:4', '7:8', '5:6', '9:8', '10:8',
+        '11:8', '13:8', '14:8', '15:8', '17:8', '19:8', '21:8',
+        '22:8', '2:3', '4:3', '4:5', '4:6',
+    ]
+
+    # 预定义拍号
+    TIME_SIGNATURES = [
+        '2/4', '3/4', '4/4', '5/4', '6/4', '2/2', '3/2', '4/2',
+        '3/8', '6/8', '9/8', '12/8', '5/8', '7/8',
+    ]
 
     def __init__(self, grid_size: int = 16, velocity_levels: int = 8):
         self.grid_size = grid_size
@@ -172,6 +191,25 @@ class REMITokenizer:
             self._id_to_token[idx] = t
             idx += 1
 
+        # <TupletStart 3:2> .. tuplet ratio tokens
+        for ratio in self.TUPLET_RATIOS:
+            t = f'{self.TUPLET_START} {ratio}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <TupletEnd>
+        self._token_to_id[self.TUPLET_END] = idx
+        self._id_to_token[idx] = self.TUPLET_END
+        idx += 1
+
+        # <TimeSig 4/4> .. time signature tokens
+        for ts in self.TIME_SIGNATURES:
+            t = f'{self.TIMESIG} {ts}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
     @property
     def vocab_size(self) -> int:
         return len(self._token_to_id)
@@ -262,4 +300,12 @@ class REMITokenizer:
             elif token.startswith(self.TEMPO):
                 val = int(token[len(self.TEMPO) + 1:-1])
                 events.append((self.TEMPO, val))
+            elif token.startswith(self.TUPLET_START):
+                val = token[len(self.TUPLET_START) + 1:-1]  # e.g. '3:2'
+                events.append((self.TUPLET_START, val))
+            elif token == self.TUPLET_END:
+                events.append((self.TUPLET_END, None))
+            elif token.startswith(self.TIMESIG):
+                val = token[len(self.TIMESIG) + 1:-1]  # e.g. '4/4'
+                events.append((self.TIMESIG, val))
         return events
