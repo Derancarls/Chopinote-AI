@@ -54,21 +54,28 @@ python -c "import torch; print(f'  PyTorch {torch.__version__}, CUDA {torch.vers
 python -c "import music21; print(f'  music21 {music21.__version__}')"
 
 # ── 4. 数据 ──────────────────────────────────────────
+DATA_TAR="$WORK_DIR/data.tar.gz"
 if [ -d "data/processed" ] && [ "$(ls -A data/processed 2>/dev/null)" ]; then
     info "数据已存在: data/ (现有文件已保留)"
+elif [ -f "$DATA_TAR" ]; then
+    info "检测到 $DATA_TAR，解压中..."
+    tar -xzf "$DATA_TAR" -C "$WORK_DIR"
+    rm "$DATA_TAR"
+    info "数据解压完成"
 elif [ -n "$DATA_URL" ]; then
     info "从 $DATA_URL 下载数据..."
-    wget -O data.tar.gz "$DATA_URL"
-    tar -xzf data.tar.gz
-    rm data.tar.gz
-    info "数据解压完成"
+    wget -O "$DATA_TAR" "$DATA_URL"
+    tar -xzf "$DATA_TAR" -C "$WORK_DIR"
+    rm "$DATA_TAR"
+    info "数据下载并解压完成"
 else
     warn "未检测到 data/，也未提供 --data-url"
     echo ""
-    echo "  请将 data/ 目录上传到 $(pwd)/data/"
-    echo "  或重新运行: bash scripts/setup_cloud.sh --data-url <下载链接>"
+    echo "  操作步骤:"
+    echo "    1. 在本地打包: tar -czf data.tar.gz data/"
+    echo "    2. 通过 AutoDL 网页上传 data.tar.gz"
+    echo "    3. 重新运行本脚本"
     echo ""
-fi
 
 # ── 5. 输出汇总 ─────────────────────────────────────
 echo ""
