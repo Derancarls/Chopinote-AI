@@ -497,12 +497,11 @@ class PDMXPreprocessor:
         return processed_files, failed_files
 
     def _find_pdmx_files(self, directory: str) -> List[str]:
-        """递归查找 PDMX 数据 JSON（跳过 metadata 目录下的纯元数据 JSON）。"""
+        """递归查找 PDMX 数据 JSON（跳过 data/metadata 目录下的纯元数据 JSON）。"""
         files = []
         for root, dirs, fnames in os.walk(directory):
-            # 跳过 metadata 子目录
-            if os.path.basename(root) == 'metadata':
-                continue
+            # 剪枝：不进入 metadata 子目录（纯元数据 JSON，无法转换）
+            dirs[:] = [d for d in dirs if d != 'metadata']
             for fname in fnames:
                 if fname.endswith('.json'):
                     files.append(os.path.join(root, fname))
