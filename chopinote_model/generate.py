@@ -329,7 +329,7 @@ def tokens_to_notes(token_ids: list[int],
                        REMITokenizer.ARTIC, REMITokenizer.ORNAMENT,
                        REMITokenizer.PEDAL, REMITokenizer.SLUR,
                        REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO,
-                       REMITokenizer.TIMESIG, REMITokenizer.KEY):
+                       REMITokenizer.TIMESIG, REMITokenizer.KEY, REMITokenizer.BEAT):
             i += 1
             continue
         else:

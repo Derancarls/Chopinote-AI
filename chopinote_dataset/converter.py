@@ -291,6 +291,24 @@ class MusicXMLToREMI:
                     extra.append((measure_idx, last_tuplet_pos, part_idx,
                                   REMITokenizer.TUPLET_END, None))
 
+                # ── 拍位标记（仅 part 0，避免重复）─────────────
+                if part_idx == 0:
+                    num = den = None
+                    ts = measure.timeSignature
+                    if ts is not None:
+                        num, den = ts.numerator, ts.denominator
+                    elif last_timesig is not None:
+                        parts_ts = last_timesig.split('/')
+                        num, den = int(parts_ts[0]), int(parts_ts[1])
+                    if num is not None and den is not None:
+                        beat_interval = 4.0 / den  # 每拍 quarter 数
+                        beat_spacing = max(1, int(round(beat_interval / self.quarter_per_position)))
+                        for beat_num in range(num):
+                            beat_pos = beat_num * beat_spacing
+                            if beat_pos < positions_in_measure and beat_num < self.tokenizer.MAX_BEATS:
+                                extra.append((measure_idx, beat_pos, part_idx,
+                                              REMITokenizer.BEAT, beat_num + 1))
+
         if not all_notes and not extra and not all_rests and not all_grace_notes:
             return []
 
@@ -573,6 +591,57 @@ class PDMXToREMI:
                     break
             merged.append((t_measure, 0, 0, 0, 0.5, 'x',
                            (REMITokenizer.TEMPO, qpm)))
+
+        # ── 5.5 拍位事件 ──────────────────────────────────────
+        # 跳过存在反复段（measure 编号重复）的文件，避免 beat 计混乱
+        has_dup_measure = False
+        seen_m = set()
+        for bl in sorted(barlines, key=lambda x: x['time']):
+            bm = bl['measure']
+            if bm in seen_m:
+                has_dup_measure = True
+                break
+            seen_m.add(bm)
+
+        beats_data = data.get('beats', [])
+        if beats_data and not has_dup_measure:
+            # 按顺序遍历 barlines 构建顺序小节列表，匹配每一拍的归属小节
+            seq_barlines = sorted(
+                [(bl['measure'] - 1, bl['time']) for bl in barlines],
+                key=lambda x: x[1],
+            )
+            sorted_beats = sorted(beats_data, key=lambda x: x['time'])
+            bar_idx = 0
+            beat_count = 0
+            for b in sorted_beats:
+                b_time = b['time']
+                while bar_idx + 1 < len(seq_barlines) and b_time >= seq_barlines[bar_idx + 1][1]:
+                    bar_idx += 1
+                    beat_count = 0
+                if bar_idx >= len(seq_barlines):
+                    break
+                start = seq_barlines[bar_idx][1]
+                if b_time < start:
+                    continue
+                beat_count += 1
+                pos = max(0, min(self.grid_size - 1,
+                          int(round((b_time - start) / ticks_per_pos))))
+                if beat_count <= self.tokenizer.MAX_BEATS:
+                    m = seq_barlines[bar_idx][0]
+                    merged.append((m, pos, 0, 0, 0.6, 'x',
+                                   (REMITokenizer.BEAT, beat_count)))
+
+        # ── 5.6 反复事件 ──────────────────────────────────────
+        for bl in barlines:
+            m = bl['measure'] - 1
+            if m not in measure_starts:
+                continue
+            if bl.get('subtype') == 'start-repeat':
+                merged.append((m, 0, 0, 0, 0.8, 'x',
+                               (REMITokenizer.REPEAT, 'start')))
+            elif bl.get('subtype') == 'end-repeat':
+                merged.append((m, 0, 0, 0, 0.8, 'x',
+                               (REMITokenizer.REPEAT, 'end')))
 
         # ── 6. 排序 ──────────────────────────────────────────
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
