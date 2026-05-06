@@ -53,6 +53,10 @@ class REMITokenizer:
     REST = '<Rest>'                # 休止符
     GRACE_NOTE = '<GraceNote'      # 倚音: acciaccatura, appoggiatura, grace
     KEY = '<Key'                   # 调号: C, G, D, A, E, B, F#, C#, F, Bb, Eb, Ab, Db, Gb, Cb (major) / Am, Em, ... (minor)
+    BEAT = '<Beat'                 # 拍位: 1 起，如 <Beat 1>（=强拍）、<Beat 2> 等
+
+    # 最多支持的拍数（与 grid_size 16 对齐）
+    MAX_BEATS = 16
 
     # 30 个标准调号
     KEY_NAMES = [
@@ -246,6 +250,13 @@ class REMITokenizer:
             self._id_to_token[idx] = t
             idx += 1
 
+        # <Beat 1> .. <Beat 16>（拍位标记，1=强拍）
+        for beat_num in range(1, self.MAX_BEATS + 1):
+            t = f'{self.BEAT} {beat_num}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
     @property
     def vocab_size(self) -> int:
         return len(self._token_to_id)
@@ -353,4 +364,7 @@ class REMITokenizer:
             elif token.startswith(self.KEY):
                 val = token[len(self.KEY) + 1:-1]  # e.g. 'C', 'Am'
                 events.append((self.KEY, val))
+            elif token.startswith(self.BEAT):
+                val = int(token[len(self.BEAT) + 1:-1])  # e.g. 1, 2, 3, 4
+                events.append((self.BEAT, val))
         return events

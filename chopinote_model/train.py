@@ -33,6 +33,8 @@ class Trainer:
     def __init__(self, model: nn.Module, model_config: ModelConfig,
                  train_config: TrainingConfig, device: torch.device):
         self.model = model.to(device)
+        if train_config.compile:
+            self.model = torch.compile(self.model)
         self.model_config = model_config
         self.train_config = train_config
         self.device = device

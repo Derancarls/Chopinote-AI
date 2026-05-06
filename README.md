@@ -4,6 +4,33 @@
 
 ---
 
+## v0.1.1-Beta (2026-05-07)
+
+### 新增
+- 强弱拍位 token（`<Beat 1>`~`<Beat 16>`），词表 815→831，模型感知节拍层级
+- 调性标记 token（30 个标准调号 `Key C`~`Key Abm`），MusicXML/PDMX 自动提取
+- PDMX 反复记号支持：`start-repeat` / `end-repeat` 与 MusicXML 对齐
+- FlashAttention（`F.scaled_dot_product_attention`），自动选择最优 cuDNN 后端
+- Gradient checkpointing，减少训练显存占用
+- fp16 混合精度训练（autocast + GradScaler）
+- 乐器音高限制（GM_INSTRUMENT_RANGES），按乐器范围屏蔽非法音高
+- `torch.compile` 支持（`TrainingConfig.compile` 开关）
+- 数据集划分 CLI（`scripts/preprocess_pdmx.py` 可覆盖 cfg 模板参数）
+- 云服务器一键部署脚本 `setup_cloud.sh`（支持自动解压 data.tar.gz / PDMX.tar.gz）
+
+### 修复
+- `converter.py`: PDMX 预处理中 Position 钳位修复
+- `converter.py`: PDMXToREMI API 一致性修复
+- `converter.py`: `_find_pdmx_files` 正确剪枝 metadata 目录，防止 254K 元数据 JSON 误处理
+- `generate.py`: 移除废弃代码
+- `model.py`: `compute_loss` ignore_index 对齐（0 → -100）
+- `train.py`: `evaluate()` 缺少 autocast 导致精度不一致
+- `train.py`: GradScaler 状态未持久化到 checkpoint
+- `model.py`: 移除废弃的 `MusicTransformer.generate()` 方法
+- 训练首步 vocab_size 自动校验
+
+---
+
 ## v0.1.0-Beta5 (2026-05-05)
 
 ### 新增
