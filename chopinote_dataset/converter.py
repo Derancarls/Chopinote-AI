@@ -4,7 +4,7 @@ MusicXML / PDMX → REMI 序列转换器
 """
 import os
 import json
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Union
 from collections import defaultdict
 import logging
 
@@ -126,8 +126,9 @@ class MusicXMLToREMI:
 
                 # ── 非音符标记提取 ──────────────────────────
                 for elem in flat:
-                    pos = min(positions_in_measure - 1,
-                              int(round(elem.offset / self.quarter_per_position)))
+                    pos = min(self.grid_size - 1,
+                              min(positions_in_measure - 1,
+                                  int(round(elem.offset / self.quarter_per_position))))
 
                     # 谱号
                     if isinstance(elem, clef.Clef):
@@ -212,16 +213,18 @@ class MusicXMLToREMI:
                 last_tuplet_pos: int = 0
                 for elem in flat.notesAndRests:
                     if isinstance(elem, note.Rest):
-                        pos = min(positions_in_measure - 1,
-                                  int(round(elem.offset / self.quarter_per_position)))
+                        pos = min(self.grid_size - 1,
+                                  min(positions_in_measure - 1,
+                                      int(round(elem.offset / self.quarter_per_position))))
                         dur_positions = max(1, min(self.grid_size,
                                                    int(round(elem.quarterLength / self.quarter_per_position))))
                         all_rests.append((measure_idx, pos, part_idx, dur_positions))
                         continue
 
                     offset = elem.offset
-                    pos = min(positions_in_measure - 1,
-                              int(round(offset / self.quarter_per_position)))
+                    pos = min(self.grid_size - 1,
+                              min(positions_in_measure - 1,
+                                  int(round(offset / self.quarter_per_position))))
 
                     # 音符上的演奏法标记
                     for art in elem.articulations:
@@ -405,33 +408,33 @@ class PDMXToREMI:
         self.tokenizer = REMITokenizer(grid_size, velocity_levels)
 
     def convert(self, file_path: str, collect_metadata: bool = False
-                ) -> Tuple[List[int], dict]:
+                ) -> Union[List[int], Tuple[List[int], dict]]:
         """加载 PDMX JSON 文件并转换为 token ID 序列。"""
         if not os.path.exists(file_path):
             logger.error(f"文件不存在: {file_path}")
-            return [], {}
+            return ([], {}) if collect_metadata else []
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 pdmx_data = json.load(f)
         except Exception as e:
             logger.error(f"解析 PDMX JSON 失败 {file_path}: {e}")
-            return [], {}
+            return ([], {}) if collect_metadata else []
 
         return self._convert_pdmx(pdmx_data, file_path, collect_metadata)
 
     def convert_pdmx(self, pdmx_data: dict, collect_metadata: bool = False
-                     ) -> Tuple[List[int], dict]:
+                     ) -> Union[List[int], Tuple[List[int], dict]]:
         """直接转换已解析的 PDMX dict 对象。"""
         return self._convert_pdmx(pdmx_data, None, collect_metadata)
 
     # ── internal ──────────────────────────────────────────────
 
     def _convert_pdmx(self, data: dict, file_path: str | None = None,
-                      collect_metadata: bool = False) -> Tuple[List[int], dict]:
+                      collect_metadata: bool = False) -> Union[List[int], Tuple[List[int], dict]]:
         events = self._pdmx_to_events(data)
         if not events:
-            return [], {}
+            return ([], {}) if collect_metadata else []
 
         full_events = [(REMITokenizer.BOS, None)] + events + [(REMITokenizer.EOS, None)]
         token_ids = self.tokenizer.tokenize(full_events)
@@ -449,7 +452,7 @@ class PDMXToREMI:
                 'source_format': md.get('source_format', ''),
                 'num_tracks': len(data.get('tracks', [])),
             }
-        return token_ids, metadata
+        return (token_ids, metadata) if collect_metadata else token_ids
 
     def _pdmx_to_events(self, data: dict) -> List[Tuple[str, Optional[int]]]:
         """PDMX MusicRender dict → REMI 事件列表。"""
