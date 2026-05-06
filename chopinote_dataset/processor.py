@@ -430,6 +430,7 @@ class MusicXMLPreprocessor:
                 stats['genre_distribution'][genre] = 1
         # 保存统计信息
         stats_path = os.path.join(output_dir, 'processing_stats.json')
+        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
         with open(stats_path, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
 
@@ -581,7 +582,10 @@ class PDMXPreprocessor:
         ks_list = pdmx_data.get('key_signatures', [])
         if ks_list:
             ks = ks_list[0]
-            key_sig = ks.get('root_str', '') + ('m' if ks.get('mode') == 'minor' else '')
+            root_str = ks.get('root_str', '')
+            if not isinstance(root_str, str):
+                root_str = ''
+            key_sig = root_str + ('m' if ks.get('mode') == 'minor' else '')
         else:
             key_sig = 'unknown'
 
@@ -654,6 +658,7 @@ class PDMXPreprocessor:
         meta_filename = f"{metadata.file_id}.meta.json"
 
         token_path = os.path.join(output_dir, "tokens", token_filename)
+        os.makedirs(os.path.dirname(token_path), exist_ok=True)
         with open(token_path, 'w', encoding='utf-8') as f:
             json.dump(tokens, f)
 
@@ -661,6 +666,7 @@ class PDMXPreprocessor:
         meta_dict = asdict(metadata)
         meta_dict.update(conversion_metadata)
         meta_path = os.path.join(output_dir, "metadata", meta_filename)
+        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
         with open(meta_path, 'w', encoding='utf-8') as f:
             json.dump(meta_dict, f, indent=2, ensure_ascii=False)
 
