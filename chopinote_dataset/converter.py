@@ -461,7 +461,10 @@ class PDMXToREMI:
         ks_events = data.get('key_signatures', [])
         if ks_events:
             first = ks_events[0]
-            key_name = first.get('root_str', 'C') + ('m' if first.get('mode') == 'minor' else '')
+            root = first.get('root_str', 'C')
+            if not isinstance(root, str):
+                root = 'C'
+            key_name = root + ('m' if first.get('mode') == 'minor' else '')
         # ──────────────────────────────────────────────────────
 
         # ── 1. 构建小节起止映射 ──────────────────────────────

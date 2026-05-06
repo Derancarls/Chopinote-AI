@@ -1,15 +1,15 @@
 """模型超参和训练配置。"""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class ModelConfig:
-    """Decoder-only Transformer 超参数（适配 RTX 5070 12GB）。"""
+    """Decoder-only Transformer 超参数（适配 RTX 4090 24GB）。"""
     vocab_size: int = 815
-    d_model: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    d_ff: int = 2048
+    d_model: int = 768
+    n_layers: int = 10
+    n_heads: int = 12
+    d_ff: int = 3072
     max_seq_len: int = 4096
     dropout: float = 0.1
     pad_token_id: int = 0
@@ -25,9 +25,9 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """训练配置（适配 RTX 5070 12GB）。"""
-    batch_size: int = 4
-    grad_accum_steps: int = 8
+    """训练配置（适配 RTX 4090 24GB）。"""
+    batch_size: int = 8
+    grad_accum_steps: int = 4
     lr: float = 2e-4
     warmup_steps: int = 2000
     total_steps: int = 100000
