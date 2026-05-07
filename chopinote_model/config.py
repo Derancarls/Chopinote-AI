@@ -35,7 +35,7 @@ class TrainingConfig:
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000
-    output_dir: str = "./checkpoints"
+    output_dir: str = "../autodl-fs/chopinote/checkpoints"
     log_dir: str = "./logs"
     data_dir: str = "data/processed"
 
