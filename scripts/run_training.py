@@ -3,7 +3,7 @@
 
 用法:
     python scripts/run_training.py                          # 默认配置
-    python scripts/run_training.py --resume checkpoints/step_1000.pt
+    python scripts/run_training.py --resume ../autodl-fs/chopinote/checkpoints/step_1000.pt
     python scripts/run_training.py --total-steps 100000
 """
 import argparse
@@ -40,7 +40,7 @@ def main():
                         help='覆盖学习率')
     parser.add_argument('--data-dir', type=str, default='data/processed',
                         help='数据目录')
-    parser.add_argument('--output-dir', type=str, default='./checkpoints',
+    parser.add_argument('--output-dir', type=str, default='../autodl-fs/chopinote/checkpoints',
                         help='checkpoint 输出目录')
     args = parser.parse_args()
 
