@@ -58,6 +58,182 @@ def _count_token_types(tokens: list[int], tokenizer: REMITokenizer) -> dict:
     return counts
 
 
+def _positions_for_time_sig(time_sig, grid_size: int = 16) -> int:
+    """根据拍号 (num, den) 推算小节总位置数。"""
+    if time_sig is None:
+        return grid_size  # 默认 4/4
+    num, den = time_sig
+    positions = num * grid_size // den  # 如 3/4 → 3*16/4 = 12
+    return max(1, min(positions, grid_size))
+
+
+def _validate_notation_legality(
+    roundtrip_tokens: list[int],
+    tokenizer: REMITokenizer,
+) -> dict:
+    """乐谱乐理合法性验证。
+
+    检查项：
+      1. 同音重复 — 同声部同 position 同 pitch
+      2. 时值溢出 — position + duration > 小节总位置数
+      3. 零/负时值 — duration <= 0
+      4. 连音不配对 — TupletStart/TupletEnd 不匹配
+      5. 空内容小节 — 有 Bar 但无任何 Note_ON 或 Rest
+
+    Returns:
+        {'passed': bool, 'checks': dict, 'detail': str, 'violations': dict}
+    """
+    events = tokenizer.detokenize(roundtrip_tokens)
+
+    cur_bar = 0
+    cur_pos = 0
+    cur_program = 0
+    cur_subtrack = 0
+    tuplet_stack = 0
+    last_time_sig = None  # (num, den)
+    bar_has_content: dict[int, bool] = {}
+    # (bar, program, subtrack, position) -> set[pitch]
+    note_positions: dict[tuple, set] = {}
+
+    violations = {
+        'duplicate_pitch': [],
+        'duration_overflow': [],
+        'zero_duration': [],
+        'tuplet_mismatch': [],
+        'empty_measure': [],
+    }
+
+    i = 0
+    while i < len(events):
+        etype, evalue = events[i]
+
+        if etype in (tokenizer.BOS, tokenizer.EOS):
+            if etype == tokenizer.EOS:
+                break
+            i += 1
+            continue
+        elif etype == tokenizer.BAR:
+            cur_bar += 1
+            i += 1
+            continue
+        elif etype == tokenizer.POSITION:
+            cur_pos = evalue
+            i += 1
+            continue
+        elif etype == tokenizer.PROGRAM:
+            val_parts = evalue.split('_')
+            cur_program = int(val_parts[0])
+            cur_subtrack = int(val_parts[1]) if len(val_parts) > 1 else 0
+            i += 1
+            continue
+        elif etype == tokenizer.TIMESIG:
+            parts = evalue.split('/')
+            last_time_sig = (int(parts[0]), int(parts[1]))
+            i += 1
+            continue
+        elif etype == tokenizer.TUPLET_START:
+            tuplet_stack += 1
+            i += 1
+            continue
+        elif etype == tokenizer.TUPLET_END:
+            tuplet_stack -= 1
+            if tuplet_stack < 0:
+                violations['tuplet_mismatch'].append(
+                    f'小节 {cur_bar}: 多余的 TupletEnd（无匹配的 TupletStart）'
+                )
+                tuplet_stack = 0
+            i += 1
+            continue
+        elif etype == tokenizer.NOTE_ON:
+            pitch = evalue
+            bar_has_content[cur_bar] = True
+
+            # 同音重复
+            dk = (cur_bar, cur_program, cur_subtrack, cur_pos)
+            note_positions.setdefault(dk, set())
+            if pitch in note_positions[dk]:
+                violations['duplicate_pitch'].append(
+                    f'小节 {cur_bar}, 位置 {cur_pos}, 声部 {cur_program}/{cur_subtrack}: 音高 {pitch} 重复'
+                )
+            else:
+                note_positions[dk].add(pitch)
+
+            # 跳过后面的 Velocity
+            if i + 1 < len(events) and events[i + 1][0] == tokenizer.VELOCITY:
+                i += 1
+            # 读取 Duration
+            dur = 4
+            if i + 1 < len(events) and events[i + 1][0] == tokenizer.DURATION:
+                dur = events[i + 1][1]
+                i += 1
+
+            # 零时值
+            if dur <= 0:
+                violations['zero_duration'].append(
+                    f'小节 {cur_bar}, 位置 {cur_pos}, 音高 {pitch}: 时值 {dur} <= 0'
+                )
+
+            # 时值溢出
+            total_pos = _positions_for_time_sig(last_time_sig, tokenizer.grid_size)
+            if cur_pos + dur > total_pos:
+                violations['duration_overflow'].append(
+                    f'小节 {cur_bar}, 位置 {cur_pos}, 音高 {pitch}: '
+                    f'pos({cur_pos}) + dur({dur}) = {cur_pos + dur} > {total_pos}'
+                )
+
+            i += 1
+            continue
+        elif etype == tokenizer.REST:
+            bar_has_content[cur_bar] = True
+
+            dur = 4
+            if i + 1 < len(events) and events[i + 1][0] == tokenizer.DURATION:
+                dur = events[i + 1][1]
+                i += 1
+
+            if dur <= 0:
+                violations['zero_duration'].append(
+                    f'小节 {cur_bar}, 位置 {cur_pos}: 休止符时值 {dur} <= 0'
+                )
+
+            total_pos = _positions_for_time_sig(last_time_sig, tokenizer.grid_size)
+            if cur_pos + dur > total_pos:
+                violations['duration_overflow'].append(
+                    f'小节 {cur_bar}, 位置 {cur_pos}: 休止符 pos({cur_pos}) + '
+                    f'dur({dur}) = {cur_pos + dur} > {total_pos}'
+                )
+
+            i += 1
+            continue
+        else:
+            i += 1
+
+    # 结尾未闭合的连音
+    if tuplet_stack > 0:
+        violations['tuplet_mismatch'].append(
+            f'结尾: {tuplet_stack} 个 TupletStart 未闭合'
+        )
+
+    # 空内容小节（跳过 Bar 0）
+    for bar_num in range(1, cur_bar + 1):
+        if bar_num not in bar_has_content:
+            violations['empty_measure'].append(
+                f'小节 {bar_num}: 无音符或休止符'
+            )
+
+    all_passed = all(len(v) == 0 for v in violations.values())
+    failed_items = [k for k, v in violations.items() if v]
+    detail_parts = [f'{k}({len(v)}处)' for k, v in violations.items() if v]
+    detail = ', '.join(detail_parts) if detail_parts else '全部检查通过'
+
+    return {
+        'passed': all_passed,
+        'checks': violations,
+        'detail': detail,
+        'failed_items': failed_items,
+    }
+
+
 def validate_generated_xml(
     musicxml_path: str,
     seed_tokens: Optional[list[int]] = None,
@@ -147,6 +323,20 @@ def validate_generated_xml(
             'detail': f'所有音高在 0-127 范围内 ({pitch_min}~{pitch_max})',
         }
 
+    # ── 4.5 调性内部一致性 ─────────────────────────────────────
+    if roundtrip_key and pitches:
+        from chopinote_model.generate import KEY_TO_DIATONIC_PITCHES
+        diatonic = KEY_TO_DIATONIC_PITCHES.get(roundtrip_key)
+        if diatonic:
+            in_key = sum(1 for p in pitches if (p % 12) in diatonic)
+            ratio = in_key / len(pitches)
+            checks['key_consistency'] = {
+                'passed': ratio > 0.6,
+                'detail': f'{ratio:.1%} 音符在调内 ({in_key}/{len(pitches)})',
+            }
+            if ratio <= 0.6:
+                all_passed = False
+
     # ── 5. 音符密度检查 ────────────────────────────────────────
     note_count = len(pitches)
     if bar_count > 0:
@@ -196,7 +386,20 @@ def validate_generated_xml(
     else:
         checks['repetition'] = {'passed': True, 'detail': '无重复循环'}
 
-    # ── 8. 损失报告（仅信息，不判定失败） ─────────────────────
+    # ── 8. 乐谱乐理合法性验证 ─────────────────────────────────────
+    if roundtrip_tokens:
+        notation_result = _validate_notation_legality(roundtrip_tokens, tokenizer)
+        if notation_result['passed']:
+            checks['notation'] = {'passed': True, 'detail': notation_result['detail']}
+        else:
+            failed_str = ', '.join(notation_result['failed_items'])
+            checks['notation'] = {
+                'passed': False,
+                'detail': f'{notation_result["detail"]}',
+            }
+            all_passed = False
+
+    # ── 9. 损失报告（仅信息，不判定失败） ─────────────────────
     if seed_tokens:
         orig_counts = _count_token_types(seed_tokens, tokenizer)
         rt_counts = _count_token_types(roundtrip_tokens, tokenizer)
@@ -222,10 +425,10 @@ def validate_generated_xml(
 
     # ── 汇总 ────────────────────────────────────────────────────
     if all_passed:
-        summary = f'✓ 验证通过 | {bar_count} 小节 | {len(pitches)} 音符 | {len(roundtrip_tokens)} tokens'
+        summary = f'验证通过 | {bar_count} 小节 | {len(pitches)} 音符 | {len(roundtrip_tokens)} tokens'
     else:
         failed = [k for k, v in checks.items() if isinstance(v, dict) and not v.get('passed', True)]
-        summary = f'✗ {len(failed)} 项检查失败: {", ".join(failed)}'
+        summary = f'{len(failed)} 项检查失败: {", ".join(failed)}'
 
     return {'passed': all_passed, 'checks': checks, 'summary': summary}
 
@@ -258,7 +461,7 @@ def main():
     print()
     print('  [验证结果]')
     for name, check in result['checks'].items():
-        status = '✓' if check.get('passed', True) else '✗'
+        status = '[OK]' if check.get('passed', True) else '[!!]'
         print(f'    {status} {name}: {check.get("detail", "")}')
     print()
     if result['passed']:
