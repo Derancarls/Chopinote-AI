@@ -1,5 +1,6 @@
 """训练循环。"""
 import os
+import shutil
 import time
 import logging
 from pathlib import Path
@@ -36,6 +37,7 @@ class Trainer:
         self.model_config = model_config
         self.train_config = train_config
         self.device = device
+        self.backup_dir = Path('../autodl-fs/chopinote/checkpoint_backups')
 
         # 去重参数（weight tying 会导致同一 tensor 作为多个 Parameter 被 yield）
         params = list(dict.fromkeys(model.parameters()))
@@ -62,7 +64,7 @@ class Trainer:
         Path(train_config.log_dir).mkdir(parents=True, exist_ok=True)
 
     def save_checkpoint(self, loss: float):
-        """保存 checkpoint。"""
+        """保存 checkpoint（同时备份到 checkpoint_backups）。"""
         path = Path(self.train_config.output_dir) / f'step_{self.global_step}.pt'
         torch.save({
             'step': self.global_step,
@@ -75,6 +77,12 @@ class Trainer:
         }, path)
         logger.info(f'Checkpoint saved: {path}')
 
+        # 备份
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = self.backup_dir / f'step_{self.global_step}.pt'
+        shutil.copy2(path, backup_path)
+        logger.info(f'Backup saved: {backup_path}')
+
         if loss < self.best_loss:
             self.best_loss = loss
             best_path = Path(self.train_config.output_dir) / 'best.pt'
@@ -85,6 +93,10 @@ class Trainer:
                 'config': self.model_config,
             }, best_path)
             logger.info(f'Best model saved: {best_path}')
+            # 备份 best.pt
+            best_backup = self.backup_dir / 'best.pt'
+            shutil.copy2(best_path, best_backup)
+            logger.info(f'Best model backup saved: {best_backup}')
 
     def load_checkpoint(self, checkpoint_path: str):
         """恢复 checkpoint。"""

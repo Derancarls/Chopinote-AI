@@ -61,27 +61,31 @@ class TokenDataset(Dataset):
             if not self.valid_indices:
                 raise ValueError('没有可用的训练文件')
 
-        # 缓存最近加载的文件
-        self._cache_key: Optional[int] = None
-        self._cache_data: Optional[list[int]] = None
+        # LRU 缓存最近加载的文件
+        self._cache: dict[int, list[int]] = {}
+        self._cache_max = 16
 
     def __len__(self) -> int:
         return max(len(self.valid_indices) * 4, 2048)
 
+    def _load_tokens(self, file_idx: int) -> list[int]:
+        """加载文件 tokens（带 LRU 缓存）。"""
+        if file_idx in self._cache:
+            return self._cache[file_idx]
+        path = self.data_dir / 'tokens' / Path(self.file_paths[file_idx]).name
+        if not path.exists():
+            path = Path(self.file_paths[file_idx])
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        self._cache[file_idx] = data
+        if len(self._cache) > self._cache_max:
+            # 移除最早未使用的
+            self._cache.pop(next(iter(self._cache)))
+        return data
+
     def __getitem__(self, idx: int) -> dict:
         file_idx = random.choice(self.valid_indices)
-        length = self.file_lengths[file_idx]
-
-        # 加载数据（带缓存）
-        if self._cache_key != file_idx:
-            path = self.data_dir / 'tokens' / Path(self.file_paths[file_idx]).name
-            if not path.exists():
-                path = Path(self.file_paths[file_idx])
-            with open(path, 'r', encoding='utf-8') as f:
-                self._cache_data = json.load(f)
-            self._cache_key = file_idx
-
-        tokens = self._cache_data
+        tokens = self._load_tokens(file_idx)
 
         if len(tokens) <= self.max_seq_len + 1:
             # 短序列直接取全部
@@ -136,6 +140,7 @@ def create_dataloader(split_file: str, data_dir: str = 'data/processed',
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=0,  # Windows 上避免多进程问题
-        pin_memory=False,
+        num_workers=4,
+        pin_memory=False,   # PyTorch 2.8 + CUDA 12.8 pin_memory bug
+        prefetch_factor=2,
     )

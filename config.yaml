@@ -16,10 +16,10 @@ dataset:
 
   # 预处理配置
   preprocessing:
-    min_notes_per_file: 50
-    max_notes_per_file: 5000
-    min_tokens_per_sequence: 100
-    max_tokens_per_sequence: 4096
+    min_notes_per_file: 10
+    max_notes_per_file: 50000
+    min_tokens_per_sequence: 50
+    max_tokens_per_sequence: 16384
 
     # REMI转换配置
     remi:
@@ -47,5 +47,5 @@ dataset:
 
   # 质量检查
   quality_checks:
-    min_file_size_kb: 10
-    max_file_size_mb: 10
+    min_file_size_kb: 1
+    max_file_size_mb: 50

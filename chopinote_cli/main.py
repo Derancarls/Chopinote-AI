@@ -267,8 +267,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             '示例:\n'
-            '  chopinote-generate checkpoints/best.pt input.musicxml\n'
-            '  chopinote-generate checkpoints/step_50000.pt input.musicxml -o out.musicxml\n'
+            '  chopinote-generate ../autodl-fs/chopinote/checkpoints/best.pt input.musicxml\n'
+            '  chopinote-generate ../autodl-fs/chopinote/checkpoints/step_50000.pt input.musicxml -o out.musicxml\n'
         ),
     )
     parser.add_argument('checkpoint', help='模型权重文件路径 (.pt)')

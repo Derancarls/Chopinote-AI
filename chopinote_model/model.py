@@ -128,6 +128,8 @@ class MusicTransformer(nn.Module):
 
         self._init_weights()
 
+        # torch.compile 实测在此模型上无加速（瓶颈在显存带宽而非计算），已移除
+
     def _init_weights(self):
         for name, p in self.named_parameters():
             if p.dim() > 1:
