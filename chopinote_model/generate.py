@@ -83,6 +83,50 @@ DRUM_KIT_NAME = 'Drums'
 
 # GM 乐器音高范围 (MIDI note min, max)
 # Program 112-127（打击乐/效果器）不受限制，MIDI note number 指代鼓件/音色而非音高
+# 按 subtrack 细分音域（hand 分离用）
+# 对钢琴类乐器：subtrack 0 = 右手（中高音区），subtrack 1 = 左手（低音区）
+SUBTRACK_RANGES: dict[int, dict[int, tuple[int, int]]] = {
+    p: {0: (48, 96), 1: (28, 72)} for p in range(8)  # piano 0-7
+}
+
+# 30 个调名 → 7 个自然音级 (pitch class 0-11) 的映射
+# 大调 = Ionian, 小调 = Aeolian (自然小调)
+# key 格式与 REMITokenizer.KEY_NAMES 一致
+KEY_TO_DIATONIC_PITCHES: dict[str, frozenset[int]] = {
+    # ── 大调 ──
+    'C':   frozenset({0, 2, 4, 5, 7, 9, 11}),
+    'G':   frozenset({0, 2, 4, 6, 7, 9, 11}),
+    'D':   frozenset({1, 2, 4, 6, 7, 9, 11}),
+    'A':   frozenset({1, 2, 4, 6, 8, 9, 11}),
+    'E':   frozenset({1, 3, 4, 6, 8, 9, 11}),
+    'B':   frozenset({1, 3, 4, 6, 8, 10, 11}),
+    'F#':  frozenset({1, 3, 5, 6, 8, 10, 11}),
+    'C#':  frozenset({0, 1, 3, 5, 6, 8, 10}),
+    'F':   frozenset({0, 2, 4, 5, 7, 9, 10}),
+    'Bb':  frozenset({0, 2, 3, 5, 7, 9, 10}),
+    'Eb':  frozenset({0, 2, 3, 5, 7, 8, 10}),
+    'Ab':  frozenset({0, 1, 3, 5, 7, 8, 10}),
+    'Db':  frozenset({0, 1, 3, 5, 6, 8, 10}),
+    'Gb':  frozenset({1, 3, 5, 6, 8, 10, 11}),
+    'Cb':  frozenset({1, 3, 4, 6, 8, 10, 11}),
+    # ── 小调（自然小调） ──
+    'Am':  frozenset({0, 2, 4, 5, 7, 9, 11}),
+    'Em':  frozenset({0, 2, 4, 6, 7, 9, 11}),
+    'Bm':  frozenset({1, 2, 4, 6, 7, 9, 11}),
+    'F#m': frozenset({1, 2, 4, 6, 8, 9, 11}),
+    'C#m': frozenset({1, 3, 4, 6, 8, 9, 11}),
+    'G#m': frozenset({1, 3, 4, 6, 8, 10, 11}),
+    'D#m': frozenset({1, 3, 5, 6, 8, 10, 11}),
+    'A#m': frozenset({0, 1, 3, 5, 6, 8, 10}),
+    'Dm':  frozenset({0, 2, 4, 5, 7, 9, 10}),
+    'Gm':  frozenset({0, 2, 3, 5, 7, 9, 10}),
+    'Cm':  frozenset({0, 2, 3, 5, 7, 8, 10}),
+    'Fm':  frozenset({0, 1, 3, 5, 7, 8, 10}),
+    'Bbm': frozenset({0, 1, 3, 5, 6, 8, 10}),
+    'Ebm': frozenset({1, 3, 5, 6, 8, 10, 11}),
+    'Abm': frozenset({1, 3, 4, 6, 8, 10, 11}),
+}
+
 GM_INSTRUMENT_RANGES: dict[int, tuple[int, int]] = {
     # ── Piano ──
     0: (21, 108), 1: (21, 108), 2: (21, 108), 3: (21, 108),
@@ -135,6 +179,13 @@ def _parse_program(token_str: str) -> int:
     # token_str 形如 '<Program 0>' 或 '<Program 0_1>'
     val = token_str[len('<Program') + 1:-1]  # 去掉 '<Program ' 和 '>'
     return int(val.split('_')[0])
+
+
+def _parse_subtrack(token_str: str) -> int:
+    """从 '<Program N_M>' 提取 subtrack M，无后缀时返回 0。"""
+    val = token_str[len('<Program') + 1:-1]
+    parts = val.split('_')
+    return int(parts[1]) if len(parts) > 1 else 0
 
 
 @torch.no_grad()
@@ -325,9 +376,57 @@ def tokens_to_notes(token_ids: list[int],
                 cur_grace_type = None
             notes_list.append(note_entry)
             i += 1
-        elif etype in (REMITokenizer.CLEF, REMITokenizer.DYNAMIC, REMITokenizer.HAIRPIN,
-                       REMITokenizer.ARTIC, REMITokenizer.ORNAMENT,
-                       REMITokenizer.PEDAL, REMITokenizer.SLUR,
+        # ── 表情记号（力度/踏板/演奏法等） ────────────────
+        elif etype == REMITokenizer.DYNAMIC:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'dynamic', 'value': evalue,
+            })
+            i += 1
+            continue
+        elif etype == REMITokenizer.HAIRPIN:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'hairpin', 'value': evalue,
+            })
+            i += 1
+            continue
+        elif etype == REMITokenizer.PEDAL:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'pedal', 'value': evalue,
+            })
+            i += 1
+            continue
+        elif etype == REMITokenizer.ARTIC:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'artic', 'value': evalue,
+            })
+            i += 1
+            continue
+        elif etype == REMITokenizer.ORNAMENT:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'ornament', 'value': evalue,
+            })
+            i += 1
+            continue
+        elif etype == REMITokenizer.SLUR:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'slur', 'value': evalue,
+            })
+            i += 1
+            continue
+        # ── 其他暂不支持的标记 ──────────────────────────
+        elif etype in (REMITokenizer.CLEF,
                        REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO,
                        REMITokenizer.TIMESIG, REMITokenizer.KEY, REMITokenizer.BEAT):
             i += 1
@@ -341,8 +440,9 @@ def tokens_to_notes(token_ids: list[int],
 def notes_to_score(notes_list: list[dict],
                    grid_size: int = 16,
                    max_bars: int = 256) -> stream.Score:
-    """将音符列表重建为 music21 Score。"""
+    """将音符列表重建为 music21 Score（含力度、踏板等表情记号）。"""
     from music21 import note as note21, duration as dur21
+    from music21 import dynamics, expressions, articulations as art21
 
     quarter_per_pos = 4.0 / grid_size
 
@@ -378,6 +478,10 @@ def notes_to_score(notes_list: list[dict],
 
     max_existing_bar = max(bars.keys())
 
+    # 收集踏板/渐强渐弱事件（music21 Spanner 序列化有缺陷，后处理注入 XML）
+    _pedal_events: list[dict] = []
+    _hairpin_events: list[dict] = []
+
     for bar_idx in range(1, max_existing_bar + 1):
         if bar_idx > max_bars:
             break
@@ -390,10 +494,13 @@ def notes_to_score(notes_list: list[dict],
             meas_by_key[key] = m
 
         for key in all_keys_sorted:
-            hand_notes = bars.get(bar_idx, {}).get(key, [])
+            all_entries = bars.get(bar_idx, {}).get(key, [])
             meas = meas_by_key[key]
+            # 分离音符和表情记号
+            hand_notes = [n for n in all_entries if n.get('type') in (None, 'rest')]
+            markings = [n for n in all_entries if n not in hand_notes]
             # Pre-compute tuplet-adjusted offsets and duration scales
-            hand_sorted = sorted(hand_notes, key=lambda n: (n['position'], n['pitch']))
+            hand_sorted = sorted(hand_notes, key=lambda n: (n['position'], n.get('pitch', -1)))
             for n in hand_sorted:
                 n['_adj_offset'] = n['position'] * quarter_per_pos
                 n['_adj_dur_scale'] = 1.0
@@ -495,11 +602,124 @@ def notes_to_score(notes_list: list[dict],
                         t.numberNotesNormal = normal
                         ch.duration.tuplets = (t,)
 
+            # ── 插入表情记号（力度/踏板/渐强渐弱/演奏法） ──
+            for m in markings:
+                offset = m['position'] * quarter_per_pos
+                if m['type'] == 'dynamic':
+                    meas.insert(offset, dynamics.Dynamic(m['value']))
+                elif m['type'] == 'pedal':
+                    _pedal_events.append({
+                        'bar': bar_idx, 'key': key,
+                        'pos': m['position'], 'value': m['value'],
+                    })
+                elif m['type'] == 'hairpin':
+                    _hairpin_events.append({
+                        'bar': bar_idx, 'key': key,
+                        'pos': m['position'], 'value': m['value'],
+                    })
+                elif m['type'] == 'artic':
+                    _ARTIC_MAP = {
+                        'staccato': art21.Staccato(), 'accent': art21.Accent(),
+                        'tenuto': art21.Tenuto(), 'marcato': art21.StrongAccent(),
+                        'pizzicato': art21.Pizzicato(),
+                    }
+                    # fermata 位于 expressions 而非 articulations
+                    if m['value'] == 'fermata':
+                        for el in meas.notesAndRests:
+                            if abs(el.offset - offset) < 1e-6:
+                                if isinstance(el, note21.Note):
+                                    el.expressions.append(expressions.Fermata())
+                                elif isinstance(el, chord.Chord):
+                                    for sub_n in el.notes:
+                                        sub_n.expressions.append(expressions.Fermata())
+                                break
+                    art_obj = _ARTIC_MAP.get(m['value'])
+                    if art_obj:
+                        for el in meas.notesAndRests:
+                            if abs(el.offset - offset) < 1e-6:
+                                if isinstance(el, note21.Note):
+                                    el.articulations.append(art_obj)
+                                elif isinstance(el, chord.Chord):
+                                    for sub_n in el.notes:
+                                        sub_n.articulations.append(art_obj)
+                                break
+                elif m['type'] == 'ornament':
+                    _ORN_MAP = {
+                        'trill': expressions.Trill(),
+                        'mordent': expressions.Mordent(),
+                        'turn': expressions.Turn(),
+                        'tremolo': expressions.Tremolo(),
+                    }
+                    orn_obj = _ORN_MAP.get(m['value'])
+                    if orn_obj:
+                        for el in meas.notesAndRests:
+                            if abs(el.offset - offset) < 1e-6:
+                                if isinstance(el, note21.Note):
+                                    el.expressions.append(orn_obj)
+                                elif isinstance(el, chord.Chord):
+                                    for sub_n in el.notes:
+                                        sub_n.expressions.append(orn_obj)
+                                break
+
         for key in all_keys_sorted:
             parts[key].append(meas_by_key[key])
 
     score = stream.Score(list(parts.values()))
+    if _pedal_events:
+        score._pedal_events = _pedal_events
+    if _hairpin_events:
+        score._hairpin_events = _hairpin_events
     return score
+
+
+# ── 方向标记后处理 ─────────────────────────────────────────
+
+def _inject_directions_in_musicxml(filepath: str,
+                                   pedal_events: list[dict],
+                                   hairpin_events: list[dict]):
+    """MusicXML 后处理：注入踏板和渐强/渐弱方向标记。
+
+    music21 的 PedalMark/Crescendo/Diminuendo 都是 Spanner 子类，
+    直接插入 measure 后无法正确序列化，因此改为在 XML 文件中直接注入。
+    """
+    import re
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    def _inject(events, xml_template):
+        nonlocal content
+        for ev in events:
+            bar_num = ev['bar']
+            xml_snippet = xml_template(ev['value'])
+            pattern = rf'(<measure[^>]*?number="{bar_num}"[^>]*>.*?)(</measure>)'
+            content = re.sub(
+                pattern,
+                lambda m: m.group(1) + '\n' + xml_snippet + '\n    ' + m.group(2),
+                content, count=1, flags=re.DOTALL,
+            )
+
+    # 踏板
+    _inject(pedal_events,
+            lambda v: (
+                '      <direction placement="below">'
+                '\n        <direction-type>'
+                f'\n          <pedal type="{v}" line="yes" sign="yes"/>'
+                '\n        </direction-type>'
+                '\n      </direction>'
+            ))
+    # 渐强/渐弱（wedge）
+    _inject(hairpin_events,
+            lambda v: (
+                '      <direction placement="below">'
+                '\n        <direction-type>'
+                f'\n          <wedge type="{"crescendo" if v == "cresc" else "diminuendo"}"'
+                ' number="1" spread="0"/>'
+                '\n        </direction-type>'
+                '\n      </direction>'
+            ))
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
 
 
 def generate_to_musicxml(model: MusicTransformer, tokenizer: REMITokenizer,
@@ -514,5 +734,10 @@ def generate_to_musicxml(model: MusicTransformer, tokenizer: REMITokenizer,
     notes = tokens_to_notes(full_tokens, tokenizer)
     score = notes_to_score(notes, grid_size=tokenizer.grid_size, max_bars=max_bars)
     score.write('musicxml', fp=output_path)
+    _inject_directions_in_musicxml(
+        output_path,
+        pedal_events=getattr(score, '_pedal_events', []),
+        hairpin_events=getattr(score, '_hairpin_events', []),
+    )
     logger.info(f'生成完成: {output_path}')
     return output_path

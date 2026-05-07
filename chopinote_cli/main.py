@@ -133,6 +133,41 @@ def _extract_intro_info(tokens: list[int], tokenizer: REMITokenizer) -> dict:
 
 # -- 复杂度控制 -----------------------------------------------
 
+def _estimate_seed_complexity(seed_tokens: torch.Tensor, tokenizer) -> float:
+    """从 seed token 序列估算自然复杂度 (0-10)。"""
+    events = tokenizer.detokenize(seed_tokens[0].tolist())
+    bar_count = 0
+    note_count = 0
+    rest_count = 0
+    short_durs = 0
+    total_durs = 0
+    for etype, evalue in events:
+        if etype == tokenizer.BAR:
+            bar_count += 1
+        elif etype == tokenizer.NOTE_ON:
+            note_count += 1
+        elif etype == tokenizer.DURATION:
+            total_durs += 1
+            if evalue <= 4:
+                short_durs += 1
+        elif etype == tokenizer.REST:
+            rest_count += 1
+
+    if bar_count == 0:
+        return 5.0
+
+    density = note_count / bar_count  # notes/bar
+    density_score = min(10.0, density / 4.0)
+
+    rest_ratio = rest_count / max(1, note_count + rest_count)
+    rest_score = (1.0 - rest_ratio) * 10.0
+
+    short_ratio = short_durs / max(1, total_durs)
+    dur_score = short_ratio * 10.0
+
+    score = density_score * 0.5 + rest_score * 0.3 + dur_score * 0.2
+    return max(0.0, min(10.0, score))
+
 def _apply_complexity(logits, complexity: float, tokenizer):
     """根据复杂度值 (0-10) 修改 logits，控制音乐密度和丰富程度。
     偏置值为加法，叠加到原始 logits 上。
@@ -223,7 +258,13 @@ def generate_with_progress(
     lock_key: bool = True,
     lock_time: bool = True,
     lock_tempo: bool = True,
-    complexity: float = 5.0,
+    lock_program: bool = True,
+    complexity: Optional[float] = None,
+    rest_penalty: float = 0.0,
+    max_polyphony: int = 10,
+    key_bias_strength: float = 2.0,
+    prog_switch_strength: float = 1.0,
+    prog_switch_interval: int = 12,
 ) -> tuple[torch.Tensor, dict]:
     """自回归生成，带 tqdm 进度条。
 
@@ -239,6 +280,10 @@ def generate_with_progress(
         lock_key: 禁止模型变调（屏蔽 Key token）
         lock_time: 禁止模型变拍号（屏蔽 TimeSig token）
         lock_tempo: 禁止模型变速度（屏蔽 Tempo token）
+        lock_program: 只允许 seed 已有的乐器（防多轨污染）
+        complexity: 音乐密度 0-10
+        rest_penalty: Rest token 负偏置（越大休止越少）
+        max_polyphony: 同一粒度内最大同时发音数（模拟手指上限）
 
     Returns:
         (1, T_total) 完整生成序列, stats dict
@@ -249,16 +294,56 @@ def generate_with_progress(
     start_time = time.time()
 
     # ── 音高限制准备 ──────────────────────────────────────────
-    from chopinote_model.generate import GM_INSTRUMENT_RANGES, _parse_program
+    from chopinote_model.generate import (
+        GM_INSTRUMENT_RANGES, SUBTRACK_RANGES, KEY_TO_DIATONIC_PITCHES,
+        _parse_program, _parse_subtrack,
+    )
     note_on_ids = [tokenizer.encode_token(f'<Note_ON {p}>') for p in range(128)]
     _prog_prefix = '<Program'
+    _pos_prefix = '<Position'
+    rest_id = tokenizer.encode_token('<Rest>')
+    # ──────────────────────────────────────────────────────────
+
+    # 当前 program/subtrack（从 seed 最后一条 Program 出发搜索）
     cur_program: int | None = None
+    cur_subtrack: int = 0
     for tid in reversed(seed_tokens[0].tolist()):
         ts = tokenizer.decode_token(tid)
         if ts.startswith(_prog_prefix):
             cur_program = _parse_program(ts)
+            cur_subtrack = _parse_subtrack(ts)
             break
-    # ──────────────────────────────────────────────────────────
+
+    # ── Lock: 收集 seed 已有的 Program token ────────────────
+    allowed_prog_tids: set[int] = set()
+    if lock_program:
+        for tid in seed_tokens[0].tolist():
+            ts = tokenizer.decode_token(tid)
+            if ts.startswith(_prog_prefix):
+                allowed_prog_tids.add(tid)
+
+    # ── 程序切换追踪 ──────────────────────────
+    seed_program_pairs: list[tuple[int, int]] = []
+    program_note_counts: dict[tuple[int, int], int] = {}
+    for tid in allowed_prog_tids:
+        ts = tokenizer.decode_token(tid)
+        prog = _parse_program(ts)
+        sub = _parse_subtrack(ts)
+        pair = (prog, sub)
+        if pair not in program_note_counts:
+            program_note_counts[pair] = 0
+            seed_program_pairs.append(pair)
+    notes_since_last_switch: int = 0
+    # ───────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+
+    # ── 预计算所有 Program token 的 ID ──────────────────────
+    all_prog_tids: list[int] = []
+    for tid in range(tokenizer.vocab_size):
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith(_prog_prefix):
+            all_prog_tids.append(tid)
+    # ─────────────────────────────────────────────────────────
 
     # ── 锁定 token ID 预计算 ──────────────────────────────
     _lock_ids = []
@@ -275,6 +360,27 @@ def generate_with_progress(
             tokenizer.encode_token(f'<Tempo {bpm}>') for bpm in range(30, 241, 10)
         )
     # ─────────────────────────────────────────────────────
+
+    # ── 多音 count 跟踪（同 Position 内的 NOTE_ON 数） ───
+    cur_position = -1
+    notes_this_pos: dict[int, int] = {}
+
+    # ── 调性跟踪（从 seed 反向扫描获取当前调性） ──────
+    current_key: str | None = None
+    for tid in reversed(seed_tokens[0].tolist()):
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith('<Key'):
+            current_key = ts[len('<Key ') + 1:-1]  # 如 'C', 'Am', 'F#'
+            break
+
+    # ── seed 复杂度基线 ───────────────────────────
+    seed_complexity = _estimate_seed_complexity(seed_tokens, tokenizer)
+    if complexity is None:
+        complexity = seed_complexity
+    # 相对调整：用户选的 0-10 相对于 5，映射到 seed 的基线
+    adjusted_complexity = complexity + (seed_complexity - 5.0)
+    adjusted_complexity = max(0.0, min(10.0, adjusted_complexity))
+    # ──────────────────────────────────────────────
 
     # KV cache 初始化
     kv_caches = [[None, None] for _ in range(model.config.n_layers)]
@@ -295,27 +401,92 @@ def generate_with_progress(
         logits = logits[:, -1, :] / temperature  # (1, V)
 
         # ── 复杂度控制 ──────────────────────────────────
-        _apply_complexity(logits, complexity, tokenizer)
+        _apply_complexity(logits, adjusted_complexity, tokenizer)
+        # ──────────────────────────────────────────────────
+
+        # ── Rest 惩罚 ─────────────────────────────────────
+        if rest_penalty > 0 and rest_id < logits.size(-1):
+            logits[0, rest_id] -= rest_penalty
         # ──────────────────────────────────────────────────
 
         # ── 词表截断 ──────────────────────────────────────
         if effective_vocab_size is not None:
             logits[0, effective_vocab_size:] = float('-inf')
 
-        # ── 锁定屏蔽 ──────────────────────────────────────
+        # ── 锁定屏蔽（Key/TimeSig/Tempo） ────────────────
         vocab_dim = logits.size(-1)
         for tid in _lock_ids:
             if tid < vocab_dim:
                 logits[0, tid] = float('-inf')
         # ──────────────────────────────────────────────────
 
-        # ── 音高限制 ──────────────────────────────────────
+        # ── Program 锁定（只允许 seed 已有的乐器） ────────
+        if lock_program:
+            for tid in all_prog_tids:
+                if tid < vocab_dim and tid not in allowed_prog_tids:
+                    logits[0, tid] = float('-inf')
+        # ──────────────────────────────────────────────────
+
+        # ── 程序切换促进 ──────────────────────────
+        if lock_program and prog_switch_strength > 0:
+            if notes_since_last_switch >= prog_switch_interval:
+                total_notes = sum(program_note_counts.values())
+                n_progs = len(seed_program_pairs)
+                avg_notes = total_notes / max(1, n_progs)
+                max_urge = 3.0
+                urge_ratio = min(1.0, (notes_since_last_switch - prog_switch_interval) / max(1, prog_switch_interval))
+                urgency = urge_ratio * prog_switch_strength * max_urge
+
+                for tid in allowed_prog_tids:
+                    if tid >= vocab_dim:
+                        continue
+                    ts = tokenizer.decode_token(tid)
+                    prog = _parse_program(ts)
+                    sub = _parse_subtrack(ts)
+                    pair_key = (prog, sub)
+                    neglect = 0.0
+                    if total_notes > 0 and avg_notes > 0:
+                        this_n = program_note_counts.get(pair_key, 0)
+                        neglect = max(0.0, (avg_notes - this_n) / avg_notes) * prog_switch_strength
+                    is_current = (prog == cur_program and sub == cur_subtrack)
+                    boost = urgency * (0.3 if is_current else 1.0) + neglect
+                    if boost > 0:
+                        logits[0, tid] += boost
+        # ───────────────────────────────────────────
+
+        # ── 音高限制（subtrack 感知） ─────────────────────
         if cur_program is not None and cur_program < 112:
-            rmin, rmax = GM_INSTRUMENT_RANGES.get(cur_program, (0, 127))
+            sub_range = SUBTRACK_RANGES.get(cur_program, {}).get(cur_subtrack)
+            if sub_range is not None:
+                rmin, rmax = sub_range
+            else:
+                rmin, rmax = GM_INSTRUMENT_RANGES.get(cur_program, (0, 127))
             for pitch in range(rmin):
                 logits[0, note_on_ids[pitch]] = float('-inf')
             for pitch in range(rmax + 1, 128):
                 logits[0, note_on_ids[pitch]] = float('-inf')
+        # ──────────────────────────────────────────────────
+
+        # ── 调性音高偏置 ──────────────────────────
+        if key_bias_strength > 0 and current_key is not None:
+            diatonic_pcs = KEY_TO_DIATONIC_PITCHES.get(current_key)
+            if diatonic_pcs is not None:
+                for pitch in range(128):
+                    tid = note_on_ids[pitch]
+                    if tid < vocab_dim:
+                        if (pitch % 12) in diatonic_pcs:
+                            logits[0, tid] += key_bias_strength * 1.0
+                        else:
+                            logits[0, tid] -= key_bias_strength * 0.5
+        # ───────────────────────────────────────────
+
+        # ── 多音限制（polyphony cap） ─────────────────────
+        if max_polyphony > 0:
+            total_active = sum(notes_this_pos.values())
+            if total_active >= max_polyphony:
+                for pid in note_on_ids:
+                    if pid < vocab_dim:
+                        logits[0, pid] = float('-inf')
         # ──────────────────────────────────────────────────
 
         if top_k > 0:
@@ -329,10 +500,24 @@ def generate_with_progress(
         generated = torch.cat([generated, next_token], dim=1)
         token_id = next_token.item()
 
-        # 追踪 Program 变化
+        # 追踪 Program / Position / NOTE_ON
         ts = tokenizer.decode_token(token_id)
+        if ts.startswith('<Key'):
+            current_key = ts[len('<Key ') + 1:-1]
         if ts.startswith(_prog_prefix):
             cur_program = _parse_program(ts)
+            cur_subtrack = _parse_subtrack(ts)
+            notes_since_last_switch = 0
+        elif ts.startswith(_pos_prefix):
+            cur_position += 1
+            notes_this_pos.clear()
+        elif ts.startswith('<Note_ON') and max_polyphony > 0:
+            if sum(notes_this_pos.values()) < max_polyphony:
+                notes_this_pos[cur_subtrack] = notes_this_pos.get(cur_subtrack, 0) + 1
+            notes_since_last_switch += 1
+            pair_key = (cur_program, cur_subtrack)
+            if pair_key in program_note_counts:
+                program_note_counts[pair_key] += 1
 
         if token_id == bar_id:
             bar_count += 1
@@ -367,14 +552,114 @@ def save_to_musicxml(
     max_bars: int = 256,
 ):
     """将 token 序列保存为 MusicXML 文件。"""
-    from chopinote_model.generate import tokens_to_notes, notes_to_score
+    from chopinote_model.generate import (
+        tokens_to_notes, notes_to_score, _inject_directions_in_musicxml,
+    )
 
     notes = tokens_to_notes(token_ids, tokenizer)
     score = notes_to_score(notes, grid_size=tokenizer.grid_size, max_bars=max_bars)
     score.write('musicxml', fp=output_path)
 
+    # ── 后处理：踏板 + 渐强渐弱标记 ──────────────────
+    _inject_directions_in_musicxml(
+        output_path,
+        pedal_events=getattr(score, '_pedal_events', []),
+        hairpin_events=getattr(score, '_hairpin_events', []),
+    )
+    # ─────────────────────────────────────────────────
+
+    # ── 后处理：清理多余的还原记号（保留合法的） ────────
+    _cleanup_accidentals(output_path)
+    # ─────────────────────────────────────────────────
+
     num_bars = max(n['bar'] for n in notes) if notes else 0
     return num_bars
+
+
+# 调号 fifths → 各 step 的默认 alter 值
+# fifths > 0 = 升号调, fifths < 0 = 降号调, 0 = C 大调/A 小调
+_KEY_SIG_ALTER: dict[int, dict[str, int]] = {
+    -7: {'C':-1,'D':-1,'E':-1,'F':-1,'G':-1,'A':-1,'B':-1},
+    -6: {'C':-1,'D':-1,'E':-1,'F':-1,'G':-1,'A':-1,'B': 0},
+    -5: {'C':-1,'D': 0,'E':-1,'F':-1,'G':-1,'A':-1,'B': 0},
+    -4: {'C':-1,'D': 0,'E':-1,'F':-1,'G': 0,'A':-1,'B': 0},
+    -3: {'C': 0,'D': 0,'E':-1,'F':-1,'G': 0,'A': 0,'B': 0},
+    -2: {'C': 0,'D': 0,'E':-1,'F': 0,'G': 0,'A': 0,'B': 0},
+    -1: {'C': 0,'D': 0,'E': 0,'F':-1,'G': 0,'A': 0,'B': 0},
+     0: {'C': 0,'D': 0,'E': 0,'F': 0,'G': 0,'A': 0,'B': 0},
+     1: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 0,'A': 0,'B': 0},
+     2: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 1,'A': 0,'B': 0},
+     3: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 1,'A': 1,'B': 0},
+     4: {'C': 0,'D': 0,'E': 1,'F': 1,'G': 1,'A': 1,'B': 0},
+     5: {'C': 0,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 0},
+     6: {'C': 0,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 1},
+     7: {'C': 1,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 1},
+}
+
+
+def _cleanup_accidentals(path: str):
+    """清理 MusicXML 中多余的还原记号。
+
+    逐小节扫描，只保留确实在"取消"某个升降号的还原号：
+    - 如果本小节内该音级有前置升降号（alter≠0）→ 保留（取消升降号）
+    - 如果调号对该音级有默认升降（如 Gb 大调的 G）→ 保留（取消调号）
+    - 否则 → 去掉（凭空出现的还原号，多余）
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    import re
+
+    measure_pattern = re.compile(
+        r'(<measure[^>]*>.*?</measure>)', re.DOTALL
+    )
+    key_fifths_pattern = re.compile(r'<fifths>(-?\d+)</fifths>')
+    step_pattern = re.compile(r'<step>([A-G])</step>')
+    alter_pattern = re.compile(r'<alter>(-?\d+)</alter>')
+    note_pattern = re.compile(r'<note[^>]*>.*?</note>', re.DOTALL)
+
+    def _get_default_alter(step: str, fifths: int) -> int:
+        return _KEY_SIG_ALTER.get(fifths, {}).get(step, 0)
+
+    def _process_measure(measure_xml: str) -> str:
+        # 读取调号
+        fifths = 0
+        m = key_fifths_pattern.search(measure_xml)
+        if m:
+            fifths = int(m.group(1))
+
+        altered_steps: set[str] = set()
+
+        # 按顺序逐 note 处理
+        for nb in note_pattern.finditer(measure_xml):
+            note_xml = nb.group(0)
+            step_m = step_pattern.search(note_xml)
+            if not step_m:
+                continue
+            step = step_m.group(1)
+            alter_m = alter_pattern.search(note_xml)
+            alter = int(alter_m.group(1)) if alter_m else 0
+            default = _get_default_alter(step, fifths)
+
+            if alter != default:
+                altered_steps.add(step)
+
+            if '<accidental>natural</accidental>' in note_xml:
+                needed = (step in altered_steps) or (default != 0 and alter == 0)
+                if not needed:
+                    cleaned_note = re.sub(
+                        r'\s*<accidental>natural</accidental>\s*\n?', '\n', note_xml, count=1
+                    )
+                    measure_xml = measure_xml.replace(note_xml, cleaned_note, 1)
+        return measure_xml
+
+    result = measure_pattern.sub(
+        lambda m: _process_measure(m.group(1)), content
+    )
+
+    if result != content:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(result)
 
 
 # -- 输出路径 --------------------------------------------------
@@ -558,7 +843,13 @@ def generate_once(model, tokenizer, seed_tensor, device,
         lock_key=params.get('lock_key', True),
         lock_time=params.get('lock_time', True),
         lock_tempo=params.get('lock_tempo', True),
-        complexity=params.get('complexity', 5.0),
+        lock_program=params.get('lock_program', True),
+        complexity=params.get('complexity'),  # None = auto from seed
+        rest_penalty=params.get('rest_penalty', 0.0),
+        max_polyphony=params.get('max_polyphony', 10),
+        key_bias_strength=params.get('key_bias_strength', 2.0),
+        prog_switch_strength=params.get('prog_switch_strength', 1.0),
+        prog_switch_interval=params.get('prog_switch_interval', 12),
     )
     print()
 
@@ -733,6 +1024,18 @@ def main():
                         help='指定速度 BPM，如 60, 120, 180 等')
     parser.add_argument('--list-presets', action='store_true',
                         help='列出所有可用预设并退出')
+    parser.add_argument('--lock-program', choices=['lock', 'free'], default=None,
+                        help='乐器锁定: lock=只保留 seed 已有的乐器, free=允许自由切换')
+    parser.add_argument('--rest-penalty', type=float, default=None,
+                        help='Rest 惩罚（0~10，越大休止越少，默认 0）')
+    parser.add_argument('--max-polyphony', type=int, default=None,
+                        help='同粒度最大同时发音数（模拟手指上限，默认 10）')
+    parser.add_argument('--key-bias', type=float, default=None,
+                        help='调性音高偏置强度 (0~5, 越大越严格遵循调性, 默认 2.0)')
+    parser.add_argument('--prog-switch-strength', type=float, default=None,
+                        help='乐器切换偏置强度 (0~5, 越大切换越频繁, 默认 1.0)')
+    parser.add_argument('--prog-switch-interval', type=int, default=None,
+                        help='触发切换偏置的最少连续音符数 (1~128, 默认 12)')
     args = parser.parse_args()
 
     print('=== Chopinote-AI - 钢琴谱续写工具 ===')
@@ -801,7 +1104,10 @@ def main():
         args.max_bars is not None, args.temp is not None,
         args.top_k is not None, args.complexity is not None,
         args.key_mode is not None, args.time_mode is not None,
-        args.tempo_mode is not None,
+        args.tempo_mode is not None, args.lock_program is not None,
+        args.rest_penalty is not None, args.max_polyphony is not None,
+        args.key_bias is not None, args.prog_switch_strength is not None,
+        args.prog_switch_interval is not None,
     ])
     if preset is None and not has_cli_params:
         preset = _select_preset_interactive()
@@ -838,6 +1144,20 @@ def main():
         model_vocab_size=model_vocab_size,
     )
     params['seed'] = args.seed  # seed 仅从 CLI 设置
+
+    # ── 新增参数注入 ──────────────────────────────────────
+    def _prog_mode_bool(v: str | None) -> bool | None:
+        return {'lock': True, 'free': False}.get(v)
+    params['lock_program'] = (
+        _prog_mode_bool(args.lock_program)
+        if args.lock_program is not None else True
+    )
+    params['rest_penalty'] = args.rest_penalty if args.rest_penalty is not None else 0.0
+    params['max_polyphony'] = args.max_polyphony if args.max_polyphony is not None else 10
+    params['key_bias_strength'] = args.key_bias if args.key_bias is not None else 2.0
+    params['prog_switch_strength'] = args.prog_switch_strength if args.prog_switch_strength is not None else 1.0
+    params['prog_switch_interval'] = args.prog_switch_interval if args.prog_switch_interval is not None else 12
+    # ─────────────────────────────────────────────────────
 
     print()
     # 展示曲谱信息（含锁定状态）
