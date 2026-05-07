@@ -46,6 +46,10 @@ def main():
     parser = argparse.ArgumentParser(description='准备训练数据')
     parser.add_argument('--include-local', action='store_true')
     parser.add_argument('--output-dir', default='data/processed')
+    parser.add_argument('--augment-transpose', action='store_true',
+                        help='对每首曲子做移调增强（默认 ±5 semitones）')
+    parser.add_argument('--transpose-range', type=int, default=5,
+                        help='移调范围 ±N semitones（默认 5）')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -102,6 +106,42 @@ def main():
 
             all_files.append(str(token_dir / f'{safe}.json'))
             converted += 1
+
+            # ── 移调增强 ─────────────────────────────────
+            if args.augment_transpose:
+                for semitone in range(-args.transpose_range, args.transpose_range + 1):
+                    if semitone == 0:
+                        continue
+                    try:
+                        ts = score.transpose(semitone, inPlace=False)
+                        # 检查所有 MIDI 音高是否仍在 0-127 范围内
+                        all_pitches = []
+                        for n in ts.flat.notes:
+                            if n.isNote:
+                                all_pitches.append(n.pitch.midi)
+                            elif n.isChord:
+                                all_pitches.extend(c.pitch.midi for c in n.notes)
+                        if all_pitches:
+                            if min(all_pitches) < 0 or max(all_pitches) > 127:
+                                skipped += 1
+                                continue
+                        tokens_t, meta_t = conv.convert_score(ts, collect_metadata=True)
+                        if not tokens_t:
+                            skipped += 1
+                            continue
+                        sign = '+' if semitone > 0 else ''
+                        safe_t = f'{safe}_t{sign}{semitone}'
+                        with open(token_dir / f'{safe_t}.json', 'w', encoding='utf-8') as f:
+                            json.dump(tokens_t, f)
+                        if meta_t:
+                            with open(meta_dir / f'{safe_t}.meta.json', 'w', encoding='utf-8') as f:
+                                json.dump(meta_t, f)
+                        all_files.append(str(token_dir / f'{safe_t}.json'))
+                        converted += 1
+                    except Exception:
+                        skipped += 1
+                        continue
+            # ────────────────────────────────────────────────
 
     # ── 2. 本地文件 ───────────────────────────────────────
     if args.include_local:
