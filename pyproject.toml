@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
-chopinote-generate = "chopinote_cli.main:main"
+chopin = "chopinote_cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["chopinote_cli*", "chopinote_dataset*", "chopinote_model*"]

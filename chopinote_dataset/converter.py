@@ -11,6 +11,7 @@ import logging
 from music21 import (
     converter, stream, note, chord, clef, meter,
     dynamics, tempo, bar, expressions, spanner, repeat,
+    instrument,
 )
 
 from .tokenizer import REMITokenizer
@@ -104,7 +105,18 @@ class MusicXMLToREMI:
             key_name = k.tonic.name + ('m' if k.mode == 'minor' else '')
         # ──────────────────────────────────────────────────────
 
-        left_idx, right_idx = self._identify_hands(parts)
+        # 构建 part → (program, subtrack) 映射
+        program_counts: Dict[int, int] = {}
+        part_program_map: Dict[int, Tuple[int, int]] = {}
+        for p_idx, part in enumerate(parts):
+            instr_objs = list(part.flatten().getElementsByClass(instrument.Instrument))
+            prog = (instr_objs[0].midiProgram
+                    if instr_objs and instr_objs[0].midiProgram is not None
+                    else 0)
+            sub_cnt = program_counts.get(prog, 0)
+            sub = sub_cnt if sub_cnt < self.tokenizer.MAX_SUBTRACKS else 0
+            part_program_map[p_idx] = (prog, sub)
+            program_counts[prog] = sub_cnt + 1
 
         # 收集两类事件:
         #   events: (measure, pos, part_idx, token_type, value) — 非音符标记
@@ -316,9 +328,6 @@ class MusicXMLToREMI:
         # priority: 0=TimeSig, 1=extra, 1.5=GraceNote, 2=note, 2.5=Rest, 3=TupletEnd
         merged: List[Tuple[int, int, int, int, float, str, tuple]] = []
 
-        def _hand_to_ps(p: int) -> Tuple[int, int]:
-            return (0, 0) if p == right_idx else (0, 1)
-
         for m_idx, pos, p_idx, ttype, val in extra:
             if ttype == REMITokenizer.TUPLET_END:
                 priority = 3
@@ -326,16 +335,16 @@ class MusicXMLToREMI:
                 priority = 0
             else:
                 priority = 1
-            prog, sub = _hand_to_ps(p_idx)
+            prog, sub = part_program_map[p_idx]
             merged.append((m_idx, pos, prog, sub, priority, 'x', (ttype, val)))
         for m_idx, pos, p_idx, p, vl, dr in all_notes:
-            prog, sub = _hand_to_ps(p_idx)
+            prog, sub = part_program_map[p_idx]
             merged.append((m_idx, pos, prog, sub, 2, 'n', (p, vl, dr)))
         for m_idx, pos, p_idx, dr in all_rests:
-            prog, sub = _hand_to_ps(p_idx)
+            prog, sub = part_program_map[p_idx]
             merged.append((m_idx, pos, prog, sub, 2.5, 'r', (dr,)))
         for m_idx, pos, p_idx, gn_type, gn_pitch, gn_vel, gn_dur in all_grace_notes:
-            prog, sub = _hand_to_ps(p_idx)
+            prog, sub = part_program_map[p_idx]
             merged.append((m_idx, pos, prog, sub, 1.5, 'g', (gn_type, gn_pitch, gn_vel, gn_dur)))
 
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))

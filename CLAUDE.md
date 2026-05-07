@@ -62,7 +62,7 @@ MusicXML → MusicXMLToREMI → token IDs → 种子截取 → OOB clamp
 7. softmax + multinomial 采样
 
 ### CLI 参数
-`chopinote-generate <checkpoint> <input> [-o/--output] [--seed-bars] [--seed] [-n] [--temp] [--top-k] [--max-bars] [--key-mode] [--time-mode] [--tempo-mode] [--complexity]`
+`chopin <checkpoint> <input> [-o/--output] [--seed-bars] [--seed] [-n] [--temp] [--top-k] [--max-bars] [--key-mode] [--time-mode] [--tempo-mode] [--complexity]`
 
 权重兼容：自动检测 checkpoint 的 vocab_size，OOB token → MASK。
 

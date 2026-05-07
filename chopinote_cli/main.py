@@ -2,9 +2,9 @@
 Chopinote-AI CLI: 钢琴谱续写命令行工具
 
 用法:
-    chopinote-generate best.pt input.musicxml
-    chopinote-generate best.pt input.musicxml --temp 1.2 --top-k 40 --seed 42
-    chopinote-generate best.pt input.musicxml -n 3
+    chopin best.pt input.musicxml
+    chopin best.pt input.musicxml --temp 1.2 --top-k 40 --seed 42
+    chopin best.pt input.musicxml -n 3
 """
 import argparse
 import logging
@@ -27,6 +27,7 @@ from chopinote_model.config import ModelConfig
 from chopinote_model.model import MusicTransformer
 from chopinote_dataset.tokenizer import REMITokenizer
 from chopinote_dataset.converter import MusicXMLToREMI
+from chopinote_cli.presets import Preset, get_preset, list_presets as _list_presets
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +286,11 @@ def generate_with_progress(
     pbar = tqdm(total=max_bars, desc='生成中', unit='bar', ncols=80)
 
     for step in range(max_new_tokens):
+        # 位置编码保护：不超过 max_seq_len
+        if generated.size(1) >= model.config.max_seq_len:
+            print(f'\n  [!] 已达最大序列长度 ({model.config.max_seq_len} tokens)，停止生成')
+            break
+
         logits = model.forward(next_token, kv_caches=kv_caches)
         logits = logits[:, -1, :] / temperature  # (1, V)
 
@@ -387,6 +393,35 @@ def make_output_path(input_path: str, custom: Optional[str] = None,
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     name = f'output_chopinote_{timestamp}{suffix}.musicxml'
     return str(Path.cwd() / name)
+
+
+# -- 预设选择 --------------------------------------------------
+
+def _select_preset_interactive() -> Optional[Preset]:
+    """交互式预设选择，回车跳过。"""
+    presets = _list_presets()
+    if not presets:
+        return None
+
+    print('  可用预设模板（回车跳过）:')
+    for i, p in enumerate(presets):
+        conds = []
+        if p.condition_key: conds.append(p.condition_key)
+        if p.condition_time: conds.append(p.condition_time)
+        if p.condition_tempo: conds.append(f'{p.condition_tempo}bpm')
+        cstr = f' [{", ".join(conds)}]' if conds else ''
+        print(f'    [{i}] {p.label}{cstr} — {p.description}')
+    raw = input('  选择预设 [回车=跳过]: ').strip()
+    if raw:
+        try:
+            idx = int(raw)
+            if 0 <= idx < len(presets):
+                p = presets[idx]
+                print(f'      [预设] {p.label} — {p.description}')
+                return p
+        except ValueError:
+            pass
+    return None
 
 
 # -- 交互式参数收集 --------------------------------------------
@@ -539,10 +574,12 @@ def generate_once(model, tokenizer, seed_tensor, device,
 def interactive_retry_loop(model, tokenizer, seed_tensor, device,
                            base_params: dict, base_output_path: str,
                            max_bars_total: int, model_vocab_size: int,
-                           num_samples: int = 1):
+                           num_samples: int = 1, do_validate: bool = False,
+                           auto_save: bool = False):
     """主交互循环：生成 → 操作选择 → 保存/重试/变体/退出。
 
-    当 num_samples > 1 时自动批量生成，跳过交互。
+    当 num_samples > 1 时自动批量生成。
+    auto_save=True 时单样本也直接保存退出（CLI 全参数模式）。
     """
     if num_samples > 1:
         print(f'  [批量生成 {num_samples} 个变体]')
@@ -561,6 +598,11 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
             )
             save_to_musicxml(full_list, tokenizer, path, max_bars_total)
             print(f'    [OK] 已保存: {os.path.abspath(path)}')
+            if do_validate:
+                from scripts.validate_generation import validate_generated_xml
+                vr = validate_generated_xml(path, tokenizer=tokenizer)
+                if not vr['passed']:
+                    print(f'    [!] 验证警告: {vr["summary"]}')
         print(f'\n  [批量完成] 生成了 {num_samples} 个变体')
         return
 
@@ -580,6 +622,18 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
         )
 
         # 操作选择
+        if auto_save:
+            save_to_musicxml(full_list, tokenizer, gen_path, max_bars_total)
+            print(f'\n  [OK] 已保存: {os.path.abspath(gen_path)}')
+            if do_validate:
+                from scripts.validate_generation import validate_generated_xml
+                vr = validate_generated_xml(gen_path, tokenizer=tokenizer)
+                if vr['passed']:
+                    print('      验证通过: ' + vr['summary'])
+                else:
+                    print('      [!] 验证: ' + vr['summary'])
+            return
+
         print('  操作选择:')
         print('    [s] 保存并退出')
         if gen_idx > 1:
@@ -591,6 +645,13 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
         if choice == 's':
             save_to_musicxml(full_list, tokenizer, gen_path, max_bars_total)
             print(f'\n  [OK] 已保存: {os.path.abspath(gen_path)}')
+            if do_validate:
+                from scripts.validate_generation import validate_generated_xml
+                vr = validate_generated_xml(gen_path, tokenizer=tokenizer)
+                if vr['passed']:
+                    print('      验证通过: ' + vr['summary'])
+                else:
+                    print('      [!] 验证: ' + vr['summary'])
             return
         elif choice == 'r' and gen_idx > 1:
             print()
@@ -612,14 +673,28 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
 # -- 主入口 ----------------------------------------------------
 
 def main():
+    # `--list-presets` 早期退出，避免 argparse 要求 checkpoint/input
+    if '--list-presets' in sys.argv:
+        from chopinote_cli.presets import list_presets as _lp
+        print('=== 可用预设 ===')
+        for p in _lp():
+            conds = []
+            if p.condition_key: conds.append(f'key={p.condition_key}')
+            if p.condition_time: conds.append(f'time={p.condition_time}')
+            if p.condition_tempo: conds.append(f'tempo={p.condition_tempo}')
+            if p.program is not None: conds.append(f'prog={p.program}')
+            extra = f' [{", ".join(conds)}]' if conds else ''
+            print(f'  {p.name:12s}  {p.label} — {p.description}{extra}')
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         description='Chopinote-AI 钢琴谱续写工具',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             '示例:\n'
-            '  chopinote-generate best.pt input.musicxml\n'
-            '  chopinote-generate best.pt input.musicxml --temp 1.2 --top-k 40\n'
-            '  chopinote-generate best.pt input.musicxml --seed 42 -n 3\n'
+            '  chopin best.pt input.musicxml\n'
+            '  chopin best.pt input.musicxml --temp 1.2 --top-k 40\n'
+            '  chopin best.pt input.musicxml --seed 42 -n 3\n'
         ),
     )
     parser.add_argument('checkpoint', help='模型权重文件路径 (.pt)')
@@ -646,6 +721,18 @@ def main():
                         help='速度模式: lock=锁定不变速, free=自由变速')
     parser.add_argument('--complexity', type=int, default=None,
                         help='音乐复杂度 0~10（0=最简单, 10=最复杂）')
+    parser.add_argument('--validate', action='store_true',
+                        help='生成后自动交叉验证 MusicXML 质量')
+    parser.add_argument('--preset', type=str, default=None,
+                        help='预设模板（baroque/romantic/classical 等）')
+    parser.add_argument('--condition-key', type=str, default=None,
+                        help='指定调性，如 C, Am, G 等')
+    parser.add_argument('--condition-time', type=str, default=None,
+                        help='指定拍号，如 4/4, 3/4, 6/8 等')
+    parser.add_argument('--condition-tempo', type=int, default=None,
+                        help='指定速度 BPM，如 60, 120, 180 等')
+    parser.add_argument('--list-presets', action='store_true',
+                        help='列出所有可用预设并退出')
     args = parser.parse_args()
 
     print('=== Chopinote-AI - 钢琴谱续写工具 ===')
@@ -700,16 +787,53 @@ def main():
     tempo_mode_bool = _mode_bool(args.tempo_mode)
     # ────────────────────────────────────────────────────
 
+    # ── 预设模板 ────────────────────────────────────────
+    preset = None
+    if args.preset:
+        preset = get_preset(args.preset)
+        if preset is None:
+            print(f'  [!] 未知预设: {args.preset}')
+            print(f'  可用预设: {", ".join(p.name for p in _list_presets())}')
+            sys.exit(1)
+        print(f'      [预设] {preset.label} — {preset.description}')
+
+    has_cli_params = any([
+        args.max_bars is not None, args.temp is not None,
+        args.top_k is not None, args.complexity is not None,
+        args.key_mode is not None, args.time_mode is not None,
+        args.tempo_mode is not None,
+    ])
+    if preset is None and not has_cli_params:
+        preset = _select_preset_interactive()
+    # ────────────────────────────────────────────────────
+
+    # 用预设值填充 CLI 默认值
+    if preset:
+        pa = preset.attrs()
+        _temp = args.temp if args.temp is not None else pa.get('temperature')
+        _top_k = args.top_k if args.top_k is not None else pa.get('top_k')
+        _complexity = args.complexity if args.complexity is not None else pa.get('complexity')
+        _key_mode = key_mode_bool if key_mode_bool is not None else pa.get('lock_key')
+        _time_mode = time_mode_bool if time_mode_bool is not None else pa.get('lock_time')
+        _tempo_mode = tempo_mode_bool if tempo_mode_bool is not None else pa.get('lock_tempo')
+    else:
+        _temp = args.temp
+        _top_k = args.top_k
+        _complexity = args.complexity
+        _key_mode = key_mode_bool
+        _time_mode = time_mode_bool
+        _tempo_mode = tempo_mode_bool
+
     # -- 第 3 步：参数设置 --------------------------------
     print('[3/4] 设置续写参数...')
     params = prompt_params(
         max_bars_cli=args.max_bars,
-        temperature_cli=args.temp,
-        top_k_cli=args.top_k,
-        complexity_cli=args.complexity,
-        key_mode_cli=key_mode_bool,
-        time_mode_cli=time_mode_bool,
-        tempo_mode_cli=tempo_mode_bool,
+        temperature_cli=_temp,
+        top_k_cli=_top_k,
+        complexity_cli=_complexity,
+        key_mode_cli=_key_mode,
+        time_mode_cli=_time_mode,
+        tempo_mode_cli=_tempo_mode,
         seed_bars=seed_bars_count,
         model_vocab_size=model_vocab_size,
     )
@@ -723,6 +847,37 @@ def main():
                       lock_time=params['lock_time'],
                       lock_tempo=params['lock_tempo'])
 
+    # ── 条件注入：控制 token 前缀 ────────────────────────
+    condition_tokens = []
+    condition_labels = []
+    conds = {}
+    if preset:
+        conds.update(preset.conditions())
+    if args.condition_key:
+        conds['key'] = args.condition_key
+    if args.condition_time:
+        conds['time'] = args.condition_time
+    if args.condition_tempo:
+        conds['tempo'] = args.condition_tempo
+
+    if 'key' in conds:
+        condition_tokens.append(tokenizer.encode_token(f'<Key {conds["key"]}>'))
+        condition_labels.append(f'调性 {conds["key"]}')
+    if 'time' in conds:
+        condition_tokens.append(tokenizer.encode_token(f'<TimeSig {conds["time"]}>'))
+        condition_labels.append(f'拍号 {conds["time"]}')
+    if 'tempo' in conds:
+        condition_tokens.append(tokenizer.encode_token(f'<Tempo {conds["tempo"]}>'))
+        condition_labels.append(f'速度 {conds["tempo"]} BPM')
+    if 'program' in conds:
+        condition_tokens.append(tokenizer.encode_token(f'<Program {conds["program"]}>'))
+        condition_labels.append(f'音色 {conds["program"]}')
+
+    if condition_tokens:
+        seed_tokens = condition_tokens + seed_tokens
+        print(f'      [条件] {" | ".join(condition_labels)}')
+    # ────────────────────────────────────────────────────
+
     print()
 
     # -- 第 4 步：生成 + 交互循环 -------------------------
@@ -734,7 +889,8 @@ def main():
     interactive_retry_loop(
         model, tokenizer, seed_tensor, device,
         params, output_path, max_bars_total, model_vocab_size,
-        num_samples=args.num_samples,
+        num_samples=args.num_samples, do_validate=args.validate,
+        auto_save=has_cli_params,
     )
     print()
 
