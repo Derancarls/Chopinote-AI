@@ -5,6 +5,7 @@ MusicXML预处理管道
 import os
 import json
 import pickle
+import copy
 import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -544,6 +545,31 @@ class PDMXPreprocessor:
 
             # 7. 缓存
             self._add_to_cache(cache_key, result)
+
+            # ── 8. 移调增强 ──────────────────────────────────────
+            augment_cfg = self.config.get('dataset', {}).get('preprocessing', {}).get('augment', {})
+            if augment_cfg.get('transpose', False):
+                tr = augment_cfg.get('transpose_range', 3)
+                for semitone in range(-tr, tr + 1):
+                    if semitone == 0:
+                        continue
+                    transposed = self._transpose_pdmx(pdmx_data, semitone)
+                    if transposed is None:
+                        continue  # 音高越界
+                    try:
+                        tt, tc = self.converter.convert_pdmx(transposed, collect_metadata=True)
+                        if not self._check_sequence_length(tt):
+                            continue
+                        # 派生元数据（保持原 metadata 大部分字段，只改 file_id/title）
+                        tm = copy.copy(metadata)
+                        sign = '+' if semitone > 0 else ''
+                        tm.file_id = f"{metadata.file_id}_t{sign}{semitone}"
+                        tm.num_tokens = len(tt)
+                        self._save_processed_file(file_path, tt, tm, tc, output_dir)
+                    except Exception:
+                        continue
+            # ────────────────────────────────────────────────────────
+
             return result
 
         except Exception as e:
@@ -629,6 +655,19 @@ class PDMXPreprocessor:
         return 'unknown'
 
     # ---- 以下方法与 MusicXMLPreprocessor 相同 ----
+
+    def _transpose_pdmx(self, pdmx_data: dict, semitones: int) -> Optional[dict]:
+        """返回移调后的 pdmx_data deepcopy，音高越界则返回 None。"""
+        data = copy.deepcopy(pdmx_data)
+        for track in data.get('tracks', []):
+            for note in track.get('notes', []):
+                pitch = note.get('pitch')
+                if pitch is not None:
+                    new_pitch = pitch + semitones
+                    if new_pitch < 0 or new_pitch > 127:
+                        return None
+                    note['pitch'] = new_pitch
+        return data
 
     def _passes_quality_check(self, metadata: MusicMetadata) -> bool:
         config = self.config['dataset']['quality_checks']

@@ -54,6 +54,10 @@ def main():
                         help='配置文件路径')
     parser.add_argument('--max-files', type=int, default=None,
                         help='最大处理文件数（测试用）')
+    parser.add_argument('--augment-transpose', action='store_true', default=None,
+                        help='启用移调增强（覆盖 config.yaml 设置）')
+    parser.add_argument('--transpose-range', type=int, default=None,
+                        help='移调范围 ±N semitones（默认 3）')
     args = parser.parse_args()
 
     start_time = time.time()
@@ -62,6 +66,13 @@ def main():
 
     # ── 1. PDMX → REMI tokens ──────────────────────────────
     preprocessor = PDMXPreprocessor(config_path=args.config)
+
+    # CLI 参数覆盖 config 中的增强设置
+    if args.augment_transpose is not None:
+        preprocessor.config.setdefault('dataset', {}).setdefault('preprocessing', {}).setdefault('augment', {})['transpose'] = args.augment_transpose
+    if args.transpose_range is not None:
+        preprocessor.config.setdefault('dataset', {}).setdefault('preprocessing', {}).setdefault('augment', {})['transpose_range'] = args.transpose_range
+
     processed, failed = preprocessor.process_directory(
         input_dir=args.input_dir,
         output_dir=args.output_dir,

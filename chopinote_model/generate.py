@@ -88,6 +88,18 @@ DRUM_KIT_NAME = 'Drums'
 SUBTRACK_RANGES: dict[int, dict[int, tuple[int, int]]] = {
     p: {0: (48, 96), 1: (28, 72)} for p in range(8)  # piano 0-7
 }
+# ── 弦乐器 subtrack 级音域 — subtrack 0 = 一提/高音区, subtrack 1 = 二提/低音区
+SUBTRACK_RANGES.update({
+    40: {0: (62, 103), 1: (55, 88)},   # Violin
+    41: {0: (55, 96), 1: (48, 84)},     # Viola
+    42: {0: (42, 76), 1: (36, 67)},     # Cello
+    43: {0: (32, 64), 1: (28, 55)},     # Contrabass
+    44: {0: (62, 103), 1: (55, 88)},    # Tremolo Strings
+    45: {0: (62, 103), 1: (55, 88)},    # Pizzicato Strings
+})
+# ── 弦乐合奏
+for p in range(48, 52):
+    SUBTRACK_RANGES[p] = {0: (55, 96), 1: (48, 84)}
 
 # 30 个调名 → 7 个自然音级 (pitch class 0-11) 的映射
 # 大调 = Ionian, 小调 = Aeolian (自然小调)
@@ -172,6 +184,34 @@ GM_INSTRUMENT_RANGES: dict[int, tuple[int, int]] = {
     108: (48, 84), 109: (58, 79), 110: (55, 103), 111: (55, 96),
     # ── Percussive (112-119) + Sound Effects (120-127): 无音高限制 ──
 }
+
+
+# ── 乐器级复音上限 ─────────────────────────────────────────────
+# 同 position 每 track 最大同时发音数，key = (program_start, program_end)
+INSTRUMENT_POLYPHONY_CAP: dict[tuple[int, int], int] = {
+    (0, 7): 10,      # Piano — full chords
+    (8, 15): 6,      # Chromatic Percussion
+    (16, 23): 6,     # Organ
+    (24, 31): 4,     # Guitar
+    (32, 39): 2,     # Bass — monophonic
+    (40, 47): 2,     # Strings — monophonic
+    (48, 51): 4,     # Ensemble strings
+    (52, 55): 3,     # Vocal
+    (56, 63): 2,     # Brass — monophonic
+    (64, 71): 2,     # Reed/Woodwind — monophonic
+    (72, 79): 2,     # Pipe/Flute — monophonic
+    (80, 103): 6,    # Synth
+    (104, 111): 2,   # Ethnic
+    (112, 127): 8,   # Percussion/Effects
+}
+
+
+def get_polyphony_cap(program: int) -> int:
+    """根据 program 返回乐器级复音上限。"""
+    for (start, end), cap in INSTRUMENT_POLYPHONY_CAP.items():
+        if start <= program <= end:
+            return cap
+    return 10  # fallback
 
 
 def _parse_program(token_str: str) -> int:
@@ -425,6 +465,22 @@ def tokens_to_notes(token_ids: list[int],
             })
             i += 1
             continue
+        elif etype == REMITokenizer.OCTAVE:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'octave', 'value': evalue,
+            })
+            i += 1
+            continue
+        elif etype == REMITokenizer.ARPEGGIO:
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'arpeggio',
+            })
+            i += 1
+            continue
         # ── 其他暂不支持的标记 ──────────────────────────
         elif etype in (REMITokenizer.CLEF,
                        REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO,
@@ -478,9 +534,10 @@ def notes_to_score(notes_list: list[dict],
 
     max_existing_bar = max(bars.keys())
 
-    # 收集踏板/渐强渐弱事件（music21 Spanner 序列化有缺陷，后处理注入 XML）
+    # 收集踏板/渐强渐弱/八度记号事件（music21 Spanner 序列化有缺陷，后处理注入 XML）
     _pedal_events: list[dict] = []
     _hairpin_events: list[dict] = []
+    _octave_events: list[dict] = []
 
     for bar_idx in range(1, max_existing_bar + 1):
         if bar_idx > max_bars:
@@ -660,6 +717,17 @@ def notes_to_score(notes_list: list[dict],
                                     for sub_n in el.notes:
                                         sub_n.expressions.append(orn_obj)
                                 break
+                elif m['type'] == 'arpeggio':
+                    for el in meas.notesAndRests:
+                        if abs(el.offset - offset) < 1e-6:
+                            if isinstance(el, chord.Chord):
+                                el.expressions.append(expressions.ArpeggioMark())
+                            break
+                elif m['type'] == 'octave':
+                    _octave_events.append({
+                        'bar': bar_idx, 'key': key,
+                        'pos': m['position'], 'value': m['value'],
+                    })
 
         for key in all_keys_sorted:
             parts[key].append(meas_by_key[key])
@@ -669,6 +737,8 @@ def notes_to_score(notes_list: list[dict],
         score._pedal_events = _pedal_events
     if _hairpin_events:
         score._hairpin_events = _hairpin_events
+    if _octave_events:
+        score._octave_events = _octave_events
     return score
 
 
@@ -676,10 +746,11 @@ def notes_to_score(notes_list: list[dict],
 
 def _inject_directions_in_musicxml(filepath: str,
                                    pedal_events: list[dict],
-                                   hairpin_events: list[dict]):
-    """MusicXML 后处理：注入踏板和渐强/渐弱方向标记。
+                                   hairpin_events: list[dict],
+                                   octave_events: list[dict] = None):
+    """MusicXML 后处理：注入踏板、渐强/渐弱、八度方向标记。
 
-    music21 的 PedalMark/Crescendo/Diminuendo 都是 Spanner 子类，
+    music21 的 PedalMark/Crescendo/Diminuendo/Ottava 都是 Spanner 子类，
     直接插入 measure 后无法正确序列化，因此改为在 XML 文件中直接注入。
     """
     import re
@@ -718,6 +789,41 @@ def _inject_directions_in_musicxml(filepath: str,
                 '\n      </direction>'
             ))
 
+    # 八度记号（octave-shift）
+    if octave_events:
+        # Map octave token values to XML octave-shift attributes
+        # 8va → type="up" size="8", 8vb → type="down" size="8"
+        # 15ma → type="up" size="15", 15mb → type="down" size="15"
+        for ev in octave_events:
+            bar_num = ev['bar']
+            val = ev['value']
+            if val == 'end':
+                xml_snippet = (
+                    '      <direction placement="below">'
+                    '\n        <direction-type>'
+                    '\n          <octave-shift type="stop" size="8" number="1"/>'
+                    '\n        </direction-type>'
+                    '\n      </direction>'
+                )
+            else:
+                # '8va', '8vb', '15ma', '15mb'
+                is_down = 'b' in val
+                size = val.replace('va', '').replace('vb', '').replace('ma', '').replace('mb', '')
+                shift_type = 'down' if is_down else 'up'
+                xml_snippet = (
+                    '      <direction placement="below">'
+                    '\n        <direction-type>'
+                    f'\n          <octave-shift type="{shift_type}" size="{size}" number="1"/>'
+                    '\n        </direction-type>'
+                    '\n      </direction>'
+                )
+            pattern = rf'(<measure[^>]*?number="{bar_num}"[^>]*>.*?)(</measure>)'
+            content = re.sub(
+                pattern,
+                lambda m: m.group(1) + '\n' + xml_snippet + '\n    ' + m.group(2),
+                content, count=1, flags=re.DOTALL,
+            )
+
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
@@ -738,6 +844,7 @@ def generate_to_musicxml(model: MusicTransformer, tokenizer: REMITokenizer,
         output_path,
         pedal_events=getattr(score, '_pedal_events', []),
         hairpin_events=getattr(score, '_hairpin_events', []),
+        octave_events=getattr(score, '_octave_events', []),
     )
     logger.info(f'生成完成: {output_path}')
     return output_path

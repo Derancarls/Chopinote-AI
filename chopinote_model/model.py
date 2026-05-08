@@ -173,18 +173,3 @@ class MusicTransformer(nn.Module):
 
         return logits
 
-    def compute_loss(self, input_ids: torch.Tensor,
-                     attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """计算 next-token prediction loss。"""
-        logits = self.forward(input_ids, attention_mask)  # (B, T, V)
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = input_ids[:, 1:].contiguous()
-
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-            reduction='sum',
-        )
-        loss = loss / max(1, (shift_labels != -100).sum())
-        return loss

@@ -13,7 +13,7 @@
 │   ├── train.py                    训练循环 Trainer
 │   └── dataset.py                  流式加载 TokenDataset
 ├── chopinote_dataset/
-│   ├── tokenizer.py                REMITokenizer（vocab=831）
+│   ├── tokenizer.py                REMITokenizer（vocab=837）
 │   ├── converter.py                MusicXMLToREMI / PDMXToREMI
 │   ├── processor.py                批量预处理
 │   ├── splitter.py                 80/10/10 数据集划分
@@ -38,8 +38,8 @@
 ## 核心架构
 
 ### Tokenizer（REMI）
-- grid_size=16, velocity_levels=8 → vocab=831
-- 24 种 token 类型：Special/Bar/Position/Program/Note_ON/Velocity/Duration/Clef/Dynamic/Hairpin/Artic/Ornament/Pedal/Slur/Repeat/Jump/Tempo/TupletStart/TupletEnd/TimeSig/Rest/GraceNote/Key/Beat
+- grid_size=16, velocity_levels=8 → vocab=837
+- 26 种 token 类型：Special/Bar/Position/Program/Note_ON/Velocity/Duration/Clef/Dynamic/Hairpin/Artic/Ornament/Pedal/Slur/Repeat/Jump/Tempo/TupletStart/TupletEnd/TimeSig/Rest/GraceNote/Key/Beat/Octave/Arpeggio
 - 关键常量和属性：`pad_token_id=0`, `bos_token_id=1`, `eos_token_id=2`, `mask_id=3`, `bar_token_id=4`
 
 ### Model
@@ -70,7 +70,7 @@ MusicXML → MusicXMLToREMI → token IDs → 种子截取 → OOB clamp
 7. Program 切换促进（低频乐器增加采样权重）
 8. 音高范围（Subtrack 级 SUBTRACK_RANGES + GM_INSTRUMENT_RANGES）
 9. 调性偏置（KEY_TO_DIATONIC_PITCHES，key_bias_strength=2.0）
-10. 复音上限（max_polyphony，非钢琴 ≤4 音/拍）
+10. 复音上限（乐器级 INSTRUMENT_POLYPHONY_CAP，弦乐/铜管/木管 ≤2，钢琴 ≤10）
 11. top-k 截断
 12. softmax + multinomial 采样
 
@@ -125,7 +125,9 @@ MusicXML → MusicXMLToREMI → token IDs → 种子截取 → OOB clamp
 - 预设系统（dense/simple/balanced/default）
 
 ### 已知问题
-1. **乐器分轨混乱**：小提琴声部出现和弦式织体（弦乐本质单音），钢琴音高混入小提琴声部。需加强 subtrack 级音域约束和非钢琴乐器的 polyphony 上限。
+1. ~~**乐器分轨混乱**（v0.1.1-Beta4 已修复）：小提琴声部出现和弦式织体、钢琴音高混入小提琴声部。~~
+   - 修复：新增 `INSTRUMENT_POLYPHONY_CAP` 乐器级复音上限（弦乐/铜管/木管 ≤2，钢琴 ≤10）
+   - 重构 per-track polyphony 追踪，扩展弦乐 SUBTRACK_RANGES
 2. **和声理解不足**：生成中出现不和谐音程（小二度、增四度），调性偏置力度不够。模型 10 层 768 dim 容量可能不足以充分学习调性和声。
 
 ## 约定

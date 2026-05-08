@@ -45,6 +45,11 @@ dataset:
     token_dir: "./data/processed/tokens"
     metadata_dir: "./data/processed/metadata"
 
+  # 数据增强
+  augment:
+    transpose: false
+    transpose_range: 3
+
   # 质量检查
   quality_checks:
     min_file_size_kb: 1

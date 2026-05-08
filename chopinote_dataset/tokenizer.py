@@ -12,13 +12,29 @@ class REMITokenizer:
         <PAD>, <BOS>, <EOS>, <MASK>  — Special tokens
         <Bar>                         — Bar line
         <Position N>                  — Position in measure (0 to grid_size-1)
-        <Track_L>, <Track_R>          — Left/right hand markers
+        <Program N> / <Program N_M>   — Program change with subtrack
         <Note_ON P>                   — Note on with MIDI pitch (0-127)
         <Velocity V>                  — Velocity level (0 to velocity_levels-1)
         <Duration D>                  — Duration in position steps (1 to grid_size)
+        <Clef type>                   — Clef (treble/bass/alto/tenor)
+        <Dynamic val>                 — Dynamic marking (ppp..fp)
+        <Hairpin val>                 — Crescendo/diminuendo
+        <Artic val>                   — Articulation (staccato..fermata)
+        <Ornament val>                — Ornament (trill..tremolo)
+        <Pedal val>                   — Pedal (start/end)
+        <Slur val>                    — Slur (start/end)
+        <Repeat val>                  — Repeat (start/end/volta)
+        <Jump val>                    — Jump (da_capo..fine)
+        <Tempo BPM>                   — Tempo (30-240, step 10)
         <TupletStart N:M>             — Tuplet start with ratio
         <TupletEnd>                   — Tuplet end
         <TimeSig N/M>                 — Time signature
+        <Rest>                        — Rest
+        <GraceNote type>              — Grace note (acciaccatura/appoggiatura/grace)
+        <Key NAME>                    — Key signature (C, G, D, ..., Abm)
+        <Beat N>                      — Beat position (1-16)
+        <Octave val>                  — Octave shift (8va/8vb/15ma/15mb/end)
+        <Arpeggio>                    — Arpeggio mark
 
     Vocabulary is built dynamically from grid_size and velocity_levels.
     """
@@ -54,6 +70,8 @@ class REMITokenizer:
     GRACE_NOTE = '<GraceNote'      # 倚音: acciaccatura, appoggiatura, grace
     KEY = '<Key'                   # 调号: C, G, D, A, E, B, F#, C#, F, Bb, Eb, Ab, Db, Gb, Cb (major) / Am, Em, ... (minor)
     BEAT = '<Beat'                 # 拍位: 1 起，如 <Beat 1>（=强拍）、<Beat 2> 等
+    OCTAVE = '<Octave'             # 八度记号: 8va, 8vb, 15ma, 15mb, end
+    ARPEGGIO = '<Arpeggio>'        # 琶音记号（自闭合，无参数）
 
     # 最多支持的拍数（与 grid_size 16 对齐）
     MAX_BEATS = 16
@@ -257,6 +275,18 @@ class REMITokenizer:
             self._id_to_token[idx] = t
             idx += 1
 
+        # <Octave 8va>, <Octave 8vb>, <Octave 15ma>, <Octave 15mb>, <Octave end>
+        for oct_val in ('8va', '8vb', '15ma', '15mb', 'end'):
+            t = f'{self.OCTAVE} {oct_val}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Arpeggio>（自闭合）
+        self._token_to_id[self.ARPEGGIO] = idx
+        self._id_to_token[idx] = self.ARPEGGIO
+        idx += 1
+
     @property
     def vocab_size(self) -> int:
         return len(self._token_to_id)
@@ -367,4 +397,9 @@ class REMITokenizer:
             elif token.startswith(self.BEAT):
                 val = int(token[len(self.BEAT) + 1:-1])  # e.g. 1, 2, 3, 4
                 events.append((self.BEAT, val))
+            elif token.startswith(self.OCTAVE):
+                val = token[len(self.OCTAVE) + 1:-1]  # e.g. '8va', '8vb', 'end'
+                events.append((self.OCTAVE, val))
+            elif token == self.ARPEGGIO:
+                events.append((self.ARPEGGIO, None))
         return events

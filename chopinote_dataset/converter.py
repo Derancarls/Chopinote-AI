@@ -207,6 +207,14 @@ class MusicXMLToREMI:
                         extra.append((measure_idx, pos, part_idx,
                                       REMITokenizer.SLUR, slur_type))
 
+                    # 八度记号
+                    elif isinstance(elem, spanner.Ottava):
+                        shift = getattr(elem, 'shift', 8)
+                        ott_type = getattr(elem, 'type', 'alta')  # 'alta' or 'bassa'
+                        oct_val = f'{shift}vb' if ott_type == 'bassa' else f'{shift}va'
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.OCTAVE, oct_val))
+
                     # 延长记号
                     elif isinstance(elem, expressions.Fermata):
                         extra.append((measure_idx, pos, part_idx,
@@ -251,6 +259,11 @@ class MusicXMLToREMI:
                         if exp_name in ('trill', 'mordent', 'turn', 'tremolo'):
                             extra.append((measure_idx, pos, part_idx,
                                           REMITokenizer.ORNAMENT, exp_name))
+
+                    # 琶音记号
+                    if getattr(elem, 'arpeggio', None) is not None:
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.ARPEGGIO, None))
 
                     # 获取音高
                     if isinstance(elem, note.Note):
@@ -400,25 +413,6 @@ class MusicXMLToREMI:
             events.insert(0, (REMITokenizer.KEY, key_name))
         return events
 
-    def _identify_hands(self, parts) -> Tuple[int, int]:
-        """返回 (left_hand_idx, right_hand_idx)。
-
-        优先根据谱号判断，回退为 first=right, second=left。
-        """
-        right_idx = 0
-        left_idx = 1 if len(parts) > 1 else 0
-
-        for i, part in enumerate(parts):
-            try:
-                for c in part.flatten().getElementsByClass(clef.Clef):
-                    if 'treble' in c.sign.lower():
-                        right_idx = i
-                    elif 'bass' in c.sign.lower():
-                        left_idx = i
-            except Exception:
-                continue
-
-        return left_idx, right_idx
 
 
 class PDMXToREMI:
