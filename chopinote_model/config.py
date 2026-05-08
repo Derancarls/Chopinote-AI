@@ -5,7 +5,7 @@ from dataclasses import dataclass
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 4090 24GB）。"""
-    vocab_size: int = 831
+    vocab_size: int = 837
     d_model: int = 768
     n_layers: int = 10
     n_heads: int = 12

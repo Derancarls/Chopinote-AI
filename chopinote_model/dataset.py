@@ -36,9 +36,7 @@ class TokenDataset(Dataset):
         self.file_lengths: list[int] = []
         for fp in self.file_paths:
             try:
-                path = self.data_dir / 'tokens' / Path(fp).name
-                if not path.exists():
-                    path = Path(fp)
+                path = self._resolve_path(fp)
                 if path.exists():
                     with open(path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
@@ -65,6 +63,13 @@ class TokenDataset(Dataset):
         self._cache: dict[int, list[int]] = {}
         self._cache_max = 16
 
+    def _resolve_path(self, file_path: str) -> Path:
+        """将 split 文件中的路径解析为实际 token 文件路径。"""
+        path = self.data_dir / 'tokens' / Path(file_path).name
+        if not path.exists():
+            path = Path(file_path)
+        return path
+
     def __len__(self) -> int:
         return max(len(self.valid_indices) * 4, 2048)
 
@@ -72,9 +77,7 @@ class TokenDataset(Dataset):
         """加载文件 tokens（带 LRU 缓存）。"""
         if file_idx in self._cache:
             return self._cache[file_idx]
-        path = self.data_dir / 'tokens' / Path(self.file_paths[file_idx]).name
-        if not path.exists():
-            path = Path(self.file_paths[file_idx])
+        path = self._resolve_path(self.file_paths[file_idx])
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         self._cache[file_idx] = data

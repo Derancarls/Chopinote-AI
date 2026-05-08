@@ -1,5 +1,24 @@
 # 修改方向记录
 
+## 2026-05-09 — 乐器分轨改进（已完成）
+
+**改动：** 针对「小提琴声部出现和弦」和「钢琴音高窜到小提琴声部」的修复。
+
+### 措施
+1. **乐器级复音上限** — 新增 `INSTRUMENT_POLYPHONY_CAP` 字典，按乐器类别设定同 position 每 track 的最大同时发音数：
+   - 弦乐/铜管/木管/贝斯：上限 2（单音旋律乐器）
+   - 钢琴：上限 10（可弹和弦）
+   - 其他：4-8
+   - 新增 `get_polyphony_cap(program)` 函数查询
+
+2. **Per-track polyphony 追踪** — polyphony 限制从全局统一 cap 改为 per-(program, subtrack) 独立追踪，不同乐器不再互相影响
+
+3. **弦乐 subtrack 级音域** — 扩展 `SUBTRACK_RANGES` 加入 Violin/Viola/Cello/Contrabass/Tremolo/Pizzicato/Ensemble 的 subtrack 划分
+
+### 文件
+- `chopinote_model/generate.py`: 新增常量和函数，扩展 SUBTRACK_RANGES
+- `chopinote_cli/main.py`: 重构 polyphony 追踪逻辑，默认 max_polyphony 10→8
+
 ## 2026-05-08 — 实测问题记录
 
 ### 1. 乐器分轨混乱

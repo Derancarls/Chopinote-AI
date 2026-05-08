@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
 
 from .config import ModelConfig, TrainingConfig
 
@@ -60,6 +61,10 @@ class Trainer:
         self.global_step = 0
         self.best_loss = float('inf')
         self._last_avg_loss = float('inf')
+
+        # TensorBoard 监控
+        self.writer = SummaryWriter(log_dir=train_config.log_dir)
+        logger.info(f'TensorBoard 日志目录: {train_config.log_dir}')
 
         # 创建输出目录
         Path(train_config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -163,7 +168,8 @@ class Trainer:
                 self.global_step += 1
 
                 if self.global_step % config.grad_accum_steps == 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
                     self.scaler.step(optimizer)
                     self.scaler.update()
                     scheduler.step()
@@ -173,6 +179,8 @@ class Trainer:
                 if self.global_step % config.logging_steps == 0:
                     avg_loss = total_loss / config.logging_steps
                     self._last_avg_loss = avg_loss
+                    self.writer.add_scalar('train/loss', avg_loss, self.global_step)
+                    self.writer.add_scalar('train/lr', scheduler.get_last_lr()[0], self.global_step)
                     elapsed = time.time() - start_time
                     logger.info(
                         f'Step {self.global_step}/{config.total_steps} | '
@@ -186,6 +194,7 @@ class Trainer:
                 if val_dataloader is not None and \
                    self.global_step % config.eval_steps == 0:
                     val_loss = self.evaluate(val_dataloader)
+                    self.writer.add_scalar('val/loss', val_loss, self.global_step)
                     logger.info(f'Validation loss: {val_loss:.4f}')
                     model.train()
 
@@ -195,6 +204,7 @@ class Trainer:
 
         # 最终保存
         self.save_checkpoint(self._last_avg_loss)
+        self.writer.close()
         logger.info('训练完成')
 
     @torch.no_grad()

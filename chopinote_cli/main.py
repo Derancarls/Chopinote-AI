@@ -283,7 +283,7 @@ def generate_with_progress(
         lock_program: 只允许 seed 已有的乐器（防多轨污染）
         complexity: 音乐密度 0-10
         rest_penalty: Rest token 负偏置（越大休止越少）
-        max_polyphony: 同一粒度内最大同时发音数（模拟手指上限）
+        max_polyphony: 全局同粒度最大同时发音数（配合乐器级 INSTRUMENT_POLYPHONY_CAP 使用）
 
     Returns:
         (1, T_total) 完整生成序列, stats dict
@@ -296,7 +296,7 @@ def generate_with_progress(
     # ── 音高限制准备 ──────────────────────────────────────────
     from chopinote_model.generate import (
         GM_INSTRUMENT_RANGES, SUBTRACK_RANGES, KEY_TO_DIATONIC_PITCHES,
-        _parse_program, _parse_subtrack,
+        _parse_program, _parse_subtrack, get_polyphony_cap,
     )
     note_on_ids = [tokenizer.encode_token(f'<Note_ON {p}>') for p in range(128)]
     _prog_prefix = '<Program'
@@ -361,16 +361,16 @@ def generate_with_progress(
         )
     # ─────────────────────────────────────────────────────
 
-    # ── 多音 count 跟踪（同 Position 内的 NOTE_ON 数） ───
+    # ── 多音 count 跟踪（同 Position 内每 track 的 NOTE_ON 数） ───
     cur_position = -1
-    notes_this_pos: dict[int, int] = {}
+    notes_this_pos: dict[tuple[int, int], int] = {}  # (program, subtrack) -> count
 
     # ── 调性跟踪（从 seed 反向扫描获取当前调性） ──────
     current_key: str | None = None
     for tid in reversed(seed_tokens[0].tolist()):
         ts = tokenizer.decode_token(tid)
         if ts.startswith('<Key'):
-            current_key = ts[len('<Key ') + 1:-1]  # 如 'C', 'Am', 'F#'
+            current_key = ts[len('<Key') + 1:-1]  # 如 'C', 'Am', 'F#'
             break
 
     # ── seed 复杂度基线 ───────────────────────────
@@ -480,10 +480,13 @@ def generate_with_progress(
                             logits[0, tid] -= key_bias_strength * 0.5
         # ───────────────────────────────────────────
 
-        # ── 多音限制（polyphony cap） ─────────────────────
+        # ── 多音限制（per-track 乐器级上限） ─────────────────
         if max_polyphony > 0:
-            total_active = sum(notes_this_pos.values())
-            if total_active >= max_polyphony:
+            track_key = (cur_program, cur_subtrack)
+            track_count = notes_this_pos.get(track_key, 0)
+            inst_cap = get_polyphony_cap(cur_program) if cur_program is not None else max_polyphony
+            effective_cap = min(inst_cap, max_polyphony)
+            if track_count >= effective_cap:
                 for pid in note_on_ids:
                     if pid < vocab_dim:
                         logits[0, pid] = float('-inf')
@@ -503,7 +506,7 @@ def generate_with_progress(
         # 追踪 Program / Position / NOTE_ON
         ts = tokenizer.decode_token(token_id)
         if ts.startswith('<Key'):
-            current_key = ts[len('<Key ') + 1:-1]
+            current_key = ts[len('<Key') + 1:-1]
         if ts.startswith(_prog_prefix):
             cur_program = _parse_program(ts)
             cur_subtrack = _parse_subtrack(ts)
@@ -512,12 +515,13 @@ def generate_with_progress(
             cur_position += 1
             notes_this_pos.clear()
         elif ts.startswith('<Note_ON') and max_polyphony > 0:
-            if sum(notes_this_pos.values()) < max_polyphony:
-                notes_this_pos[cur_subtrack] = notes_this_pos.get(cur_subtrack, 0) + 1
+            track_key = (cur_program, cur_subtrack)
+            track_count = notes_this_pos.get(track_key, 0)
+            inst_cap = get_polyphony_cap(cur_program) if cur_program is not None else max_polyphony
+            effective_cap = min(inst_cap, max_polyphony)
+            if track_count < effective_cap:
+                notes_this_pos[track_key] = track_count + 1
             notes_since_last_switch += 1
-            pair_key = (cur_program, cur_subtrack)
-            if pair_key in program_note_counts:
-                program_note_counts[pair_key] += 1
 
         if token_id == bar_id:
             bar_count += 1
@@ -560,11 +564,12 @@ def save_to_musicxml(
     score = notes_to_score(notes, grid_size=tokenizer.grid_size, max_bars=max_bars)
     score.write('musicxml', fp=output_path)
 
-    # ── 后处理：踏板 + 渐强渐弱标记 ──────────────────
+    # ── 后处理：踏板 + 渐强渐弱 + 八度记号 ──────────────
     _inject_directions_in_musicxml(
         output_path,
         pedal_events=getattr(score, '_pedal_events', []),
         hairpin_events=getattr(score, '_hairpin_events', []),
+        octave_events=getattr(score, '_octave_events', []),
     )
     # ─────────────────────────────────────────────────
 
