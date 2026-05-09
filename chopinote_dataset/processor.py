@@ -17,7 +17,7 @@ import numpy as np
 from tqdm import tqdm
 
 try:
-    from .converter import MusicXMLToREMI, PDMXToREMI
+    from .converter import MusicXMLToREMI, PDMXToREMI, MIDIToREMI
     from .tokenizer import REMITokenizer
 except ImportError:
     from converter import MusicXMLToREMI, PDMXToREMI
@@ -775,3 +775,351 @@ class PDMXPreprocessor:
         stats_path = os.path.join(output_dir, 'processing_stats.json')
         with open(stats_path, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
+
+
+class MIDIPreprocessor:
+    """MIDI → REMI 预处理管道。
+
+    用 music21 解析 MIDI 文件，通过 MIDIToREMI 转换为 token 序列，
+    输出与 MusicXMLPreprocessor / PDMXPreprocessor 兼容的 token 和元数据。
+    """
+
+    def __init__(self, config_path: str = "config.yaml"):
+        import yaml
+        with open(config_path, 'r', encoding='utf-8') as f:
+            self.config = yaml.safe_load(f)
+
+        remi_cfg = self.config['dataset']['preprocessing']['remi']
+        self.converter = MIDIToREMI(
+            grid_size=remi_cfg['grid_size'],
+            velocity_levels=remi_cfg['velocity_levels'],
+        )
+        self.tokenizer = REMITokenizer(
+            grid_size=remi_cfg['grid_size'],
+            velocity_levels=remi_cfg['velocity_levels'],
+        )
+        self._create_directories()
+        self.cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def _create_directories(self):
+        dirs = [
+            self.config['dataset']['storage']['processed_dir'],
+            self.config['dataset']['storage']['cache_dir'],
+            self.config['dataset']['storage']['token_dir'],
+            self.config['dataset']['storage']['metadata_dir'],
+        ]
+        for dir_path in dirs:
+            Path(dir_path).mkdir(parents=True, exist_ok=True)
+
+    def process_directory(self, input_dir: str, output_dir: Optional[str] = None):
+        """处理目录下所有 MIDI 文件。"""
+        if output_dir is None:
+            output_dir = self.config['dataset']['storage']['processed_dir']
+
+        midi_files = self._find_midi_files(input_dir)
+        logger.info(f"找到 {len(midi_files)} 个 MIDI 文件")
+
+        processed_files = []
+        failed_files = []
+
+        for file_path in tqdm(midi_files, desc="处理 MIDI 文件"):
+            try:
+                result = self.process_file(file_path, output_dir)
+                if result:
+                    processed_files.append(result)
+                else:
+                    failed_files.append(file_path)
+            except Exception as e:
+                logger.error(f"处理文件失败 {file_path}: {e}")
+                failed_files.append(file_path)
+
+        self._save_processing_stats(processed_files, failed_files, output_dir)
+        return processed_files, failed_files
+
+    def _find_midi_files(self, directory: str) -> List[str]:
+        """递归查找 .mid / .midi 文件。"""
+        files = []
+        for root, _dirs, fnames in os.walk(directory):
+            for fname in fnames:
+                if fname.lower().endswith(('.mid', '.midi')):
+                    files.append(os.path.join(root, fname))
+        return files
+
+    def process_file(self, file_path: str, output_dir: str) -> Optional[Dict]:
+        """处理单个 MIDI 文件。"""
+        file_hash = self._compute_file_hash(file_path)
+        cache_key = f"midi_{file_hash}_{self.config['dataset']['preprocessing']['remi']['grid_size']}"
+
+        cached = self._get_from_cache(cache_key)
+        if cached:
+            self.cache_hits += 1
+            return cached
+        self.cache_misses += 1
+
+        try:
+            # 1. 解析 MIDI
+            score = converter.parse(file_path)
+
+            # 2. 提取元数据
+            metadata = self._extract_metadata(file_path, score)
+
+            # 3. 质量检查
+            if not self._passes_quality_check(metadata):
+                logger.warning(f"文件未通过质量检查: {file_path}")
+                return None
+
+            # 4. 转换为 REMI tokens
+            tokens, conv_meta = self.converter.convert_score(score, collect_metadata=True)
+
+            # 5. 序列长度检查
+            if not self._check_sequence_length(tokens):
+                logger.warning(f"序列长度不合适: {file_path} ({len(tokens)} tokens)")
+                return None
+
+            # 6. 保存结果
+            result = self._save_processed_file(file_path, tokens, metadata, conv_meta, output_dir)
+
+            # 7. 缓存
+            self._add_to_cache(cache_key, result)
+
+            # ── 8. 移调增强 ──────────────────────────────────────
+            augment_cfg = self.config.get('dataset', {}).get('preprocessing', {}).get('augment', {})
+            if augment_cfg.get('transpose', False):
+                tr = augment_cfg.get('transpose_range', 3)
+                for semitone in range(-tr, tr + 1):
+                    if semitone == 0:
+                        continue
+                    try:
+                        ts = score.transpose(semitone, inPlace=False)
+                    except Exception:
+                        continue
+                    # 检查是否有音高越界
+                    all_pitches = []
+                    for n in ts.flatten().notesAndRests:
+                        if hasattr(n, 'pitch') and hasattr(n.pitch, 'midi'):
+                            all_pitches.append(n.pitch.midi)
+                    if all_pitches and (min(all_pitches) < 0 or max(all_pitches) > 127):
+                        continue
+                    try:
+                        tt, tc = self.converter.convert_score(ts, collect_metadata=True)
+                        if not self._check_sequence_length(tt):
+                            continue
+                        tm = copy.copy(metadata)
+                        sign = '+' if semitone > 0 else ''
+                        tm.file_id = f"{metadata.file_id}_t{sign}{semitone}"
+                        tm.num_tokens = len(tt)
+                        self._save_processed_file(file_path, tt, tm, tc, output_dir)
+                    except Exception:
+                        continue
+            # ────────────────────────────────────────────────────────
+
+            return result
+
+        except Exception as e:
+            logger.error(f"处理 MIDI 文件时出错 {file_path}: {e}")
+            return None
+
+    def _extract_metadata(self, file_path: str, score) -> MusicMetadata:
+        """从 music21 Score 和文件路径提取元数据。"""
+        from music21 import key, tempo
+
+        p = Path(file_path)
+        # 作曲家：从路径中推断（如 .../asap/Bach/Fugue/... → Bach）
+        path_parts = p.parts
+        composer = 'Unknown'
+        for i, part in enumerate(path_parts):
+            if part.lower() in ASAP_COMPOSERS:
+                composer = part
+                break
+        if composer == 'Unknown' and len(path_parts) >= 3:
+            # 倒数第二级目录可能包含作曲家名
+            composer = path_parts[-2]
+
+        title = p.stem
+
+        # 音符统计
+        all_notes_nr = score.flatten().notesAndRests
+        notes_only = [n for n in all_notes_nr if hasattr(n, 'pitch')]
+        num_notes = len(notes_only)
+
+        # 小节数
+        measures = list(score.flatten().getElementsByClass('Measure'))
+        num_measures = len(measures) if measures else 1
+
+        # 拍号
+        ts = score.flatten().getElementsByClass('TimeSignature')
+        time_sig = f'{ts[0].numerator}/{ts[0].denominator}' if ts else '4/4'
+
+        # 调号
+        ks = score.flatten().getElementsByClass(key.Key)
+        if ks:
+            k = ks[0]
+            key_sig = k.tonic.name + ('m' if k.mode == 'minor' else '')
+        else:
+            key_sig = 'unknown'
+
+        # 速度
+        tms = score.flatten().getElementsByClass(tempo.MetronomeMark)
+        tempo_val = float(tms[0].number) if tms and tms[0].number else None
+
+        # 乐器
+        instruments = []
+        for part in score.parts:
+            instrs = list(part.flatten().getElementsByClass('Instrument'))
+            instruments.append(str(instrs[0]) if instrs else 'Unknown')
+
+        # 时长
+        duration_seconds = score.duration.quarterLength / 60  # rough estimate
+
+        return MusicMetadata(
+            file_id=self._generate_file_id(file_path),
+            file_path=file_path,
+            composer=composer,
+            title=title,
+            genre=self._infer_genre(composer, title),
+            year=None,
+            duration_seconds=duration_seconds,
+            num_measures=num_measures,
+            num_notes=num_notes,
+            num_tokens=0,
+            time_signature=time_sig,
+            key_signature=key_sig,
+            tempo=tempo_val,
+            instruments=instruments,
+            has_chords=False,
+            has_polyphony=len(list(score.parts)) > 1,
+            processing_time=0.0,
+            hash_md5=self._compute_file_hash(file_path),
+        )
+
+    def _infer_genre(self, composer: str, title: str) -> str:
+        combined = f'{composer} {title}'.lower()
+        for kw, genre in [
+            ('sonata', 'sonata'), ('ballade', 'ballade'), ('nocturne', 'nocturne'),
+            ('etude', 'etude'), ('prelude', 'prelude'), ('fugue', 'fugue'),
+            ('chorale', 'chorale'), ('waltz', 'waltz'), ('symphony', 'symphony'),
+            ('concerto', 'concerto'), ('mass', 'mass'), ('requiem', 'requiem'),
+            ('suite', 'suite'), ('variation', 'variation'), ('rondo', 'rondo'),
+            ('march', 'march'), ('polonaise', 'polonaise'), ('mazurka', 'mazurka'),
+            ('impromptu', 'impromptu'), ('scherzo', 'scherzo'),
+        ]:
+            if kw in combined:
+                return genre
+        return 'unknown'
+
+    def _passes_quality_check(self, metadata: MusicMetadata) -> bool:
+        config = self.config['dataset']['quality_checks']
+        file_size_kb = os.path.getsize(metadata.file_path) / 1024
+        if file_size_kb < config['min_file_size_kb']:
+            return False
+        if file_size_kb > config['max_file_size_mb'] * 1024:
+            return False
+        if metadata.num_notes < self.config['dataset']['preprocessing']['min_notes_per_file']:
+            return False
+        if metadata.num_notes > self.config['dataset']['preprocessing']['max_notes_per_file']:
+            return False
+        return True
+
+    def _check_sequence_length(self, tokens: List[int]) -> bool:
+        config = self.config['dataset']['preprocessing']
+        return config['min_tokens_per_sequence'] <= len(tokens) <= config['max_tokens_per_sequence']
+
+    def _save_processed_file(self, file_path: str, tokens: List[int],
+                             metadata: MusicMetadata, conversion_metadata: Dict,
+                             output_dir: str) -> Dict:
+        import time
+        start_time = time.time()
+        metadata.num_tokens = len(tokens)
+        token_filename = f"{metadata.file_id}.tokens"
+        meta_filename = f"{metadata.file_id}.meta.json"
+
+        token_path = os.path.join(output_dir, "tokens", token_filename)
+        os.makedirs(os.path.dirname(token_path), exist_ok=True)
+        with open(token_path, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f)
+
+        metadata.processing_time = time.time() - start_time
+        meta_dict = asdict(metadata)
+        meta_dict.update(conversion_metadata)
+        meta_path = os.path.join(output_dir, "metadata", meta_filename)
+        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta_dict, f, indent=2, ensure_ascii=False)
+
+        return {
+            'file_id': metadata.file_id,
+            'original_path': file_path,
+            'token_path': token_path,
+            'metadata_path': meta_path,
+            'num_tokens': len(tokens),
+            'metadata': meta_dict,
+        }
+
+    def _compute_file_hash(self, file_path: str) -> str:
+        import hashlib
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+    def _generate_file_id(self, file_path: str) -> str:
+        import uuid
+        return f"{Path(file_path).stem}_{self._compute_file_hash(file_path)[:8]}_{uuid.uuid4().hex[:8]}"
+
+    def _get_from_cache(self, cache_key: str) -> Optional[Dict]:
+        cache_file = os.path.join(
+            self.config['dataset']['storage']['cache_dir'],
+            f"{cache_key}.cache"
+        )
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except:
+                return None
+        return None
+
+    def _add_to_cache(self, cache_key: str, data: Dict):
+        cache_file = os.path.join(
+            self.config['dataset']['storage']['cache_dir'],
+            f"{cache_key}.cache"
+        )
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(data, f)
+        except:
+            pass
+
+    def _save_processing_stats(self, processed_files: List, failed_files: List, output_dir: str):
+        stats = {
+            'total_files': len(processed_files) + len(failed_files),
+            'processed_files': len(processed_files),
+            'failed_files': len(failed_files),
+            'success_rate': (len(processed_files) / (len(processed_files) + len(failed_files))
+                             if (len(processed_files) + len(failed_files)) > 0 else 0),
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'total_tokens': sum(f['num_tokens'] for f in processed_files),
+            'avg_tokens_per_file': float(np.mean([f['num_tokens'] for f in processed_files])) if processed_files else 0,
+            'composer_distribution': {},
+            'genre_distribution': {},
+        }
+        for f in processed_files:
+            c = f['metadata']['composer']
+            g = f['metadata']['genre']
+            stats['composer_distribution'][c] = stats['composer_distribution'].get(c, 0) + 1
+            stats['genre_distribution'][g] = stats['genre_distribution'].get(g, 0) + 1
+        stats_path = os.path.join(output_dir, 'processing_stats.json')
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+
+
+# ASAP 作曲家目录名（用于元数据推断）
+ASAP_COMPOSERS = {
+    'bach', 'balakirev', 'beethoven', 'brahms', 'chopin', 'debussy',
+    'glinka', 'haydn', 'liszt', 'mozart', 'prokofiev', 'rachmaninoff',
+    'ravel', 'schubert', 'schumann', 'scriabin',
+}

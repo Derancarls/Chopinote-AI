@@ -45,6 +45,8 @@ def safe_filename(name):
 def main():
     parser = argparse.ArgumentParser(description='准备训练数据')
     parser.add_argument('--include-local', action='store_true')
+    parser.add_argument('--include-midi', action='store_true',
+                        help='也处理 data/raw/ 下的 MIDI (.mid/.midi) 文件')
     parser.add_argument('--output-dir', default='data/processed')
     parser.add_argument('--augment-transpose', action='store_true',
                         help='对每首曲子做移调增强（默认 ±5 semitones）')
@@ -166,7 +168,27 @@ def main():
                 all_files.append(str(token_dir / f'{safe}.json'))
                 converted += 1
 
-    # ── 3. 文件列表 ───────────────────────────────────────
+    # ── 3. MIDI 文件 ───────────────────────────────────────
+    if args.include_midi:
+        from chopinote_dataset.processor import MIDIPreprocessor
+        mp = MIDIPreprocessor()
+        raw_dir = Path('data/raw')
+        midi_files = []
+        for ext in ('*.mid', '*.midi'):
+            midi_files.extend(raw_dir.rglob(ext))
+        print(f"MIDI 文件: {len(midi_files)}")
+        for path in tqdm(midi_files, desc="MIDI 文件"):
+            try:
+                result = mp.process_file(str(path), str(output_dir))
+                if result:
+                    all_files.append(result['token_path'])
+                    converted += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+
+    # ── 4. 文件列表 ───────────────────────────────────────
     with open(output_dir / 'all_files.txt', 'w', encoding='utf-8') as f:
         for fp in all_files:
             f.write(fp + '\n')
