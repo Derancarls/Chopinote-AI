@@ -4,6 +4,7 @@ structure.txt
 
 # Claude 配置
 .claude/
+CLAUDE.md
 
 # Python 虚拟环境
 music_ai_env/
