@@ -696,7 +696,245 @@ class PDMXToREMI:
                     events.append((REMITokenizer.VELOCITY, vel_level))
                     events.append((REMITokenizer.DURATION, dur))
 
-        # Key token 作为第一个内容事件
+        if key_name:
+            events.insert(0, (REMITokenizer.KEY, key_name))
+        return events
+
+
+class MIDIToREMI:
+    """MIDI → REMI 转换器。
+
+    用 music21 解析 MIDI 文件，提取音符骨架（音高/力度/时值/拍号/调号/
+    速度/拍位/乐器），不生成表现力标记。
+
+    支持 Standard MIDI File Type 0（单轨）和 Type 1（多轨）。
+    """
+
+    _DRUM_PROGRAMS = set(range(112, 128))
+
+    def __init__(self, grid_size: int = 16, velocity_levels: int = 8):
+        self.grid_size = grid_size
+        self.velocity_levels = velocity_levels
+        self.quarter_per_position = 4.0 / grid_size
+        self.tokenizer = REMITokenizer(grid_size, velocity_levels)
+
+    def convert(self, file_path: str, collect_metadata: bool = False):
+        """解析 MIDI 文件并转换为 REMI token ID 列表。"""
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return ([], {}) if collect_metadata else []
+
+        try:
+            score = converter.parse(file_path)
+        except Exception as e:
+            logger.error(f"Failed to parse MIDI {file_path}: {e}")
+            return ([], {}) if collect_metadata else []
+
+        return self._convert_score(score, file_path, collect_metadata)
+
+    def convert_score(self, score, collect_metadata: bool = False):
+        """转换已解析的 music21 Score 对象。"""
+        return self._convert_score(score, None, collect_metadata)
+
+    def _convert_score(self, score, file_path=None, collect_metadata=False):
+        events = self._score_to_events(score)
+        if not events:
+            if collect_metadata:
+                return [], {}
+            return []
+
+        full_events = [(REMITokenizer.BOS, None)] + events + [(REMITokenizer.EOS, None)]
+        token_ids = self.tokenizer.tokenize(full_events)
+
+        if collect_metadata:
+            metadata = {
+                'grid_size': self.grid_size,
+                'velocity_levels': self.velocity_levels,
+                'num_events': len(events),
+                'num_measures': sum(1 for e in events if e[0] == REMITokenizer.BAR),
+                'num_notes': sum(1 for e in events if e[0] == REMITokenizer.NOTE_ON),
+                'source_format': 'midi',
+            }
+            return token_ids, metadata
+        return token_ids
+
+    def _score_to_events(self, score) -> List[Tuple[str, Optional[Any]]]:
+        """music21 Score → REMI 事件列表（骨架模式，无表现力标记）。"""
+        parts = list(score.parts)
+        if not parts:
+            return []
+
+        # ── 检测 MIDI 类型 ──────────────────────────────────────
+        midi_type = getattr(score, 'midiType', 1)
+        if midi_type == 2:
+            logger.warning("MIDI Type 2 detected, skipping (unsupported)")
+            return []
+
+        # ── 调号提取 ──────────────────────────────────────────
+        from music21 import key
+        key_name: Optional[str] = None
+        key_objs = score.flatten().getElementsByClass(key.Key)
+        if key_objs:
+            k = key_objs[0]
+            key_name = k.tonic.name + ('m' if k.mode == 'minor' else '')
+        # ──────────────────────────────────────────────────────
+
+        # 构建 part → (program, subtrack) 映射，跳过鼓轨
+        program_counts: Dict[int, int] = {}
+        part_program_map: Dict[int, Tuple[int, int]] = {}
+        valid_part_indices = set()
+
+        for p_idx, part in enumerate(parts):
+            instr_objs = list(part.flatten().getElementsByClass(instrument.Instrument))
+            prog = (instr_objs[0].midiProgram
+                    if instr_objs and instr_objs[0].midiProgram is not None
+                    else 0)
+            if prog in self._DRUM_PROGRAMS:
+                continue
+            sub_cnt = program_counts.get(prog, 0)
+            sub = sub_cnt if sub_cnt < self.tokenizer.MAX_SUBTRACKS else 0
+            part_program_map[p_idx] = (prog, sub)
+            program_counts[prog] = sub_cnt + 1
+            valid_part_indices.add(p_idx)
+
+        if not part_program_map:
+            return []
+
+        # 收集事件与音符
+        extra: List[Tuple[int, int, int, str, Optional[Any]]] = []
+        all_notes: List[Tuple[int, int, int, int, int, int]] = []
+        last_timesig: Optional[str] = None
+
+        for part_idx, part in enumerate(parts):
+            if part_idx not in valid_part_indices:
+                continue
+
+            for measure_idx, measure in enumerate(part.getElementsByClass('Measure')):
+                measure_dur = measure.duration.quarterLength
+                if measure_dur <= 0:
+                    continue
+
+                positions_in_measure = max(1, int(measure_dur / self.quarter_per_position))
+                flat = measure.flatten()
+
+                # ── 非音符标记 ──────────────────────────────────
+                for elem in flat:
+                    pos = min(self.grid_size - 1,
+                              min(positions_in_measure - 1,
+                                  int(round(elem.offset / self.quarter_per_position))))
+
+                    if isinstance(elem, tempo.MetronomeMark):
+                        if elem.number is None:
+                            continue
+                        bpm = int(round(max(30, min(240, elem.number))))
+                        bpm = (bpm // 10) * 10
+                        extra.append((measure_idx, 0, part_idx,
+                                      REMITokenizer.TEMPO, bpm))
+
+                    elif isinstance(elem, meter.TimeSignature):
+                        ts_str = f'{elem.numerator}/{elem.denominator}'
+                        if ts_str in REMITokenizer.TIME_SIGNATURES and ts_str != last_timesig:
+                            extra.append((measure_idx, 0, part_idx,
+                                          REMITokenizer.TIMESIG, ts_str))
+                            last_timesig = ts_str
+
+                # ── 音符提取 ────────────────────────────────────
+                for elem in flat.notesAndRests:
+                    if isinstance(elem, note.Rest):
+                        continue  # V1: 不生成 Rest
+
+                    offset = elem.offset
+                    pos = min(self.grid_size - 1,
+                              min(positions_in_measure - 1,
+                                  int(round(offset / self.quarter_per_position))))
+
+                    if isinstance(elem, note.Note):
+                        pitches = [elem.pitch.midi]
+                    elif isinstance(elem, chord.Chord):
+                        pitches = [n.pitch.midi for n in elem.notes]
+                    else:
+                        continue
+
+                    vel = int(elem.volume.velocity) if elem.volume.velocity else 64
+                    vel_level = min(self.velocity_levels - 1,
+                                    vel // (128 // self.velocity_levels))
+
+                    dur_positions = max(1, min(self.grid_size,
+                                               int(round(elem.quarterLength / self.quarter_per_position))))
+
+                    for p in pitches:
+                        all_notes.append((measure_idx, pos, part_idx, p, vel_level, dur_positions))
+
+                # ── 拍位标记（仅第一个有效 part，避免重复）─────
+                if part_idx == min(valid_part_indices):
+                    num = den = None
+                    ts = measure.timeSignature
+                    if ts is not None:
+                        num, den = ts.numerator, ts.denominator
+                    elif last_timesig is not None:
+                        parts_ts = last_timesig.split('/')
+                        num, den = int(parts_ts[0]), int(parts_ts[1])
+                    if num is not None and den is not None:
+                        beat_interval = 4.0 / den
+                        beat_spacing = max(1, int(round(beat_interval / self.quarter_per_position)))
+                        for beat_num in range(num):
+                            beat_pos = beat_num * beat_spacing
+                            if beat_pos < positions_in_measure and beat_num < self.tokenizer.MAX_BEATS:
+                                extra.append((measure_idx, beat_pos, part_idx,
+                                              REMITokenizer.BEAT, beat_num + 1))
+
+        if not all_notes and not extra:
+            return []
+
+        # ── 合并、排序、组装 ────────────────────────────────────
+        merged: List[Tuple[int, int, int, int, float, str, tuple]] = []
+
+        for m_idx, pos, p_idx, ttype, val in extra:
+            priority = 0 if ttype == REMITokenizer.TIMESIG else 1
+            prog, sub = part_program_map[p_idx]
+            merged.append((m_idx, pos, prog, sub, priority, 'x', (ttype, val)))
+        for m_idx, pos, p_idx, p, vl, dr in all_notes:
+            prog, sub = part_program_map[p_idx]
+            merged.append((m_idx, pos, prog, sub, 2, 'n', (p, vl, dr)))
+
+        merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+
+        # ── 组装事件序列 ───────────────────────────────────────
+        events: List[Tuple[str, Optional[Any]]] = []
+        cur_measure = -1
+        cur_pos = -1
+        cur_program = -1
+        cur_subtrack = 0
+
+        for m, pos, prog, sub, _priority, kind, data in merged:
+            if m != cur_measure:
+                events.append((REMITokenizer.BAR, None))
+                cur_measure = m
+                cur_pos = -1
+                cur_program = -1
+
+            if pos != cur_pos:
+                events.append((REMITokenizer.POSITION, pos))
+                cur_pos = pos
+                cur_program = -1
+
+            if prog != cur_program or sub != cur_subtrack:
+                if sub == 0:
+                    events.append((REMITokenizer.PROGRAM, str(prog)))
+                else:
+                    events.append((REMITokenizer.PROGRAM, f'{prog}_{sub}'))
+                cur_program = prog
+                cur_subtrack = sub
+
+            if kind == 'x':
+                ttype, val = data
+                events.append((ttype, val))
+            else:  # 'n' — note
+                pitch, vel_level, dur = data
+                events.append((REMITokenizer.NOTE_ON, pitch))
+                events.append((REMITokenizer.VELOCITY, vel_level))
+                events.append((REMITokenizer.DURATION, dur))
+
         if key_name:
             events.insert(0, (REMITokenizer.KEY, key_name))
         return events

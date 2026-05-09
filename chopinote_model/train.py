@@ -4,7 +4,7 @@ import shutil
 import time
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,7 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from .config import ModelConfig, TrainingConfig
+from .dataset import TokenDataset, collate_fn
 
 logger = logging.getLogger(__name__)
 
@@ -117,9 +118,24 @@ class Trainer:
         self.best_loss = checkpoint.get('loss', float('inf'))
         logger.info(f'Resumed from checkpoint: {checkpoint_path} (step {self.global_step})')
 
-    def train(self, train_dataloader: DataLoader,
+    def train(self, train_dataloader: DataLoader = None,
               val_dataloader: Optional[DataLoader] = None):
-        """运行训练循环。"""
+        """训练入口：根据 phases 配置自动选择单阶段或多阶段模式。
+
+        单阶段（phases=None，向后兼容）：
+            train(train_dataloader, val_dataloader)
+
+        多阶段（phases 非空）：
+            自动从 phase.data_split_file 创建 dataloader。
+        """
+        if self.train_config.phases is not None and len(self.train_config.phases) > 0:
+            self._train_multiphase(val_dataloader)
+        else:
+            self._train_single_phase(train_dataloader, val_dataloader)
+
+    def _train_single_phase(self, train_dataloader: DataLoader,
+                            val_dataloader: Optional[DataLoader] = None):
+        """单阶段训练循环（原有逻辑不变）。"""
         config = self.train_config
         model = self.model
         optimizer = self.optimizer
@@ -127,7 +143,6 @@ class Trainer:
 
         model.train()
         total_loss = 0.0
-        logging_loss = 0.0
         start_time = time.time()
 
         logger.info(f'开始训练 | batch_size={config.batch_size} '
@@ -145,11 +160,10 @@ class Trainer:
                 labels = batch['labels'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
 
-                # 首次 batch 校验 vocab_size
                 if not _vocab_checked:
                     max_id = max(input_ids.max().item(), labels.max().item() if labels.numel() else 0)
                     assert max_id < model.config.vocab_size, \
-                        f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}，请更新 ModelConfig.vocab_size 并重新生成 token 数据'
+                        f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}'
                     _vocab_checked = True
 
                 with autocast(enabled=(self.device.type == 'cuda')):
@@ -161,7 +175,6 @@ class Trainer:
                         reduction='sum',
                     )
                     loss = loss / max(1, (labels != -100).sum())
-                # 先记录未除 grad_accum 的真实 loss，再做归一化 backward
                 total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
                 self.scaler.scale(loss).backward()
@@ -175,7 +188,6 @@ class Trainer:
                     scheduler.step()
                     optimizer.zero_grad()
 
-                # logging
                 if self.global_step % config.logging_steps == 0:
                     avg_loss = total_loss / config.logging_steps
                     self._last_avg_loss = avg_loss
@@ -190,7 +202,6 @@ class Trainer:
                     )
                     total_loss = 0.0
 
-                # 验证
                 if val_dataloader is not None and \
                    self.global_step % config.eval_steps == 0:
                     val_loss = self.evaluate(val_dataloader)
@@ -198,14 +209,161 @@ class Trainer:
                     logger.info(f'Validation loss: {val_loss:.4f}')
                     model.train()
 
-                # 保存
                 if self.global_step % config.save_steps == 0:
                     self.save_checkpoint(self._last_avg_loss)
 
-        # 最终保存
         self.save_checkpoint(self._last_avg_loss)
         self.writer.close()
         logger.info('训练完成')
+
+    def _train_multiphase(self, val_dataloader: Optional[DataLoader] = None):
+        """多阶段分层训练。
+
+        按 phases 列表顺序执行，每阶段：
+        - 从 phase.data_split_file 创建 DataLoader
+        - 若 phase.loss_mask 非空，屏蔽对应 token 的 loss
+        - 重建 optimizer/scheduler（使用阶段 LR 和 warmup）
+        - 模型参数在阶段之间保留
+        """
+        config = self.train_config
+        model = self.model
+
+        for phase_idx, phase in enumerate(config.phases):
+            logger.info(f'{"="*60}')
+            logger.info(f'Phase {phase_idx+1}/{len(config.phases)}: {phase.name}')
+            logger.info(f'  数据: {phase.data_split_file}')
+            logger.info(f'  步数: {phase.total_steps}')
+            logger.info(f'  LR: {phase.lr}')
+            logger.info(f'  Loss 屏蔽: {phase.loss_mask is not None}')
+            logger.info(f'{"="*60}')
+
+            # 创建本阶段 dataloader
+            dataset = TokenDataset(
+                split_file=phase.data_split_file,
+                data_dir=config.data_dir,
+                max_seq_len=self.model_config.max_seq_len,
+            )
+            phase_loader = DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=False,
+                collate_fn=collate_fn,
+                drop_last=True,
+            )
+
+            # 预计算 loss 屏蔽 token ID 集合
+            masked_ids: Optional[set] = None
+            if phase.loss_mask is not None:
+                from .config import TokenLossMask
+                from chopinote_dataset.tokenizer import REMITokenizer
+                t = REMITokenizer(grid_size=16, velocity_levels=8)
+                masked_ids = phase.loss_mask.get_masked_token_ids(t)
+                logger.info(f'  屏蔽 token 数: {len(masked_ids)}')
+
+            # 重建 optimizer
+            params = list(dict.fromkeys(model.parameters()))
+            optimizer = AdamW(
+                params, lr=phase.lr, weight_decay=0.1, betas=(0.9, 0.95),
+            )
+            self.scaler = GradScaler(enabled=(self.device.type == 'cuda'))
+
+            opt_total = max(1, phase.total_steps // config.grad_accum_steps)
+            opt_warmup = max(1, phase.warmup_steps // config.grad_accum_steps)
+            scheduler = _get_scheduler(optimizer, opt_warmup, opt_total)
+
+            # 阶段训练循环
+            model.train()
+            total_loss = 0.0
+            start_time = time.time()
+            phase_step = 0
+            _vocab_checked = False
+
+            while phase_step < phase.total_steps:
+                for batch in phase_loader:
+                    if phase_step >= phase.total_steps:
+                        break
+
+                    input_ids = batch['input_ids'].to(self.device)
+                    labels = batch['labels'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+
+                    if not _vocab_checked:
+                        max_id = max(input_ids.max().item(), labels.max().item() if labels.numel() else 0)
+                        assert max_id < model.config.vocab_size, \
+                            f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}'
+                        _vocab_checked = True
+
+                    # 应用 loss 屏蔽
+                    if masked_ids:
+                        labels = self._apply_loss_mask(labels, masked_ids)
+
+                    with autocast(enabled=(self.device.type == 'cuda')):
+                        logits = model(input_ids, attention_mask)
+                        loss = nn.functional.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            labels.view(-1),
+                            ignore_index=-100,
+                            reduction='sum',
+                        )
+                        loss = loss / max(1, (labels != -100).sum())
+                    total_loss += loss.item()
+                    loss = loss / config.grad_accum_steps
+                    self.scaler.scale(loss).backward()
+                    self.global_step += 1
+                    phase_step += 1
+
+                    if phase_step % config.grad_accum_steps == 0:
+                        total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
+                        scheduler.step()
+                        optimizer.zero_grad()
+
+                    if phase_step % config.logging_steps == 0:
+                        avg_loss = total_loss / config.logging_steps
+                        self._last_avg_loss = avg_loss
+                        self.writer.add_scalar('train/loss', avg_loss, self.global_step)
+                        self.writer.add_scalar('train/lr', scheduler.get_last_lr()[0], self.global_step)
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f'[{phase.name}] Step {phase_step}/{phase.total_steps} '
+                            f'(global {self.global_step}) | '
+                            f'Loss: {avg_loss:.4f} | '
+                            f'LR: {scheduler.get_last_lr()[0]:.2e} | '
+                            f'Time: {elapsed:.1f}s'
+                        )
+                        total_loss = 0.0
+
+                    if val_dataloader is not None and \
+                       phase_step % phase.eval_steps == 0:
+                        val_loss = self.evaluate(val_dataloader)
+                        self.writer.add_scalar('val/loss', val_loss, self.global_step)
+                        logger.info(f'[{phase.name}] Validation loss: {val_loss:.4f}')
+                        model.train()
+
+                    if phase_step % phase.save_steps == 0:
+                        self.save_checkpoint(self._last_avg_loss)
+
+            # 阶段终了保存
+            self.save_checkpoint(self._last_avg_loss)
+            logger.info(f'Phase {phase.name} 完成 (global_step={self.global_step})')
+
+        self.writer.close()
+        logger.info('多阶段训练完成')
+
+    @staticmethod
+    def _apply_loss_mask(labels: torch.Tensor, masked_ids: set) -> torch.Tensor:
+        """向量化 loss 屏蔽：将 labels 中属于 masked_ids 的 token 设为 -100。"""
+        if not masked_ids:
+            return labels
+        mask_tensor = torch.tensor(list(masked_ids), device=labels.device)
+        is_masked = torch.isin(labels, mask_tensor)
+        labels = labels.clone()
+        labels[is_masked] = -100
+        return labels
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader) -> float:
