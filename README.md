@@ -1,103 +1,172 @@
 # Chopinote-AI
 
-自动生成古典钢琴曲谱的 AI 系统。
+输入一首钢琴曲（MusicXML），让 AI 帮你续写下去，生成完整的古典风格乐谱。
 
 ---
 
-## v0.1.1-Beta (2026-05-07)
+## 它能做什么
 
-### 新增
-- 强弱拍位 token（`<Beat 1>`~`<Beat 16>`），词表 815→831，模型感知节拍层级
-- 调性标记 token（30 个标准调号 `Key C`~`Key Abm`），MusicXML/PDMX 自动提取
-- PDMX 反复记号支持：`start-repeat` / `end-repeat` 与 MusicXML 对齐
-- FlashAttention（`F.scaled_dot_product_attention`），自动选择最优 cuDNN 后端
-- Gradient checkpointing，减少训练显存占用
-- fp16 混合精度训练（autocast + GradScaler）
-- 乐器音高限制（GM_INSTRUMENT_RANGES），按乐器范围屏蔽非法音高
-- `torch.compile` 支持（`TrainingConfig.compile` 开关）
-- 数据集划分 CLI（`scripts/preprocess_pdmx.py` 可覆盖 cfg 模板参数）
-- 云服务器一键部署脚本 `setup_cloud.sh`（支持自动解压 data.tar.gz / PDMX.tar.gz）
+给你一首曲子的开头片段，比如肖邦的前奏曲前几小节，Chopinote-AI 会用自回归的方式逐 token 续写，生成风格匹配的后续乐章。最终输出标准的 MusicXML 文件，可以在 MuseScore、Finale、Sibelius 等打谱软件中打开和编辑。
 
-### 修复
-- `converter.py`: PDMX 预处理中 Position 钳位修复
-- `converter.py`: PDMXToREMI API 一致性修复
-- `converter.py`: `_find_pdmx_files` 正确剪枝 metadata 目录，防止 254K 元数据 JSON 误处理
-- `generate.py`: 移除废弃代码
-- `model.py`: `compute_loss` ignore_index 对齐（0 → -100）
-- `train.py`: `evaluate()` 缺少 autocast 导致精度不一致
-- `train.py`: GradScaler 状态未持久化到 checkpoint
-- `model.py`: 移除废弃的 `MusicTransformer.generate()` 方法
-- 训练首步 vocab_size 自动校验
+支持以下音乐元素的生成：
+
+- **音符骨架**：音高、节奏、和声、多声部
+- **力度**：ppp 到 fff，渐强/渐弱
+- **演奏法**：跳音、重音、保持音、琶音、装饰音（颤音/回音/波音）
+- **踏板**：延音踏板记号
+- **连音**：三连音、五连音等
+- **乐器**：支持 General MIDI 标准的所有乐器，多轨同时生成
+- **拍号/调号/速度**：可锁定或自由变化
 
 ---
 
-## v0.1.0-Beta5 (2026-05-05)
+## 快速开始
 
-### 新增
-- Tuplet 连音 token（`<TupletStart 3:2>` / `<TupletEnd>`）：20 种常见比率，支持三连音至 22 连音
-- 拍号 token（`<TimeSig 4/4>` 等 14 种）：词表标记小节拍号变化
-- `tokenizer.py`：词表 236 → 271，detokenize 支持所有新 token 类型
-- `converter.py`：Tuplet 检测（`duration.tuplets`）+ TimeSig 检测（`meter.TimeSignature`），事件合并按 priority 排序
-- `generate.py`：`tokens_to_notes()` 解析 TupletStart/TupletEnd 并标记音符；`notes_to_score()` 按比率缩放偏移和时值，输出 music21 `DurationTuplet`
+### 安装
 
----
+```bash
+pip install -e .
+```
 
-## v0.1.0-Beta4 (2026-05-04)
+### 下载预训练权重
 
-### 新增
-- CLI 命令行续写工具 `chopinote-generate`（交互式参数、KV cache、tqdm 进度条）
-- `pyproject.toml`：`pip install -e .` 可一键安装依赖
-- 乐谱标记词表扩展（175 → 236）：谱号、力度、渐强/渐弱、演奏法、装饰音、踏板、连奏线、反复、跳转、速度
+```bash
+# 推荐使用 step_94000_best.pt（v0.1.2-Beta1）
+# 下载后放到项目根目录即可
+```
 
-### 修复
-- `converter.py`: `Diminuendo` 渐弱记号未被捕获，训练数据丢失渐弱事件
-- `converter.py`: `MetronomeMark.number is None` 时崩溃（文字型速度标记如 "Andante"）
-- `model.py`: 因果掩码在 KV cache 推理时错误应用（改为仅首次 forward 应用）
-- `train.py`: Weight tying 导致 Embedding 层梯度累加两次，等效学习率翻倍（Optimizer 参数去重）
-- `train.py`: CrossEntropy `reduction='mean'` 全 mask 时 NaN（改为 `sum` + 安全除法，共 3 处）
-- `train.py`: Scheduler 按 batch step 而非 optimizer step 调度，warmup 与 decay 提前结束
-- `generate.py`: 独立 `generate()` 无 KV cache，每步重算全序列注意力 O(T²)
-- `generate.py`: Session 状态泄漏（训练→评估切换后 `model.eval()` 未在后续训练步恢复）
-- `generate.py`: 删除无用 import（`key as key21`, `bar`）
+### 基本使用
 
-### 移除
-- `generate.py` 独立 `generate()` 函数改为使用 KV cache，兼容旧调用接口
+```bash
+# 交互式续写：输入一首 MusicXML，AI 帮你写完
+chopin step_94000_best.pt input.musicxml
 
----
+# 指定输出文件
+chopin step_94000_best.pt input.musicxml -o output.musicxml
 
-## v0.1.0-beta1 (2026-05-04)
+# 一次生成多份变体
+chopin step_94000_best.pt input.musicxml -n 5
+```
 
-### 新增
-- REMI Tokenizer（grid_size=16, velocity_levels=8, 词表 175）
-- MusicXML→REMI 转换器（双手谱按谱号自动分配左右手）
-- 数据集划分模块（80/10/10）
-- Decoder-only Transformer 模型（6层, d_model=256, 8头, ~5.3M 参数）
-- Memory-mapped 流式数据集加载（适配 8GB 内存）
-- 训练循环（AdamW + warmup + cosine decay + 梯度累积）
-- 自回归生成管线（top-k + temperature 采样, KV cache）
-- 随机权重 MusicXML 导出测试
-- 数据预处理脚本（music21 语料库 → token 序列）
-- CUDA 12.1 + Python 3.12 训练环境适配
+### 控制生成风格
 
-### 修复
-- `converter.py`: `.flat` → `.flatten()`（music21 废弃 API）
-- `converter.py`: `from music21 import rest` → `note.Rest`
-- `converter.py`: BAR 元数据统计改用 `sum(1 for ...)` 避免 None 异常
-- `prepare_corpus.py`: Opus 多乐章对象拆分处理
-- `prepare_corpus.py`: Opus 同名文件添加 `_{idx}` 后缀防覆盖
-- `model.py`: KV cache NoneType 初始化检查
-- `model.py`: `compute_loss` 移除 `@torch.no_grad()`（训练时无法反向传播）
+```bash
+# 使用预设风格
+chopin step_94000_best.pt input.musicxml --preset baroque
+chopin step_94000_best.pt input.musicxml --preset romantic
+chopin step_94000_best.pt input.musicxml --preset jazz
 
-### 移除
-- `music_ai_env/`（Python 3.14 CPU 环境，已废弃）
-- `structure.txt`
-- 旧版存根代码（converter.py / tokenizer.py 占位逻辑）
+# 手动调节参数
+chopin step_94000_best.pt input.musicxml --temp 1.2 --top-k 40 --complexity 7
+
+# 锁定部分音乐要素
+chopin step_94000_best.pt input.musicxml --key-mode lock     # 保持原调性
+chopin step_94000_best.pt input.musicxml --time-mode lock    # 保持原拍号
+chopin step_94000_best.pt input.musicxml --tempo-mode lock   # 保持原速度
+```
+
+### 种子截取
+
+```bash
+# 只使用前 4 小节作为种子
+chopin step_94000_best.pt input.musicxml --seed-bars 4
+
+# 指定种子文件
+chopin step_94000_best.pt input.musicxml --seed input_seed.musicxml
+```
 
 ---
 
-## v0.0.1 (2026-04-30)
+## 可用预设
 
-### 新增
-- 项目基础结构搭建
-- `config.yaml` 数据集配置
-- `processor.py` 预处理管线框架
+| 预设名 | 说明 | 复杂度 |
+|--------|------|--------|
+| `default` | 默认平衡模式 | 5 |
+| `dense` | 密集织体，音符多 | 7 |
+| `simple` | 简单织体，稀疏 | 2 |
+| `baroque` | 巴洛克风格 | 6 |
+| `romantic` | 浪漫主义风格 | 6 |
+| `classical` | 古典主义风格 | 4 |
+| `minimal` | 极简风格 | 2 |
+| `jazz` | 爵士风格 | 6 |
+| `church` | 圣咏风格 | 3 |
+
+---
+
+## 训练自己的模型
+
+### 数据处理
+
+```bash
+# 准备训练数据（MusicXML → token 序列）
+python scripts/prepare_corpus.py
+
+# 包含本地文件和 MIDI 文件
+python scripts/prepare_corpus.py --include-local --include-midi
+
+# 带移调增强（±5 半音 = 11 倍扩充）
+python scripts/prepare_corpus.py --augment-transpose
+```
+
+### 训练
+
+```bash
+# 分层训练：先用 MIDI 预训练音符骨架，再用 MusicXML 微调细节
+python scripts/run_curriculum_training.py \
+    --midi-train-list data/processed/midi_train.txt \
+    --musicxml-train-list data/processed/train.txt \
+    --phase1-steps 250000 \
+    --phase2-steps 100000
+```
+
+训练时自动启用 TensorBoard 监控，可实时查看 loss、学习率、梯度变化。
+
+---
+
+## 技术概要
+
+| 模块 | 说明 |
+|------|------|
+| **模型架构** | Decoder-only Transformer，156M 参数，12 层，d_model=1024 |
+| **tokenizer** | REMI 编码，grid_size=16，velocity_levels=8，词表 837 |
+| **注意力** | FlashAttention + KV cache 推理 + gradient checkpointing 训练 |
+| **数据来源** | MusicXML 语料库 + PDMX 数据集 + MIDI 数据集（Lakh/Aria/Bread/MAESTRO） |
+| **训练策略** | 两阶段分层训练：Phase 1 MIDI 预训练（屏蔽表现力 token），Phase 2 全量微调 |
+| **硬件** | RTX 4090 24GB（当前配置完全利用可用显存） |
+
+---
+
+## 项目结构
+
+```
+├── chopinote_cli/main.py           CLI 入口
+├── chopinote_model/
+│   ├── config.py                   模型和训练配置
+│   ├── model.py                    Transformer 模型
+│   ├── train.py                    训练循环
+│   ├── generate.py                 推理生成
+│   └── dataset.py                  数据加载
+├── chopinote_dataset/
+│   ├── tokenizer.py                REMI 编解码（词表 837）
+│   ├── converter.py                乐谱 → token 转换
+│   ├── processor.py                批量预处理
+│   └── splitter.py                 数据集划分
+├── scripts/
+│   ├── prepare_corpus.py           数据准备
+│   ├── preprocess_pdmx.py          PDMX 预处理
+│   ├── run_curriculum_training.py  分层训练入口
+│   └── validate_generation.py      生成结果验证
+├── design_docs/                    设计文档
+└── tests/                          测试（87 个）
+```
+
+---
+
+## 版本历史
+
+- **v0.1.2-Beta1**: 模型升级 156M、MIDI 转换管道、分层训练、测试体系
+- **v0.1.1-Beta5**: 移调增强、TensorBoard 监控、调性 Bug 修复
+- **v0.1.1-Beta4**: 连音 token、拍号 token、词表扩展
+- **v0.1.1-Beta3**: 预设系统、多轨保持、CLI 完善
+- **v0.1.0-Beta5**: 乐谱标记系统（力度/演奏法/装饰音/踏板）
+- **v0.1.0-beta1**: 首个可运行版本，基础模型 + 生成管线
