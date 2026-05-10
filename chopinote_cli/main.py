@@ -172,7 +172,7 @@ def _apply_complexity(logits, complexity: float, tokenizer):
     """根据复杂度值 (0-10) 修改 logits，控制音乐密度和丰富程度。
     偏置值为加法，叠加到原始 logits 上。
     """
-    if complexity == 5.0:
+    if abs(complexity - 5.0) < 1e-6:
         return  # 默认值不做任何修改
 
     vocab_dim = logits.size(-1)
@@ -397,13 +397,22 @@ def generate_with_progress(
     cached_measure_ids = torch.cumsum((seed_tokens[0] == bar_id).int(), dim=0)
     seed_measure_count = cached_measure_ids[-1].item()  # seed 末位置的累计小节数
 
+    # 种子过长时截断（只保留最后 max_seq_len 个 token）
+    max_len = model.config.max_seq_len
+    if generated.size(1) > max_len:
+        trim = generated.size(1) - max_len
+        print(f'  [!] 种子长度 {generated.size(1)} > max_seq_len {max_len}，截断前 {trim} 个 token')
+        next_token = generated[:, -max_len:]
+        generated = generated[:, -max_len:]
+        cached_measure_ids = cached_measure_ids[-max_len:]
+        seed_measure_count = cached_measure_ids[-1].item()
+
     pbar = tqdm(total=max_bars, desc='生成中', unit='bar', ncols=80)
 
     for step in range(max_new_tokens):
-        # 位置编码保护：不超过 max_seq_len
-        if generated.size(1) >= model.config.max_seq_len:
-            print(f'\n  [!] 已达最大序列长度 ({model.config.max_seq_len} tokens)，停止生成')
-            break
+        # 滑窗回退：首轮后只喂最后一个 token（依靠 KV cache）
+        if generated.size(1) > max_len:
+            next_token = generated[:, -1:]
 
         logits = model.forward(next_token, kv_caches=kv_caches, measure_ids=cached_measure_ids)
         logits = logits[:, -1, :] / temperature  # (1, V)
@@ -523,7 +532,7 @@ def generate_with_progress(
             cur_subtrack = _parse_subtrack(ts)
             notes_since_last_switch = 0
         elif ts.startswith(_pos_prefix):
-            cur_position += 1
+            cur_position = int(ts[len(_pos_prefix) + 1:-1])
             notes_this_pos.clear()
         elif ts.startswith('<Note_ON') and max_polyphony > 0:
             track_key = (cur_program, cur_subtrack)
@@ -587,6 +596,7 @@ def save_to_musicxml(
         pedal_events=getattr(score, '_pedal_events', []),
         hairpin_events=getattr(score, '_hairpin_events', []),
         octave_events=getattr(score, '_octave_events', []),
+        all_keys=getattr(score, '_all_keys', None),
     )
     # ─────────────────────────────────────────────────
 

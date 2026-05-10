@@ -571,7 +571,7 @@ class PDMXToREMI:
 
         # 确定总小节数
         max_measure = max(
-            max(measure_starts.keys()),
+            max(measure_starts.keys(), default=0),
             max((n['measure'] - 1 for t in data.get('tracks', [])
                  for n in t.get('notes', [])), default=0),
         )

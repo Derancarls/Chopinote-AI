@@ -59,7 +59,7 @@ class TokenDataset(Dataset):
             if not self.valid_indices:
                 raise ValueError('没有可用的训练文件')
 
-        # LRU 缓存最近加载的文件
+        # FIFO 缓存最近加载的文件（随机采样下 FIFO ≈ LRU）
         self._cache: dict[int, list[int]] = {}
         self._cache_max = 16
 
@@ -67,11 +67,14 @@ class TokenDataset(Dataset):
         """将 split 文件中的路径解析为实际 token 文件路径。"""
         path = self.data_dir / 'tokens' / Path(file_path).name
         if not path.exists():
-            path = Path(file_path)
+            fallback = Path(file_path)
+            if not fallback.is_absolute():
+                fallback = self.data_dir / file_path
+            path = fallback
         return path
 
     def __len__(self) -> int:
-        return max(len(self.valid_indices) * 4, 2048)
+        return len(self.valid_indices)
 
     def _load_tokens(self, file_idx: int) -> list[int]:
         """加载文件 tokens（带 LRU 缓存）。"""
