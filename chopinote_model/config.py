@@ -6,7 +6,7 @@ from typing import List, Optional, Set
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 4090 24GB）。"""
-    vocab_size: int = 837
+    vocab_size: int = 872
     d_model: int = 1024
     n_layers: int = 12
     n_heads: int = 16
@@ -14,6 +14,8 @@ class ModelConfig:
     max_seq_len: int = 4096
     dropout: float = 0.1
     pad_token_id: int = 0
+    bar_token_id: int = 4
+    max_measures: int = 256
 
     @property
     def head_dim(self) -> int:
@@ -44,6 +46,8 @@ class TokenLossMask:
     mask_repeat: bool = True
     mask_jump: bool = True
     mask_tuplet: bool = True
+    mask_bass: bool = False
+    mask_anticipate: bool = False
 
     def get_masked_token_ids(self, tokenizer) -> Set[int]:
         """预计算需要屏蔽的 token ID 集合。"""
@@ -62,6 +66,8 @@ class TokenLossMask:
             'mask_repeat': REMITokenizer.REPEAT,
             'mask_jump': REMITokenizer.JUMP,
             'mask_tuplet': REMITokenizer.TUPLET_START,
+            'mask_bass': REMITokenizer.BASS,
+            'mask_anticipate': REMITokenizer.ANTICIPATE,
         }
         masked_ids: Set[int] = set()
         for attr, prefix in prefix_map.items():

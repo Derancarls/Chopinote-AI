@@ -160,7 +160,8 @@ def main():
                 if not tokens:
                     skipped += 1
                     continue
-                safe = path.stem.replace(' ', '_')
+                rel = path.relative_to(raw_dir)
+                safe = ('_'.join(rel.parts)).replace(' ', '_').replace('.', '_')
                 with open(token_dir / f'{safe}.json', 'w', encoding='utf-8') as f:
                     json.dump(tokens, f)
                 with open(meta_dir / f'{safe}.meta.json', 'w', encoding='utf-8') as f:

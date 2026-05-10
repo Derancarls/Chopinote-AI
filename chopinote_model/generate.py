@@ -9,7 +9,7 @@ from music21 import stream, note, chord, meter, clef
 
 from .model import MusicTransformer
 from .config import ModelConfig
-from chopinote_dataset.tokenizer import REMITokenizer
+from chopinote_dataset.tokenizer import REMITokenizer, key_name_to_tonic_midi
 
 logger = logging.getLogger(__name__)
 
@@ -255,17 +255,27 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
     eos_id = tokenizer.eos_token_id
 
     # ── 音高限制准备 ──────────────────────────────────────────
-    # 预计算每个 MIDI 音高的 NOTE_ON token ID
-    note_on_ids = [tokenizer.encode_token(f'<Note_ON {p}>') for p in range(128)]
+    _OFFSET = 60
+    # 预计算每个半音程的 NOTE_ON token ID（-60 .. +60）
+    note_on_ids = [tokenizer.encode_token(f'<Note_ON {i - _OFFSET}>')
+                   for i in range(121)]
     # Program token 前缀（不含末尾 >，匹配用 startswith）
     _prog_prefix = '<Program'
-    # 从 seed 中查找当前 program
+    _key_prefix = '<Key'
+    # 从 seed 中查找当前 program 和 key
     cur_program: int | None = None
+    current_key: str | None = None
     for tid in reversed(seed_tokens):
         ts = tokenizer.decode_token(tid)
         if ts.startswith(_prog_prefix):
             cur_program = _parse_program(ts)
             break
+    for tid in reversed(seed_tokens):
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith(_key_prefix):
+            current_key = ts[len(_key_prefix) + 1:-1]
+            break
+    tonic_midi = key_name_to_tonic_midi(current_key)
     # ──────────────────────────────────────────────────────────
 
     # 初始化 KV cache
@@ -273,6 +283,7 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
 
     generated = seed.clone()
     bar_count = seed_tokens.count(bar_id)
+    cached_measure_ids = torch.cumsum((seed[0] == bar_id).int(), dim=0)  # (T_seed,)
 
     # 首轮 forward 处理全部 seed
     next_token = seed
@@ -282,16 +293,17 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
         if ctx_len > model.config.max_seq_len:
             next_token = generated[:, -1:]
 
-        logits = model.forward(next_token, kv_caches=kv_caches)  # (1, T', V)
+        logits = model.forward(next_token, kv_caches=kv_caches,
+                                measure_ids=cached_measure_ids)  # (1, T', V)
         logits = logits[:, -1, :] / temperature  # (1, V)
 
         # ── 音高限制：遮盖当前乐器音域外的 NOTE_ON token ──
         if cur_program is not None and cur_program < 112:
             rmin, rmax = GM_INSTRUMENT_RANGES.get(cur_program, (0, 127))
-            for pitch in range(rmin):
-                logits[0, note_on_ids[pitch]] = float('-inf')
-            for pitch in range(rmax + 1, 128):
-                logits[0, note_on_ids[pitch]] = float('-inf')
+            for i in range(121):
+                midi_pitch = tonic_midi + (i - _OFFSET)
+                if midi_pitch < rmin or midi_pitch > rmax:
+                    logits[0, note_on_ids[i]] = float('-inf')
         # ──────────────────────────────────────────────────
 
         # top-k
@@ -306,13 +318,23 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
         ctx_len = generated.size(1)
         token_id = next_token.item()
 
-        # 追踪 Program 变化
+        # 追踪 Program / Key 变化
         ts = tokenizer.decode_token(token_id)
         if ts.startswith(_prog_prefix):
             cur_program = _parse_program(ts)
+        elif ts.startswith(_key_prefix):
+            current_key = ts[len(_key_prefix) + 1:-1]
+            tonic_midi = key_name_to_tonic_midi(current_key)
 
-        if token_id == bar_id:
-            bar_count += 1
+        # 更新 measure_ids 追踪
+        is_bar = (token_id == bar_id)
+        new_measure = bar_count + (1 if is_bar else 0)
+        cached_measure_ids = torch.cat(
+            [cached_measure_ids, torch.tensor([new_measure], device=device)]
+        )
+
+        if is_bar:
+            bar_count = new_measure
             if bar_count >= max_bars:
                 break
 
@@ -334,6 +356,7 @@ def tokens_to_notes(token_ids: list[int],
     cur_subtrack = 0
     cur_tuplet = None       # (actual, normal) or None
     cur_grace_type = None   # 'acciaccatura', 'appoggiatura', 'grace' or None
+    current_tonic = 60      # 默认 C4，遇到 KEY token 时更新
     i = 0
 
     while i < len(events):
@@ -390,7 +413,7 @@ def tokens_to_notes(token_ids: list[int],
             })
             i += 1
         elif etype == REMITokenizer.NOTE_ON:
-            pitch = evalue
+            pitch = current_tonic + evalue  # interval → 绝对 MIDI 音高
             # 接下来应该是 Velocity 和 Duration
             vel = 6  # default
             dur = 4  # default
@@ -481,10 +504,16 @@ def tokens_to_notes(token_ids: list[int],
             })
             i += 1
             continue
+        # ── KEY — 追踪主音，用于 interval → 绝对音高转换 ──
+        elif etype == REMITokenizer.KEY:
+            current_tonic = key_name_to_tonic_midi(evalue)
+            i += 1
+            continue
         # ── 其他暂不支持的标记 ──────────────────────────
         elif etype in (REMITokenizer.CLEF,
                        REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO,
-                       REMITokenizer.TIMESIG, REMITokenizer.KEY, REMITokenizer.BEAT):
+                       REMITokenizer.TIMESIG, REMITokenizer.BEAT,
+                       REMITokenizer.BASS, REMITokenizer.ANTICIPATE):
             i += 1
             continue
         else:

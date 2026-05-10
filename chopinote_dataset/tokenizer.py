@@ -5,6 +5,33 @@ Manages vocabulary and conversion between REMI events and token IDs.
 from typing import List, Tuple, Optional
 
 
+# ── 调号名 → 主音 MIDI 音高映射 ──────────────────────────────
+_KEY_PC_MAP = {
+    'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3,
+    'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8,
+    'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11, 'Cb': 11,
+}
+
+
+def key_name_to_tonic_midi(key_name: str | None) -> int:
+    """将调号名转为 MIDI 主音音高（八度 4），无调号时默认 C（60）。
+
+    >>> key_name_to_tonic_midi('C')
+    60
+    >>> key_name_to_tonic_midi('Am')
+    69
+    >>> key_name_to_tonic_midi('F#')
+    66
+    >>> key_name_to_tonic_midi(None)
+    60
+    """
+    if not key_name:
+        return 60
+    root = key_name[:-1] if key_name.endswith('m') else key_name
+    pc = _KEY_PC_MAP.get(root, 0)
+    return pc + 60
+
+
 class REMITokenizer:
     """REMI tokenizer for piano score tokenization.
 
@@ -13,7 +40,7 @@ class REMITokenizer:
         <Bar>                         — Bar line
         <Position N>                  — Position in measure (0 to grid_size-1)
         <Program N> / <Program N_M>   — Program change with subtrack
-        <Note_ON P>                   — Note on with MIDI pitch (0-127)
+        <Note_ON I>                   — Note on with semitone interval from tonic (-60 to +60)
         <Velocity V>                  — Velocity level (0 to velocity_levels-1)
         <Duration D>                  — Duration in position steps (1 to grid_size)
         <Clef type>                   — Clef (treble/bass/alto/tenor)
@@ -35,6 +62,8 @@ class REMITokenizer:
         <Beat N>                      — Beat position (1-16)
         <Octave val>                  — Octave shift (8va/8vb/15ma/15mb/end)
         <Arpeggio>                    — Arpeggio mark
+        <Bass N>                      — Bass note pitch class (0-11, C-B)
+        <Anticipate Key NAME>         — Anticipated key change target
 
     Vocabulary is built dynamically from grid_size and velocity_levels.
     """
@@ -72,6 +101,8 @@ class REMITokenizer:
     BEAT = '<Beat'                 # 拍位: 1 起，如 <Beat 1>（=强拍）、<Beat 2> 等
     OCTAVE = '<Octave'             # 八度记号: 8va, 8vb, 15ma, 15mb, end
     ARPEGGIO = '<Arpeggio>'        # 琶音记号（自闭合，无参数）
+    BASS = '<Bass'                 # 低音音级: 0~11（C~B）
+    ANTICIPATE = '<Anticipate'     # 预期调性变更目标: 如 Key C, Key G
 
     # 最多支持的拍数（与 grid_size 16 对齐）
     MAX_BEATS = 16
@@ -137,9 +168,9 @@ class REMITokenizer:
                 self._id_to_token[idx] = t
                 idx += 1
 
-        # <Note_ON 0> .. <Note_ON 127>
-        for pitch in range(128):
-            t = f'{self.NOTE_ON} {pitch}>'
+        # <Note_ON -60> .. <Note_ON +60>（半音程，相对主调主音）
+        for interval in range(-60, 61):
+            t = f'{self.NOTE_ON} {interval}>'
             self._token_to_id[t] = idx
             self._id_to_token[idx] = t
             idx += 1
@@ -287,6 +318,20 @@ class REMITokenizer:
         self._id_to_token[idx] = self.ARPEGGIO
         idx += 1
 
+        # <Bass 0> .. <Bass 11>（低音音级，C~B）
+        for bass_pc in range(12):
+            t = f'{self.BASS} {bass_pc}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Anticipate Key C> .. <Anticipate Key Abm>（30 个，复用 KEY_NAMES）
+        for key_name in self.KEY_NAMES:
+            t = f'{self.ANTICIPATE} {key_name}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
     @property
     def vocab_size(self) -> int:
         return len(self._token_to_id)
@@ -402,4 +447,10 @@ class REMITokenizer:
                 events.append((self.OCTAVE, val))
             elif token == self.ARPEGGIO:
                 events.append((self.ARPEGGIO, None))
+            elif token.startswith(self.BASS):
+                val = int(token[len(self.BASS) + 1:-1])  # 0~11
+                events.append((self.BASS, val))
+            elif token.startswith(self.ANTICIPATE):
+                val = token[len(self.ANTICIPATE) + 1:-1]  # e.g. 'C', 'Am'
+                events.append((self.ANTICIPATE, val))
         return events

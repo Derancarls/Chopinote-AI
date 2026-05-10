@@ -298,7 +298,11 @@ def generate_with_progress(
         GM_INSTRUMENT_RANGES, SUBTRACK_RANGES, KEY_TO_DIATONIC_PITCHES,
         _parse_program, _parse_subtrack, get_polyphony_cap,
     )
-    note_on_ids = [tokenizer.encode_token(f'<Note_ON {p}>') for p in range(128)]
+    from chopinote_dataset.tokenizer import key_name_to_tonic_midi
+    _OFFSET = 60
+    # NOTE_ON tokens 从绝对音高改为半音程（-60 .. +60）
+    note_on_ids = [tokenizer.encode_token(f'<Note_ON {i - _OFFSET}>')
+                   for i in range(121)]
     _prog_prefix = '<Program'
     _pos_prefix = '<Position'
     rest_id = tokenizer.encode_token('<Rest>')
@@ -367,10 +371,12 @@ def generate_with_progress(
 
     # ── 调性跟踪（从 seed 反向扫描获取当前调性） ──────
     current_key: str | None = None
+    current_tonic_midi: int = 60
     for tid in reversed(seed_tokens[0].tolist()):
         ts = tokenizer.decode_token(tid)
         if ts.startswith('<Key'):
             current_key = ts[len('<Key') + 1:-1]  # 如 'C', 'Am', 'F#'
+            current_tonic_midi = key_name_to_tonic_midi(current_key)
             break
 
     # ── seed 复杂度基线 ───────────────────────────
@@ -388,6 +394,8 @@ def generate_with_progress(
     generated = seed_tokens.clone()
     next_token = seed_tokens
     bar_count = 0
+    cached_measure_ids = torch.cumsum((seed_tokens[0] == bar_id).int(), dim=0)
+    seed_measure_count = cached_measure_ids[-1].item()  # seed 末位置的累计小节数
 
     pbar = tqdm(total=max_bars, desc='生成中', unit='bar', ncols=80)
 
@@ -397,7 +405,7 @@ def generate_with_progress(
             print(f'\n  [!] 已达最大序列长度 ({model.config.max_seq_len} tokens)，停止生成')
             break
 
-        logits = model.forward(next_token, kv_caches=kv_caches)
+        logits = model.forward(next_token, kv_caches=kv_caches, measure_ids=cached_measure_ids)
         logits = logits[:, -1, :] / temperature  # (1, V)
 
         # ── 复杂度控制 ──────────────────────────────────
@@ -454,27 +462,29 @@ def generate_with_progress(
                         logits[0, tid] += boost
         # ───────────────────────────────────────────
 
-        # ── 音高限制（subtrack 感知） ─────────────────────
+        # ── 音高限制（subtrack 感知，interval 空间） ──────────
         if cur_program is not None and cur_program < 112:
             sub_range = SUBTRACK_RANGES.get(cur_program, {}).get(cur_subtrack)
             if sub_range is not None:
                 rmin, rmax = sub_range
             else:
                 rmin, rmax = GM_INSTRUMENT_RANGES.get(cur_program, (0, 127))
-            for pitch in range(rmin):
-                logits[0, note_on_ids[pitch]] = float('-inf')
-            for pitch in range(rmax + 1, 128):
-                logits[0, note_on_ids[pitch]] = float('-inf')
+            for i in range(121):
+                abs_pitch = current_tonic_midi + (i - _OFFSET)
+                if abs_pitch < rmin or abs_pitch > rmax:
+                    logits[0, note_on_ids[i]] = float('-inf')
         # ──────────────────────────────────────────────────
 
-        # ── 调性音高偏置 ──────────────────────────
+        # ── 调性音高偏置（interval pitch class 空间） ────────
         if key_bias_strength > 0 and current_key is not None:
             diatonic_pcs = KEY_TO_DIATONIC_PITCHES.get(current_key)
             if diatonic_pcs is not None:
-                for pitch in range(128):
-                    tid = note_on_ids[pitch]
+                tonic_pc = current_tonic_midi % 12
+                for i in range(121):
+                    abs_pc = (tonic_pc + (i - _OFFSET)) % 12
+                    tid = note_on_ids[i]
                     if tid < vocab_dim:
-                        if (pitch % 12) in diatonic_pcs:
+                        if abs_pc in diatonic_pcs:
                             logits[0, tid] += key_bias_strength * 1.0
                         else:
                             logits[0, tid] -= key_bias_strength * 0.5
@@ -507,6 +517,7 @@ def generate_with_progress(
         ts = tokenizer.decode_token(token_id)
         if ts.startswith('<Key'):
             current_key = ts[len('<Key') + 1:-1]
+            current_tonic_midi = key_name_to_tonic_midi(current_key)
         if ts.startswith(_prog_prefix):
             cur_program = _parse_program(ts)
             cur_subtrack = _parse_subtrack(ts)
@@ -523,7 +534,13 @@ def generate_with_progress(
                 notes_this_pos[track_key] = track_count + 1
             notes_since_last_switch += 1
 
-        if token_id == bar_id:
+        is_bar = (token_id == bar_id)
+        new_measure = seed_measure_count + bar_count + (1 if is_bar else 0)
+        cached_measure_ids = torch.cat(
+            [cached_measure_ids, torch.tensor([new_measure], device=device)]
+        )
+
+        if is_bar:
             bar_count += 1
             pbar.update(1)
             if bar_count >= max_bars:
@@ -1021,6 +1038,8 @@ def main():
                         help='生成后自动交叉验证 MusicXML 质量')
     parser.add_argument('--preset', type=str, default=None,
                         help='预设模板（baroque/romantic/classical 等）')
+    parser.add_argument('--target-key', type=str, default=None,
+                        help='目标调性（如 G, Am），在种子末尾插入 Anticipate token 引导转调')
     parser.add_argument('--condition-key', type=str, default=None,
                         help='指定调性，如 C, Am, G 等')
     parser.add_argument('--condition-time', type=str, default=None,
@@ -1201,6 +1220,19 @@ def main():
     if condition_tokens:
         seed_tokens = condition_tokens + seed_tokens
         print(f'      [条件] {" | ".join(condition_labels)}')
+    # ────────────────────────────────────────────────────
+
+    # ── 目标调性（Anticipate token）─────────────────────
+    if args.target_key:
+        if args.target_key in REMITokenizer.KEY_NAMES:
+            anticipate_tid = tokenizer.encode_token(f'<Anticipate {args.target_key}>')
+            if anticipate_tid < model_vocab_size:
+                seed_tokens.append(anticipate_tid)
+                print(f'      [Anticipate] 目标调性 {args.target_key}')
+            else:
+                print(f'  [!] Anticipate token 超出模型词表 (vocab_size={model_vocab_size})，忽略')
+        else:
+            print(f'  [!] 无效目标调性: {args.target_key}，忽略')
     # ────────────────────────────────────────────────────
 
     print()

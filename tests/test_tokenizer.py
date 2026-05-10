@@ -3,7 +3,7 @@ from chopinote_dataset.tokenizer import REMITokenizer
 
 class TestVocabSize:
     def test_vocab_size(self, tokenizer):
-        assert tokenizer.vocab_size == 837
+        assert tokenizer.vocab_size == 872
 
     def test_grid16_vel8_determines_vocab(self):
         t1 = REMITokenizer(grid_size=16, velocity_levels=8)
@@ -34,8 +34,8 @@ class TestEncodeDecodeRoundtrip:
             assert tokenizer.decode_token(tokenizer.encode_token(t)) == t
 
     def test_note_on(self, tokenizer):
-        for p in [0, 60, 127]:
-            t = f'<Note_ON {p}>'
+        for interval in [-60, -1, 0, 1, 60]:
+            t = f'<Note_ON {interval}>'
             assert tokenizer.decode_token(tokenizer.encode_token(t)) == t
 
     def test_velocity(self, tokenizer):

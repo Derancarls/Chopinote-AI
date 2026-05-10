@@ -29,6 +29,13 @@ chopinote_dataset/data/
 # 生成的乐谱输出
 output_*.musicxml
 test_output*.musicxml
+data/outputs/
+
+# 归档文件
+archives/
+
+# VSCode 设置
+.vscode/
 
 # Python 缓存
 __pycache__/
