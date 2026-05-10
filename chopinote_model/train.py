@@ -107,16 +107,52 @@ class Trainer:
             logger.info(f'Best model backup saved: {best_backup}')
 
     def load_checkpoint(self, checkpoint_path: str):
-        """恢复 checkpoint。"""
+        """恢复 checkpoint（支持 vocab/参数量变化，自动跳过 shape 不匹配的权重）。"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         state_dict = checkpoint['model_state_dict']
-        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
-        if missing or unexpected:
-            logger.warning(f'Checkpoint 加载: missing={missing}, unexpected={unexpected}')
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        model_state = self.model.state_dict()
+
+        loaded = 0
+        skipped = []
+        for k, v in state_dict.items():
+            if k in model_state and v.shape == model_state[k].shape:
+                model_state[k] = v
+                loaded += 1
+            else:
+                skipped.append(k)
+
+        # ── Embedding 行拷贝（处理 vocab 扩展，复用旧行） ──────
+        for key in ('token_embedding.weight', 'lm_head.weight'):
+            if key in state_dict and key in model_state:
+                old_emb = state_dict[key]
+                new_emb = model_state[key]
+                if old_emb.shape != new_emb.shape:
+                    copy_rows = min(old_emb.shape[0], new_emb.shape[0])
+                    new_emb[:copy_rows] = old_emb[:copy_rows]
+                    logger.info(f'Embedding {key}: 复用 {copy_rows}/{new_emb.shape[0]} 行来自 checkpoint')
+        # ─────────────────────────────────────────────────────
+
+        self.model.load_state_dict(model_state)
+
+        if skipped:
+            logger.warning(f'Checkpoint 加载: {loaded} 个参数加载成功, '
+                           f'{len(skipped)} 个 shape 不匹配已跳过')
+
+        # 优化器/调度器状态尽量恢复（跳过的参数无对应状态，PyTorch 自动处理）
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except Exception:
+            logger.warning('优化器状态恢复失败，已重新初始化')
+        try:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except Exception:
+            logger.warning('调度器状态恢复失败，已重新初始化')
         if 'scaler_state_dict' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            try:
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            except Exception:
+                logger.warning('GradScaler 状态恢复失败，已重新初始化')
+
         self.global_step = checkpoint['step']
         self.best_loss = checkpoint.get('loss', float('inf'))
         logger.info(f'Resumed from checkpoint: {checkpoint_path} (step {self.global_step})')
