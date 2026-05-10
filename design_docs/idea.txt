@@ -1,0 +1,75 @@
+v0.1.1-Beta2
+● 我全看完了，下面从几个维度分析。                                                                                                                                               
+                                                                                                                                                                                 
+  当前状态总结：                                                                                                                                                                 
+  - 模型：~75M 参数，10 层 d_model=768 的 decoder-only Transformer                                                                                                               
+  - Loss 已平台在 1.50-1.55，best checkpoint 停在 86000 步（20:08 之后没再更新）                                                                                                 
+  - 数据集：~650 首曲目（Chopin 250 + Bach 371 + Beethoven 32），处理为 REMI token，词表 815                                                                                     
+  - GPU：RTX 4090，显存占用 ~11.4GB/24GB，利用率还有空间                                                                                                                         
+                                                                                                                                                                                 
+  改进建议（按优先级排序）：                                                                                                                                                     
+                                                                                                                                                                                 
+  ---                                                                                                                                                                            
+  1. 增加数据量和多样性（最迫切）                                                                                                                                                
+                                                                                                                                                                                 
+  650 首曲子对 75M 参数的模型来说太少了。Loss 提前平台，怀疑数据量是瓶颈。                                                                                                       
+                                                                                                                                                                                 
+  - 扩充曲库：加入更多古典作曲家（Mozart, Schubert, Liszt, Scarlatti 等），这是最直接的收益点                                                                                    
+  - 数据增强：对 MIDI/MusicXML 做整体移调（transpose ±6 semitones），可立即使有效数据量翻几倍                                                                                    
+  - 音高抖动：小幅度随机变化 velocity/timing，增加泛化性                                                                                                                         
+                                                                                                                                                                                 
+  2. 调整训练策略                                                                                                                                                                
+                                                                                                                                                                                 
+  - 学习率 restart：现在 LR 已经衰减到 4.2e-6（几乎为 0），模型不再学习。可以尝试 cosine restart（SGDR），每次重启让 loss 继续下降                                               
+  - batch size 偏小：当前 effective batch=32，显存还有 12.6GB 空闲。可以尝试 batch_size=16, grad_accum=2 或直接 batch_size=12
+                                                                                                                                                                                 
+  3. 尝试更好的 Tokenization 方案                                                                                                                                                
+                                                                                                                                                                                 
+  REMI 词表只有 815，在现代音乐生成模型里偏小（SOTA 模型词表通常在 2000-5000）。REMI 的 16 分音符网格粒度对快速音符密度高的曲子（比如 Chopin 的装饰音）可能不够精细。            
+                  
+  可以考虑：                                                                                                                                                                     
+  - REMI+（增加分辨率）
+  - CPWord（Compound Word）tokenization                                                                                                                                          
+  - 或者直接用 **MidiTokenizer（MidiTok 库）**的 BPE/REMI 变体
+                                                                                                                                                                                 
+  4. 模型架构微调                                                                                                                                                                
+                                                                                                                                                                                 
+  - 从 10 层加深到 12-16 层：显存占用 ~11.4G，还有足够余量                                                                                                                       
+  - 如果扩充数据后，可以增大 d_model 到 1024，n_heads=16（RTX 4090 完全扛得住）                                                                                                  
+                                                                                                                                                                                 
+  5. 评估指标                                                                                                                                                                    
+                                                                                                                                                                                 
+  目前只有 validation loss，建议加一些主观/结构化评估：                                                                                                                          
+  - 定期生成 MIDI 样本（generate.py 已经有了），听听实际效果
+  - 计算 bar-level 的复现率、转调稳定性等音乐结构指标                                                                                                                            
+                  
+  ---                                                                                                                                                                            
+  最推荐的第一步：数据增强（移调），零成本但通常效果明显。然后加 cosine restart 让 LR 回升一次继续训练。
+
+
+
+
+好，从整个项目角度看，我列一下当前的短板和可以补的方向：
+
+训练层面
+最紧迫：用 vocab=831 重新训练 — best.pt 是在 815 词表下训练的，新增的 16 个 BEAT token 模型完全没见过，复杂度 C=5~10 梯度平也是因为模型欠训练
+训练才跑 10k/100k steps — loss=1.67 远未收敛，当前所有生成质量都受限于这一点
+无训练监控 — 没有 TensorBoard/WandB，loss 只能看日志，看不到学习率曲线、梯度范数、验证集走势
+单 GPU 训练慢 — 没有多卡/分布式支持，RTX 4090 上 100k steps 可能要跑一整天
+CLI / 生成层面
+无循环检测 — 模型生成卡在重复模式时不会自动停止，浪费 token 配额
+只支持 MusicXML 输入 — MIDI 文件（更常见的数据格式）不能直接作为 seed
+首次生成后改参数不方便 — 「r」重来只在 gen_idx>1 才出现，第一次不满意必须 quit 重来
+无 PDMX 直接输入 — 数据管线支持 PDMX，但 CLI 入口只接了 MusicXML
+无批量模式 — 不能一次性喂多个输入文件各自生成
+质量保障
+零测试 — 没有单元测试/集成测试，重构全靠手动试
+无 round-trip 验证 — 生成出的 MusicXML 能否被重新解析回 token 序列？没人知道
+无 CI — 代码提交后没有任何自动化检查
+体验改进
+无预设/模板 — 比如用户想生成「巴洛克风格」或「浪漫派」，没有一个快捷方式
+只能导出 MusicXML — 加 MIDI/WAV 输出可以让用户直接听到结果
+生成过程中无频谱/可视化反馈 — 只能看 tqdm 进度条
+模型架构
+无条件嵌入 — 无法在生成时指定「生成 4/4 拍」「C 大调」等条件，完全依赖 seed 隐式控制
+要我挑几个你认为最有价值的，规划到下一步？还是你有自己的想法想加进来？

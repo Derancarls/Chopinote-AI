@@ -9,7 +9,7 @@ class TestModelConfig:
 
     def test_vocab_default(self):
         config = ModelConfig()
-        assert config.vocab_size == 837
+        assert config.vocab_size == 872
 
     def test_d_model_divisible(self):
         config = ModelConfig(d_model=768, n_heads=12)

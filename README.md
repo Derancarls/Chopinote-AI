@@ -31,48 +31,48 @@ pip install -e .
 ### 下载预训练权重
 
 ```bash
-# 推荐使用 step_94000_best.pt（v0.1.2-Beta1）
-# 下载后放到项目根目录即可
+# 推荐使用 checkpoints/step_94000_best.pt（v0.1.2-Beta1）
+# 下载后放到 checkpoints/ 目录即可
 ```
 
 ### 基本使用
 
 ```bash
 # 交互式续写：输入一首 MusicXML，AI 帮你写完
-chopin step_94000_best.pt input.musicxml
+chopin checkpoints/step_94000_best.pt input.musicxml
 
 # 指定输出文件
-chopin step_94000_best.pt input.musicxml -o output.musicxml
+chopin checkpoints/step_94000_best.pt input.musicxml -o output.musicxml
 
 # 一次生成多份变体
-chopin step_94000_best.pt input.musicxml -n 5
+chopin checkpoints/step_94000_best.pt input.musicxml -n 5
 ```
 
 ### 控制生成风格
 
 ```bash
 # 使用预设风格
-chopin step_94000_best.pt input.musicxml --preset baroque
-chopin step_94000_best.pt input.musicxml --preset romantic
-chopin step_94000_best.pt input.musicxml --preset jazz
+chopin checkpoints/step_94000_best.pt input.musicxml --preset baroque
+chopin checkpoints/step_94000_best.pt input.musicxml --preset romantic
+chopin checkpoints/step_94000_best.pt input.musicxml --preset jazz
 
 # 手动调节参数
-chopin step_94000_best.pt input.musicxml --temp 1.2 --top-k 40 --complexity 7
+chopin checkpoints/step_94000_best.pt input.musicxml --temp 1.2 --top-k 40 --complexity 7
 
 # 锁定部分音乐要素
-chopin step_94000_best.pt input.musicxml --key-mode lock     # 保持原调性
-chopin step_94000_best.pt input.musicxml --time-mode lock    # 保持原拍号
-chopin step_94000_best.pt input.musicxml --tempo-mode lock   # 保持原速度
+chopin checkpoints/step_94000_best.pt input.musicxml --key-mode lock     # 保持原调性
+chopin checkpoints/step_94000_best.pt input.musicxml --time-mode lock    # 保持原拍号
+chopin checkpoints/step_94000_best.pt input.musicxml --tempo-mode lock   # 保持原速度
 ```
 
 ### 种子截取
 
 ```bash
 # 只使用前 4 小节作为种子
-chopin step_94000_best.pt input.musicxml --seed-bars 4
+chopin checkpoints/step_94000_best.pt input.musicxml --seed-bars 4
 
 # 指定种子文件
-chopin step_94000_best.pt input.musicxml --seed input_seed.musicxml
+chopin checkpoints/step_94000_best.pt input.musicxml --seed input_seed.musicxml
 ```
 
 ---
@@ -156,7 +156,11 @@ python scripts/run_curriculum_training.py \
 │   ├── preprocess_pdmx.py          PDMX 预处理
 │   ├── run_curriculum_training.py  分层训练入口
 │   └── validate_generation.py      生成结果验证
-├── design_docs/                    设计文档
+├── design_docs/                    待办任务与优化方向
+├── ROADMAP.md                      版本历史与功能清单
+├── data/                           数据集（raw/processed/outputs/test_seeds）
+├── checkpoints/                    模型权重
+├── archives/                       归档压缩包
 └── tests/                          测试（87 个）
 ```
 
