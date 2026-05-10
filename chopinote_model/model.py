@@ -20,6 +20,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.d_model = config.d_model
         self.max_len = config.max_seq_len
+        self.max_measures = config.max_measures
 
         self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
@@ -68,6 +69,17 @@ class CausalSelfAttention(nn.Module):
         # 相对位置注意力（方案 C: 偏置通过 attn_mask 传入）
         total_bias = self._get_rel_bias(T, k.size(2))
 
+        # padding mask: 禁止注意 padding 位置的 key（mask 中为 0 的位置）
+        if mask is not None:
+            T_kv = k.size(2)
+            if mask.size(1) < T_kv:
+                # 推理 KV-cache 情况：past keys 都是有效位置
+                pad_bias = torch.zeros(B, T_kv, device=mask.device, dtype=total_bias.dtype)
+                pad_bias[:, :mask.size(1)] = torch.where(mask.bool(), 0.0, float('-inf'))
+            else:
+                pad_bias = torch.where(mask.bool(), 0.0, float('-inf'))
+            total_bias = total_bias + pad_bias.unsqueeze(1).unsqueeze(2)
+
         # ── 小节目对偏置 ──────────────────────────────────
         if measure_ids is not None:
             # measure_ids: (T_total,) 推理 或 (B, T) 训练
@@ -92,18 +104,21 @@ class CausalSelfAttention(nn.Module):
         # ──────────────────────────────────────────────────
 
         if kv_cache is not None and kv_cache[0] is not None:
-            # 推理：单 token → attn_mask=rel_bias, 无需因果掩码
+            # 推理：单 token → attn_mask=total_bias, 无需因果掩码
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=total_bias,
                 dropout_p=0.0, is_causal=False,
             )
         else:
-            # 训练：is_causal=True 处理因果掩码
-            # padding 屏蔽由 loss ignore_index=-100 处理
+            # 训练：手动构造因果掩码，合并到 total_bias 中
+            # is_causal=True 会忽略 attn_mask，导致 rel_bias/measure_bias 不生效
+            L = k.size(2)
+            causal_mask = torch.triu(torch.ones(T, L, device=x.device, dtype=torch.bool), diagonal=1)
+            total_bias = total_bias.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=total_bias,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=True,
+                is_causal=False,
             )
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)

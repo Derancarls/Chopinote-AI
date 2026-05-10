@@ -768,6 +768,7 @@ def notes_to_score(notes_list: list[dict],
         score._hairpin_events = _hairpin_events
     if _octave_events:
         score._octave_events = _octave_events
+    score._all_keys = all_keys_sorted
     return score
 
 
@@ -776,27 +777,41 @@ def notes_to_score(notes_list: list[dict],
 def _inject_directions_in_musicxml(filepath: str,
                                    pedal_events: list[dict],
                                    hairpin_events: list[dict],
-                                   octave_events: list[dict] = None):
+                                   octave_events: list[dict] = None,
+                                   all_keys: list = None):
     """MusicXML 后处理：注入踏板、渐强/渐弱、八度方向标记。
 
     music21 的 PedalMark/Crescendo/Diminuendo/Ottava 都是 Spanner 子类，
     直接插入 measure 后无法正确序列化，因此改为在 XML 文件中直接注入。
+
+    多声部时同一个小节号会出现在多个 <part> 中，通过 all_keys 映射
+    event['key'] → target part 来确定正确的出现位置。
     """
     import re
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
 
+    # key → part occurrence index (1-based)
+    key_to_occurrence = {}
+    if all_keys:
+        key_to_occurrence = {tuple(k): i + 1 for i, k in enumerate(all_keys)}
+
+    def _inject_into_measure(content, bar_num, xml_snippet, target_occurrence):
+        """将 xml_snippet 注入到第 target_occurrence 个 <measure number="bar_num"> 内。"""
+        pattern = rf'(<measure[^>]*?number="{bar_num}"[^>]*>.*?)(</measure>)'
+        matches = list(re.finditer(pattern, content, re.DOTALL))
+        if target_occurrence > len(matches):
+            return content
+        m = matches[target_occurrence - 1]
+        return content[:m.start()] + m.group(1) + '\n' + xml_snippet + '\n    ' + m.group(2) + content[m.end():]
+
     def _inject(events, xml_template):
         nonlocal content
         for ev in events:
             bar_num = ev['bar']
+            target = key_to_occurrence.get(tuple(ev.get('key', ())), 1)
             xml_snippet = xml_template(ev['value'])
-            pattern = rf'(<measure[^>]*?number="{bar_num}"[^>]*>.*?)(</measure>)'
-            content = re.sub(
-                pattern,
-                lambda m: m.group(1) + '\n' + xml_snippet + '\n    ' + m.group(2),
-                content, count=1, flags=re.DOTALL,
-            )
+            content = _inject_into_measure(content, bar_num, xml_snippet, target)
 
     # 踏板
     _inject(pedal_events,
@@ -820,11 +835,9 @@ def _inject_directions_in_musicxml(filepath: str,
 
     # 八度记号（octave-shift）
     if octave_events:
-        # Map octave token values to XML octave-shift attributes
-        # 8va → type="up" size="8", 8vb → type="down" size="8"
-        # 15ma → type="up" size="15", 15mb → type="down" size="15"
         for ev in octave_events:
             bar_num = ev['bar']
+            target = key_to_occurrence.get(tuple(ev.get('key', ())), 1)
             val = ev['value']
             if val == 'end':
                 xml_snippet = (
@@ -835,7 +848,6 @@ def _inject_directions_in_musicxml(filepath: str,
                     '\n      </direction>'
                 )
             else:
-                # '8va', '8vb', '15ma', '15mb'
                 is_down = 'b' in val
                 size = val.replace('va', '').replace('vb', '').replace('ma', '').replace('mb', '')
                 shift_type = 'down' if is_down else 'up'
@@ -846,12 +858,7 @@ def _inject_directions_in_musicxml(filepath: str,
                     '\n        </direction-type>'
                     '\n      </direction>'
                 )
-            pattern = rf'(<measure[^>]*?number="{bar_num}"[^>]*>.*?)(</measure>)'
-            content = re.sub(
-                pattern,
-                lambda m: m.group(1) + '\n' + xml_snippet + '\n    ' + m.group(2),
-                content, count=1, flags=re.DOTALL,
-            )
+            content = _inject_into_measure(content, bar_num, xml_snippet, target)
 
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
@@ -874,6 +881,7 @@ def generate_to_musicxml(model: MusicTransformer, tokenizer: REMITokenizer,
         pedal_events=getattr(score, '_pedal_events', []),
         hairpin_events=getattr(score, '_hairpin_events', []),
         octave_events=getattr(score, '_octave_events', []),
+        all_keys=getattr(score, '_all_keys', None),
     )
     logger.info(f'生成完成: {output_path}')
     return output_path

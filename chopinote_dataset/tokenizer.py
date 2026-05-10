@@ -354,7 +354,16 @@ class REMITokenizer:
 
     def encode_token(self, token: str) -> int:
         """Convert a token string to its ID (returns MASK ID for unknown)."""
-        return self._token_to_id.get(token, self._token_to_id[self.MASK])
+        tid = self._token_to_id.get(token)
+        if tid is None:
+            if not hasattr(self, '_warned_unknown'):
+                self._warned_unknown: set = set()
+            if token not in self._warned_unknown:
+                import logging
+                logging.warning(f'未知 token "{token}" 被映射为 MASK ({self.MASK})')
+                self._warned_unknown.add(token)
+            return self._token_to_id[self.MASK]
+        return tid
 
     def decode_token(self, token_id: int) -> str:
         """Convert a token ID back to its string form."""

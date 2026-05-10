@@ -19,6 +19,12 @@ def split_dataset(file_list_path: str, output_dir: str,
         print("错误: 文件列表为空")
         return
 
+    if train_ratio + val_ratio > 1.0:
+        raise ValueError(
+            f'train_ratio ({train_ratio}) + val_ratio ({val_ratio}) = '
+            f'{train_ratio + val_ratio} > 1.0，会导致划分重叠或 test 集为空'
+        )
+
     random.seed(seed)
     random.shuffle(files)
 

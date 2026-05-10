@@ -26,6 +26,24 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 调号移调：音名 → 音高级别映射
+_KEY_PC = {'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4,
+           'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9,
+           'A#': 10, 'Bb': 10, 'B': 11}
+_KEY_PC_REV = {0: 'C', 1: 'C#', 2: 'D', 3: 'Eb', 4: 'E', 5: 'F',
+               6: 'F#', 7: 'G', 8: 'Ab', 9: 'A', 10: 'Bb', 11: 'B'}
+
+
+def _transpose_key_name(key_sig: str, semitones: int) -> str:
+    """将调号名移调 semitones 个半音。"""
+    if not key_sig or key_sig == 'unknown':
+        return key_sig
+    is_minor = key_sig.endswith('m')
+    root = key_sig[:-1] if is_minor else key_sig
+    new_pc = (_KEY_PC.get(root, 0) + semitones) % 12
+    return _KEY_PC_REV[new_pc] + ('m' if is_minor else '')
+
+
 @dataclass
 class MusicMetadata:
     """音乐文件元数据"""
@@ -48,49 +66,136 @@ class MusicMetadata:
     processing_time: float
     hash_md5: str
 
-class MusicXMLPreprocessor:
-    def __init__(self, config_path: str = "config.yaml"):
-        """
-        初始化预处理管道
-        
-        Args:
-            config_path: 配置文件路径
-        """
+class _BasePreprocessor:
+    """Preprocessor 基类：提供共享的目录/缓存/统计/质量检查方法。"""
+
+    def __init__(self, config_path: str):
         import yaml
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
-        
-        # 初始化转换器（从配置读取 REMI 参数）
         remi_cfg = self.config['dataset']['preprocessing']['remi']
-        self.converter = MusicXMLToREMI(
-            grid_size=remi_cfg['grid_size'],
-            velocity_levels=remi_cfg['velocity_levels'],
-        )
         self.tokenizer = REMITokenizer(
             grid_size=remi_cfg['grid_size'],
             velocity_levels=remi_cfg['velocity_levels'],
         )
-        
-        # 创建目录
-        self._create_directories()
-        
-        # 缓存
-        self.cache = {}
+        self.cache: dict = {}
         self.cache_hits = 0
         self.cache_misses = 0
-    
+        self._create_directories()
+
     def _create_directories(self):
-        """创建必要的目录"""
         dirs = [
             self.config['dataset']['storage']['processed_dir'],
             self.config['dataset']['storage']['cache_dir'],
             self.config['dataset']['storage']['token_dir'],
             self.config['dataset']['storage']['metadata_dir'],
         ]
-        
-        for dir_path in dirs:
-            Path(dir_path).mkdir(parents=True, exist_ok=True)
-    
+        for d in dirs:
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+    def _passes_quality_check(self, metadata: MusicMetadata) -> bool:
+        qc = self.config['dataset']['quality_checks']
+        fsize = os.path.getsize(metadata.file_path) / 1024
+        if fsize < qc['min_file_size_kb'] or fsize > qc['max_file_size_mb'] * 1024:
+            return False
+        pp = self.config['dataset']['preprocessing']
+        if metadata.num_notes < pp['min_notes_per_file'] or metadata.num_notes > pp['max_notes_per_file']:
+            return False
+        return True
+
+    def _check_sequence_length(self, tokens: List[int]) -> bool:
+        pp = self.config['dataset']['preprocessing']
+        return pp['min_tokens_per_sequence'] <= len(tokens) <= pp['max_tokens_per_sequence']
+
+    def _save_processed_file(self, file_path: str, tokens: List[int],
+                             metadata: MusicMetadata, conversion_metadata: Dict,
+                             output_dir: str) -> Dict:
+        import time
+        t0 = time.time()
+        metadata.num_tokens = len(tokens)
+        tid = f"{metadata.file_id}.tokens"
+        mid = f"{metadata.file_id}.meta.json"
+        tp = os.path.join(output_dir, "tokens", tid)
+        os.makedirs(os.path.dirname(tp), exist_ok=True)
+        with open(tp, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f)
+        metadata.processing_time = time.time() - t0
+        md = asdict(metadata)
+        md.update(conversion_metadata)
+        mp = os.path.join(output_dir, "metadata", mid)
+        os.makedirs(os.path.dirname(mp), exist_ok=True)
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(md, f, indent=2, ensure_ascii=False)
+        return {
+            'file_id': metadata.file_id, 'original_path': file_path,
+            'token_path': tp, 'metadata_path': mp,
+            'num_tokens': len(tokens), 'metadata': md,
+        }
+
+    def _compute_file_hash(self, file_path: str) -> str:
+        h = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _generate_file_id(self, file_path: str) -> str:
+        import uuid
+        return f"{Path(file_path).stem}_{self._compute_file_hash(file_path)[:8]}_{uuid.uuid4().hex[:8]}"
+
+    def _get_from_cache(self, cache_key: str) -> Optional[Dict]:
+        cf = os.path.join(self.config['dataset']['storage']['cache_dir'], f"{cache_key}.cache")
+        if os.path.exists(cf):
+            try:
+                with open(cf, 'rb') as f:
+                    return pickle.load(f)
+            except Exception:
+                return None
+        return None
+
+    def _add_to_cache(self, cache_key: str, data: Dict):
+        cf = os.path.join(self.config['dataset']['storage']['cache_dir'], f"{cache_key}.cache")
+        try:
+            with open(cf, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception:
+            pass
+
+    def _save_processing_stats(self, processed_files: List, failed_files: List, output_dir: str):
+        total = len(processed_files) + len(failed_files)
+        stats = {
+            'total_files': total,
+            'processed_files': len(processed_files),
+            'failed_files': len(failed_files),
+            'success_rate': len(processed_files) / total if total > 0 else 0,
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'cache_hit_rate': (self.cache_hits / (self.cache_hits + self.cache_misses)
+                               if (self.cache_hits + self.cache_misses) > 0 else 0),
+            'total_tokens': sum(f['num_tokens'] for f in processed_files),
+            'avg_tokens_per_file': float(np.mean([f['num_tokens'] for f in processed_files])) if processed_files else 0,
+            'composer_distribution': {},
+            'genre_distribution': {},
+        }
+        for f in processed_files:
+            c = f['metadata']['composer']
+            g = f['metadata']['genre']
+            stats['composer_distribution'][c] = stats['composer_distribution'].get(c, 0) + 1
+            stats['genre_distribution'][g] = stats['genre_distribution'].get(g, 0) + 1
+        sp = os.path.join(output_dir, 'processing_stats.json')
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+
+
+class MusicXMLPreprocessor(_BasePreprocessor):
+    def __init__(self, config_path: str = "config.yaml"):
+        super().__init__(config_path)
+        remi_cfg = self.config['dataset']['preprocessing']['remi']
+        self.converter = MusicXMLToREMI(
+            grid_size=remi_cfg['grid_size'],
+            velocity_levels=remi_cfg['velocity_levels'],
+        )
+
     def process_directory(self, input_dir: str, output_dir: Optional[str] = None):
         """
         处理整个目录的MusicXML文件
@@ -206,7 +311,7 @@ class MusicXMLPreprocessor:
         md = score.metadata
         
         # 计算音乐特征
-        duration = score.duration.quarterLength
+        quarter_length = score.duration.quarterLength
         num_measures = len(score.parts[0].getElementsByClass('Measure'))
         
         # 统计音符数量
@@ -241,7 +346,8 @@ class MusicXMLPreprocessor:
             title=md.title if md and md.title else Path(file_path).stem,
             genre=self._infer_genre(file_path, md),
             year=md.date if md and md.date else None,
-            duration_seconds=duration,
+            # quarterLength → seconds: 使用速度（无速度时默认 120 BPM）
+            duration_seconds=quarter_length * 60.0 / (tempo_value or 120.0),
             num_measures=num_measures,
             num_notes=num_notes,
             num_tokens=0,  # 将在后面更新
@@ -279,164 +385,9 @@ class MusicXMLPreprocessor:
         else:
             return 'unknown'
     
-    def _passes_quality_check(self, metadata: MusicMetadata) -> bool:
-        """质量检查"""
-        config = self.config['dataset']['quality_checks']
-        
-        # 检查文件大小
-        file_size_kb = os.path.getsize(metadata.file_path) / 1024
-        if file_size_kb < config['min_file_size_kb']:
-            logger.warning(f"文件太小: {metadata.file_path} ({file_size_kb:.1f}KB)")
-            return False
-        
-        if file_size_kb > config['max_file_size_mb'] * 1024:
-            logger.warning(f"文件太大: {metadata.file_path} ({file_size_kb/1024:.1f}MB)")
-            return False
-        
-        # 检查音符数量
-        if metadata.num_notes < self.config['dataset']['preprocessing']['min_notes_per_file']:
-            logger.warning(f"音符太少: {metadata.file_path} ({metadata.num_notes} notes)")
-            return False
-        
-        if metadata.num_notes > self.config['dataset']['preprocessing']['max_notes_per_file']:
-            logger.warning(f"音符太多: {metadata.file_path} ({metadata.num_notes} notes)")
-            return False
-        
-        return True
-    
-    def _check_sequence_length(self, tokens: List[int]) -> bool:
-        """检查序列长度是否合适"""
-        config = self.config['dataset']['preprocessing']
-        
-        if len(tokens) < config['min_tokens_per_sequence']:
-            return False
-        
-        if len(tokens) > config['max_tokens_per_sequence']:
-            return False
-        
-        return True
-    
-    def _save_processed_file(self, file_path: str, tokens: List[int], 
-                           metadata: MusicMetadata, conversion_metadata: Dict,
-                           output_dir: str) -> Dict:
-        """保存处理后的文件"""
-        import time
-        start_time = time.time()
-        
-        # 更新元数据
-        metadata.num_tokens = len(tokens)
-        
-        # 生成输出文件名
-        base_name = Path(file_path).stem
-        token_filename = f"{metadata.file_id}.tokens"
-        metadata_filename = f"{metadata.file_id}.meta.json"
-        
-        # 保存tokens
-        token_path = os.path.join(output_dir, "tokens", token_filename)
-        with open(token_path, 'w', encoding='utf-8') as f:
-            json.dump(tokens, f)
-        
-        # 保存元数据
-        metadata.processing_time = time.time() - start_time
-        metadata_dict = asdict(metadata)
-        metadata_dict.update(conversion_metadata)
-        
-        metadata_path = os.path.join(output_dir, "metadata", metadata_filename)
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata_dict, f, indent=2, ensure_ascii=False)
-        
-        # 返回结果
-        result = {
-            'file_id': metadata.file_id,
-            'original_path': file_path,
-            'token_path': token_path,
-            'metadata_path': metadata_path,
-            'num_tokens': len(tokens),
-            'metadata': metadata_dict
-        }
-        
-        return result
-    
-    def _compute_file_hash(self, file_path: str) -> str:
-        """计算文件MD5哈希"""
-        hash_md5 = hashlib.md5()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
-    
-    def _generate_file_id(self, file_path: str) -> str:
-        """生成唯一的文件ID"""
-        import uuid
-        file_hash = self._compute_file_hash(file_path)
-        return f"{Path(file_path).stem}_{file_hash[:8]}_{uuid.uuid4().hex[:8]}"
-    
-    def _get_from_cache(self, cache_key: str) -> Optional[Dict]:
-        """从缓存获取数据"""
-        cache_file = os.path.join(
-            self.config['dataset']['storage']['cache_dir'],
-            f"{cache_key}.cache"
-        )
-        
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except:
-                return None
-        return None
-    
-    def _add_to_cache(self, cache_key: str, data: Dict):
-        """添加数据到缓存"""
-        cache_file = os.path.join(
-            self.config['dataset']['storage']['cache_dir'],
-            f"{cache_key}.cache"
-        )
-        
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-        except:
-            pass
-    
-    def _save_processing_stats(self, processed_files: List, failed_files: List, output_dir: str):
-        """保存处理统计"""
-        stats = {
-            'total_files': len(processed_files) + len(failed_files),
-            'processed_files': len(processed_files),
-            'failed_files': len(failed_files),
-            'success_rate': len(processed_files) / (len(processed_files) + len(failed_files)) if (len(processed_files) + len(failed_files)) > 0 else 0,
-            'cache_hits': self.cache_hits,
-            'cache_misses': self.cache_misses,
-            'cache_hit_rate': self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0,
-            'total_tokens': sum(f['num_tokens'] for f in processed_files),
-            'avg_tokens_per_file': np.mean([f['num_tokens'] for f in processed_files]) if processed_files else 0,
-            'composer_distribution': {},
-            'genre_distribution': {},
-        }
-        
-        # 统计作曲家和体裁分布
-        for file in processed_files:
-            composer = file['metadata']['composer']
-            genre = file['metadata']['genre']
-            # 统计作曲家分布
-            if composer in stats['composer_distribution']:
-                stats['composer_distribution'][composer] += 1
-            else:
-                stats['composer_distribution'][composer] = 1
-            # 统计体裁分布
-            if genre in stats['genre_distribution']:
-                stats['genre_distribution'][genre] += 1
-            else:
-                stats['genre_distribution'][genre] = 1
-        # 保存统计信息
-        stats_path = os.path.join(output_dir, 'processing_stats.json')
-        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
-        with open(stats_path, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
 
 
-class PDMXPreprocessor:
+class PDMXPreprocessor(_BasePreprocessor):
     """PDMX JSON → REMI 预处理管道
 
     直接处理 PDMX 数据集的 JSON 格式（无需 music21 解析），
@@ -444,33 +395,12 @@ class PDMXPreprocessor:
     """
 
     def __init__(self, config_path: str = "config.yaml"):
-        import yaml
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
-
+        super().__init__(config_path)
         remi_cfg = self.config['dataset']['preprocessing']['remi']
         self.converter = PDMXToREMI(
             grid_size=remi_cfg['grid_size'],
             velocity_levels=remi_cfg['velocity_levels'],
         )
-        self.tokenizer = REMITokenizer(
-            grid_size=remi_cfg['grid_size'],
-            velocity_levels=remi_cfg['velocity_levels'],
-        )
-        self._create_directories()
-        self.cache = {}
-        self.cache_hits = 0
-        self.cache_misses = 0
-
-    def _create_directories(self):
-        dirs = [
-            self.config['dataset']['storage']['processed_dir'],
-            self.config['dataset']['storage']['cache_dir'],
-            self.config['dataset']['storage']['token_dir'],
-            self.config['dataset']['storage']['metadata_dir'],
-        ]
-        for dir_path in dirs:
-            Path(dir_path).mkdir(parents=True, exist_ok=True)
 
     def process_directory(self, input_dir: str, output_dir: Optional[str] = None):
         """处理 PDMX 目录结构下的所有 JSON 数据文件。"""
@@ -560,10 +490,11 @@ class PDMXPreprocessor:
                         tt, tc = self.converter.convert_pdmx(transposed, collect_metadata=True)
                         if not self._check_sequence_length(tt):
                             continue
-                        # 派生元数据（保持原 metadata 大部分字段，只改 file_id/title）
-                        tm = copy.copy(metadata)
+                        # 派生元数据（保持原 metadata 大部分字段，只改 file_id/title/key_signature）
+                        tm = copy.deepcopy(metadata)
                         sign = '+' if semitone > 0 else ''
                         tm.file_id = f"{metadata.file_id}_t{sign}{semitone}"
+                        tm.key_signature = _transpose_key_name(tm.key_signature, semitone)
                         tm.num_tokens = len(tt)
                         self._save_processed_file(file_path, tt, tm, tc, output_dir)
                     except Exception:
@@ -597,7 +528,6 @@ class PDMXPreprocessor:
         num_measures = len(barlines) if barlines else 1
         song_length = pdmx_data.get('song_length', 0)
         resolution = pdmx_data.get('resolution', 480)
-        duration_seconds = song_length / resolution / 4  # quarter → seconds at qpm≈60
 
         # 拍号
         ts_list = pdmx_data.get('time_signatures', [])
@@ -614,9 +544,12 @@ class PDMXPreprocessor:
         else:
             key_sig = 'unknown'
 
-        # 速度
+        # 速度（先提取，用于时长计算）
         tempos = pdmx_data.get('tempos', [])
         tempo_val = float(tempos[0]['qpm']) if tempos else None
+
+        # quarter_notes = song_length / resolution; seconds = quarter_notes * 60 / qpm
+        duration_seconds = (song_length / resolution) * 60.0 / (tempo_val or 120.0) if song_length > 0 and resolution > 0 else 0.0
 
         return MusicMetadata(
             file_id=self._generate_file_id(file_path),
@@ -669,115 +602,8 @@ class PDMXPreprocessor:
                     note['pitch'] = new_pitch
         return data
 
-    def _passes_quality_check(self, metadata: MusicMetadata) -> bool:
-        config = self.config['dataset']['quality_checks']
-        file_size_kb = os.path.getsize(metadata.file_path) / 1024
-        if file_size_kb < config['min_file_size_kb']:
-            return False
-        if file_size_kb > config['max_file_size_mb'] * 1024:
-            return False
-        if metadata.num_notes < self.config['dataset']['preprocessing']['min_notes_per_file']:
-            return False
-        if metadata.num_notes > self.config['dataset']['preprocessing']['max_notes_per_file']:
-            return False
-        return True
 
-    def _check_sequence_length(self, tokens: List[int]) -> bool:
-        config = self.config['dataset']['preprocessing']
-        return config['min_tokens_per_sequence'] <= len(tokens) <= config['max_tokens_per_sequence']
-
-    def _save_processed_file(self, file_path: str, tokens: List[int],
-                             metadata: MusicMetadata, conversion_metadata: Dict,
-                             output_dir: str) -> Dict:
-        import time
-        start_time = time.time()
-        metadata.num_tokens = len(tokens)
-        token_filename = f"{metadata.file_id}.tokens"
-        meta_filename = f"{metadata.file_id}.meta.json"
-
-        token_path = os.path.join(output_dir, "tokens", token_filename)
-        os.makedirs(os.path.dirname(token_path), exist_ok=True)
-        with open(token_path, 'w', encoding='utf-8') as f:
-            json.dump(tokens, f)
-
-        metadata.processing_time = time.time() - start_time
-        meta_dict = asdict(metadata)
-        meta_dict.update(conversion_metadata)
-        meta_path = os.path.join(output_dir, "metadata", meta_filename)
-        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump(meta_dict, f, indent=2, ensure_ascii=False)
-
-        return {
-            'file_id': metadata.file_id,
-            'original_path': file_path,
-            'token_path': token_path,
-            'metadata_path': meta_path,
-            'num_tokens': len(tokens),
-            'metadata': meta_dict,
-        }
-
-    def _compute_file_hash(self, file_path: str) -> str:
-        import hashlib
-        hash_md5 = hashlib.md5()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
-
-    def _generate_file_id(self, file_path: str) -> str:
-        import uuid
-        return f"{Path(file_path).stem}_{self._compute_file_hash(file_path)[:8]}_{uuid.uuid4().hex[:8]}"
-
-    def _get_from_cache(self, cache_key: str) -> Optional[Dict]:
-        cache_file = os.path.join(
-            self.config['dataset']['storage']['cache_dir'],
-            f"{cache_key}.cache"
-        )
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except:
-                return None
-        return None
-
-    def _add_to_cache(self, cache_key: str, data: Dict):
-        cache_file = os.path.join(
-            self.config['dataset']['storage']['cache_dir'],
-            f"{cache_key}.cache"
-        )
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-        except:
-            pass
-
-    def _save_processing_stats(self, processed_files: List, failed_files: List, output_dir: str):
-        stats = {
-            'total_files': len(processed_files) + len(failed_files),
-            'processed_files': len(processed_files),
-            'failed_files': len(failed_files),
-            'success_rate': (len(processed_files) / (len(processed_files) + len(failed_files))
-                             if (len(processed_files) + len(failed_files)) > 0 else 0),
-            'cache_hits': self.cache_hits,
-            'cache_misses': self.cache_misses,
-            'total_tokens': sum(f['num_tokens'] for f in processed_files),
-            'avg_tokens_per_file': float(np.mean([f['num_tokens'] for f in processed_files])) if processed_files else 0,
-            'composer_distribution': {},
-            'genre_distribution': {},
-        }
-        for f in processed_files:
-            c = f['metadata']['composer']
-            g = f['metadata']['genre']
-            stats['composer_distribution'][c] = stats['composer_distribution'].get(c, 0) + 1
-            stats['genre_distribution'][g] = stats['genre_distribution'].get(g, 0) + 1
-        stats_path = os.path.join(output_dir, 'processing_stats.json')
-        with open(stats_path, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
-
-
-class MIDIPreprocessor:
+class MIDIPreprocessor(_BasePreprocessor):
     """MIDI → REMI 预处理管道。
 
     用 music21 解析 MIDI 文件，通过 MIDIToREMI 转换为 token 序列，
@@ -785,33 +611,12 @@ class MIDIPreprocessor:
     """
 
     def __init__(self, config_path: str = "config.yaml"):
-        import yaml
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
-
+        super().__init__(config_path)
         remi_cfg = self.config['dataset']['preprocessing']['remi']
         self.converter = MIDIToREMI(
             grid_size=remi_cfg['grid_size'],
             velocity_levels=remi_cfg['velocity_levels'],
         )
-        self.tokenizer = REMITokenizer(
-            grid_size=remi_cfg['grid_size'],
-            velocity_levels=remi_cfg['velocity_levels'],
-        )
-        self._create_directories()
-        self.cache = {}
-        self.cache_hits = 0
-        self.cache_misses = 0
-
-    def _create_directories(self):
-        dirs = [
-            self.config['dataset']['storage']['processed_dir'],
-            self.config['dataset']['storage']['cache_dir'],
-            self.config['dataset']['storage']['token_dir'],
-            self.config['dataset']['storage']['metadata_dir'],
-        ]
-        for dir_path in dirs:
-            Path(dir_path).mkdir(parents=True, exist_ok=True)
 
     def process_directory(self, input_dir: str, output_dir: Optional[str] = None):
         """处理目录下所有 MIDI 文件。"""
@@ -906,9 +711,10 @@ class MIDIPreprocessor:
                         tt, tc = self.converter.convert_score(ts, collect_metadata=True)
                         if not self._check_sequence_length(tt):
                             continue
-                        tm = copy.copy(metadata)
+                        tm = copy.deepcopy(metadata)
                         sign = '+' if semitone > 0 else ''
                         tm.file_id = f"{metadata.file_id}_t{sign}{semitone}"
+                        tm.key_signature = _transpose_key_name(tm.key_signature, semitone)
                         tm.num_tokens = len(tt)
                         self._save_processed_file(file_path, tt, tm, tc, output_dir)
                     except Exception:
@@ -970,8 +776,8 @@ class MIDIPreprocessor:
             instrs = list(part.flatten().getElementsByClass('Instrument'))
             instruments.append(str(instrs[0]) if instrs else 'Unknown')
 
-        # 时长
-        duration_seconds = score.duration.quarterLength / 60  # rough estimate
+        # 时长：quarterLength → seconds（无速度时默认 120 BPM）
+        duration_seconds = score.duration.quarterLength * 60.0 / (tempo_val or 120.0)
 
         return MusicMetadata(
             file_id=self._generate_file_id(file_path),
@@ -1009,112 +815,6 @@ class MIDIPreprocessor:
                 return genre
         return 'unknown'
 
-    def _passes_quality_check(self, metadata: MusicMetadata) -> bool:
-        config = self.config['dataset']['quality_checks']
-        file_size_kb = os.path.getsize(metadata.file_path) / 1024
-        if file_size_kb < config['min_file_size_kb']:
-            return False
-        if file_size_kb > config['max_file_size_mb'] * 1024:
-            return False
-        if metadata.num_notes < self.config['dataset']['preprocessing']['min_notes_per_file']:
-            return False
-        if metadata.num_notes > self.config['dataset']['preprocessing']['max_notes_per_file']:
-            return False
-        return True
-
-    def _check_sequence_length(self, tokens: List[int]) -> bool:
-        config = self.config['dataset']['preprocessing']
-        return config['min_tokens_per_sequence'] <= len(tokens) <= config['max_tokens_per_sequence']
-
-    def _save_processed_file(self, file_path: str, tokens: List[int],
-                             metadata: MusicMetadata, conversion_metadata: Dict,
-                             output_dir: str) -> Dict:
-        import time
-        start_time = time.time()
-        metadata.num_tokens = len(tokens)
-        token_filename = f"{metadata.file_id}.tokens"
-        meta_filename = f"{metadata.file_id}.meta.json"
-
-        token_path = os.path.join(output_dir, "tokens", token_filename)
-        os.makedirs(os.path.dirname(token_path), exist_ok=True)
-        with open(token_path, 'w', encoding='utf-8') as f:
-            json.dump(tokens, f)
-
-        metadata.processing_time = time.time() - start_time
-        meta_dict = asdict(metadata)
-        meta_dict.update(conversion_metadata)
-        meta_path = os.path.join(output_dir, "metadata", meta_filename)
-        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump(meta_dict, f, indent=2, ensure_ascii=False)
-
-        return {
-            'file_id': metadata.file_id,
-            'original_path': file_path,
-            'token_path': token_path,
-            'metadata_path': meta_path,
-            'num_tokens': len(tokens),
-            'metadata': meta_dict,
-        }
-
-    def _compute_file_hash(self, file_path: str) -> str:
-        import hashlib
-        hash_md5 = hashlib.md5()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
-
-    def _generate_file_id(self, file_path: str) -> str:
-        import uuid
-        return f"{Path(file_path).stem}_{self._compute_file_hash(file_path)[:8]}_{uuid.uuid4().hex[:8]}"
-
-    def _get_from_cache(self, cache_key: str) -> Optional[Dict]:
-        cache_file = os.path.join(
-            self.config['dataset']['storage']['cache_dir'],
-            f"{cache_key}.cache"
-        )
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except:
-                return None
-        return None
-
-    def _add_to_cache(self, cache_key: str, data: Dict):
-        cache_file = os.path.join(
-            self.config['dataset']['storage']['cache_dir'],
-            f"{cache_key}.cache"
-        )
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-        except:
-            pass
-
-    def _save_processing_stats(self, processed_files: List, failed_files: List, output_dir: str):
-        stats = {
-            'total_files': len(processed_files) + len(failed_files),
-            'processed_files': len(processed_files),
-            'failed_files': len(failed_files),
-            'success_rate': (len(processed_files) / (len(processed_files) + len(failed_files))
-                             if (len(processed_files) + len(failed_files)) > 0 else 0),
-            'cache_hits': self.cache_hits,
-            'cache_misses': self.cache_misses,
-            'total_tokens': sum(f['num_tokens'] for f in processed_files),
-            'avg_tokens_per_file': float(np.mean([f['num_tokens'] for f in processed_files])) if processed_files else 0,
-            'composer_distribution': {},
-            'genre_distribution': {},
-        }
-        for f in processed_files:
-            c = f['metadata']['composer']
-            g = f['metadata']['genre']
-            stats['composer_distribution'][c] = stats['composer_distribution'].get(c, 0) + 1
-            stats['genre_distribution'][g] = stats['genre_distribution'].get(g, 0) + 1
-        stats_path = os.path.join(output_dir, 'processing_stats.json')
-        with open(stats_path, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
 
 
 # ASAP 作曲家目录名（用于元数据推断）
