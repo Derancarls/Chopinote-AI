@@ -57,8 +57,8 @@ def main():
     parser.add_argument('--phase2-warmup', type=int, default=2000,
                         help='Phase 2 warmup 步数 (default: 2000)')
     # 通用
-    parser.add_argument('--batch-size', type=int, default=8,
-                        help='batch size (default: 8)')
+    parser.add_argument('--batch-size', type=int, default=4,
+                        help='batch size (default: 4)')
     parser.add_argument('--output-dir', type=str,
                         default='../autodl-fs/chopinote/checkpoints',
                         help='checkpoint 输出目录')

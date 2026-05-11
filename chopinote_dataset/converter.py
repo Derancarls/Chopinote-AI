@@ -347,7 +347,7 @@ class MusicXMLToREMI:
                         beat_spacing = max(1, int(round(beat_interval / self.quarter_per_position)))
                         for beat_num in range(num):
                             beat_pos = beat_num * beat_spacing
-                            if beat_pos < positions_in_measure and beat_num < self.tokenizer.MAX_BEATS:
+                            if beat_pos < positions_in_measure and beat_pos < self.grid_size and beat_num < self.tokenizer.MAX_BEATS:
                                 extra.append((measure_idx, beat_pos, part_idx,
                                               REMITokenizer.BEAT, beat_num + 1))
 
@@ -419,6 +419,7 @@ class MusicXMLToREMI:
                 # ─────────────────────────────────
 
             if pos != cur_pos:
+                pos = min(pos, self.grid_size - 1)
                 events.append((REMITokenizer.POSITION, pos))
                 cur_pos = pos
                 cur_program = -1
@@ -756,6 +757,7 @@ class PDMXToREMI:
                 _m, pos, prog, sub, _priority, kind, data = item
 
                 if pos != cur_pos:
+                    pos = min(pos, self.grid_size - 1)
                     events.append((REMITokenizer.POSITION, pos))
                     cur_pos = pos
                     cur_program = -1
@@ -990,7 +992,7 @@ class MIDIToREMI:
                         beat_spacing = max(1, int(round(beat_interval / self.quarter_per_position)))
                         for beat_num in range(num):
                             beat_pos = beat_num * beat_spacing
-                            if beat_pos < positions_in_measure and beat_num < self.tokenizer.MAX_BEATS:
+                            if beat_pos < positions_in_measure and beat_pos < self.grid_size and beat_num < self.tokenizer.MAX_BEATS:
                                 extra.append((measure_idx, beat_pos, part_idx,
                                               REMITokenizer.BEAT, beat_num + 1))
 
@@ -1050,6 +1052,7 @@ class MIDIToREMI:
                 # ─────────────────────────────────
 
             if pos != cur_pos:
+                pos = min(pos, self.grid_size - 1)
                 events.append((REMITokenizer.POSITION, pos))
                 cur_pos = pos
                 cur_program = -1

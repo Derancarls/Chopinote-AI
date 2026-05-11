@@ -81,6 +81,7 @@ class FastMIDIToREMI:
         self.TEMPO = '<Tempo'
         self.TIMESIG = '<TimeSig'
         self.KEY = '<Key'
+        self.ANTICIPATE = '<Anticipate'
         self.BEAT = '<Beat'
         self.BASS = '<Bass'
         self.BOS = '<BOS>'
@@ -419,10 +420,15 @@ class FastMIDIToREMI:
         last_key_name: Optional[str] = None
 
         for m in all_measures:
+            key_at_m = _get_key_name(measure_starts[m])
+
+            # ANTICIPATE: emit BEFORE BAR if key changes in the next measure
+            if m > 0 and key_at_m and key_at_m != last_key_name:
+                events.append((self.ANTICIPATE, key_at_m))
+
             events.append((self.BAR, None))
 
-            # Key signature
-            key_at_m = _get_key_name(measure_starts[m])
+            # Key signature (after BAR)
             if m == 0:
                 events.append((self.KEY, initial_key))
                 last_key_name = initial_key

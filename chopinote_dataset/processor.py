@@ -337,7 +337,12 @@ class MusicXMLPreprocessor(_BasePreprocessor):
         
         # 提取速度
         tempo_mark = score.flat.getElementsByClass(tempo.MetronomeMark)
-        tempo_value = float(tempo_mark[0].number) if tempo_mark else None
+        tempo_value = None
+        if tempo_mark and tempo_mark[0].number is not None:
+            try:
+                tempo_value = float(tempo_mark[0].number)
+            except (ValueError, TypeError):
+                pass
         
         return MusicMetadata(
             file_id=file_id,
@@ -380,7 +385,7 @@ class MusicXMLPreprocessor(_BasePreprocessor):
             return 'fugue'
         elif 'chorale' in path_lower:
             return 'chorale'
-        elif md and md.genericName:
+        elif md and getattr(md, 'genericName', None):
             return md.genericName
         else:
             return 'unknown'

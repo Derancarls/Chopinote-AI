@@ -5,14 +5,14 @@ from typing import List, Optional, Set
 
 @dataclass
 class ModelConfig:
-    """Decoder-only Transformer 超参数（适配 RTX 4090 24GB）。"""
+    """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
     vocab_size: int = 872
-    d_model: int = 1024
-    n_layers: int = 12
-    n_heads: int = 16
-    d_ff: int = 4096
+    d_model: int = 2048
+    n_layers: int = 24
+    n_heads: int = 32
+    d_ff: int = 8192
     max_seq_len: int = 4096
-    dropout: float = 0.1
+    dropout: float = 0.15
     pad_token_id: int = 0
     bar_token_id: int = 4
     max_measures: int = 256
@@ -93,11 +93,11 @@ class PhaseConfig:
 
 @dataclass
 class TrainingConfig:
-    """训练配置（适配 RTX 4090 24GB）。"""
-    batch_size: int = 8
-    grad_accum_steps: int = 4
-    lr: float = 2e-4
-    warmup_steps: int = 2000
+    """训练配置（适配 RTX 5090 32GB / 1.24B 模型）。"""
+    batch_size: int = 4
+    grad_accum_steps: int = 8
+    lr: float = 1.5e-4
+    warmup_steps: int = 4000
     total_steps: int = 100000
     compile: bool = False
     logging_steps: int = 10
