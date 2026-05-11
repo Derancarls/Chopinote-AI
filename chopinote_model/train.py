@@ -73,8 +73,11 @@ class Trainer:
         Path(train_config.log_dir).mkdir(parents=True, exist_ok=True)
 
     def save_checkpoint(self, loss: float):
-        """保存 checkpoint（同时备份到 checkpoint_backups）。"""
-        path = Path(self.train_config.output_dir) / f'step_{self.global_step}.pt'
+        """保存 checkpoint + 备份 + 自动清理旧文件。"""
+        output_dir = Path(self.train_config.output_dir)
+
+        # ── step checkpoint ─────────────────────────────────
+        step_path = output_dir / f'step_{self.global_step}.pt'
         torch.save({
             'step': self.global_step,
             'model_state_dict': self.model.state_dict(),
@@ -83,29 +86,51 @@ class Trainer:
             'scaler_state_dict': self.scaler.state_dict(),
             'loss': loss,
             'config': self.model_config,
-        }, path)
-        logger.info(f'Checkpoint saved: {path}')
+        }, step_path)
+        logger.info(f'Checkpoint saved: {step_path}')
+
+        # 确认保存成功后再删旧的 step checkpoint（保留最新 2 个）
+        self._cleanup_old_checkpoints(keep_latest=2)
 
         # 备份
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         backup_path = self.backup_dir / f'step_{self.global_step}.pt'
-        shutil.copy2(path, backup_path)
+        shutil.copy2(step_path, backup_path)
         logger.info(f'Backup saved: {backup_path}')
 
+        # ── best checkpoint ─────────────────────────────────
         if loss < self.best_loss:
             self.best_loss = loss
-            best_path = Path(self.train_config.output_dir) / 'best.pt'
+            # 先写临时文件，确认后再原子替换，避免写一半损坏
+            tmp_path = output_dir / 'best.tmp'
+            best_path = output_dir / 'best.pt'
             torch.save({
                 'step': self.global_step,
                 'model_state_dict': self.model.state_dict(),
                 'loss': loss,
                 'config': self.model_config,
-            }, best_path)
+            }, tmp_path)
+            tmp_path.rename(best_path)  # 原子的—POSIX guarantee
             logger.info(f'Best model saved: {best_path}')
             # 备份 best.pt
             best_backup = self.backup_dir / 'best.pt'
             shutil.copy2(best_path, best_backup)
             logger.info(f'Best model backup saved: {best_backup}')
+
+    def _cleanup_old_checkpoints(self, keep_latest: int = 2):
+        """保留最新的 keep_latest 个 step checkpoint，删除更早的（含备份）。"""
+        output_dir = Path(self.train_config.output_dir)
+        step_files = sorted(
+            output_dir.glob('step_*.pt'),
+            key=lambda p: int(p.stem.split('_')[1]),
+        )
+        for f in step_files[:-keep_latest]:
+            f.unlink()
+            logger.info(f'Deleted old checkpoint: {f}')
+            backup = self.backup_dir / f.name
+            if backup.exists():
+                backup.unlink()
+                logger.info(f'Deleted old backup: {backup}')
 
     def load_checkpoint(self, checkpoint_path: str):
         """恢复 checkpoint（支持 vocab/参数量变化，自动跳过 shape 不匹配的权重）。"""
