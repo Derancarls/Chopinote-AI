@@ -32,19 +32,39 @@ class TokenDataset(Dataset):
         if not self.file_paths:
             raise ValueError(f'文件列表为空: {split_file}')
 
-        # 预读取每个文件的 token 数
-        self.file_lengths: list[int] = []
-        for fp in self.file_paths:
-            try:
-                path = self._resolve_path(fp)
-                if path.exists():
-                    with open(path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    self.file_lengths.append(len(data))
-                else:
+        # 加载 token 长度索引（由预处理生成的 token_lengths.json）
+        index_path = self.data_dir / 'token_lengths.json'
+        if index_path.exists():
+            import gc
+            with open(index_path, 'r') as fh:
+                length_index = json.load(fh)
+            self.file_lengths = [
+                length_index.get(Path(fp).stem, 0)
+                for fp in self.file_paths
+            ]
+            del length_index
+            gc.collect()  # 释放 ~300MB dict，避免 DataLoader fork 时 COW 复制
+        else:
+            # 回退：逐文件读取 meta
+            meta_dir = self.data_dir / 'metadata'
+            self.file_lengths: list[int] = []
+            for fp in self.file_paths:
+                try:
+                    path = self._resolve_path(fp)
+                    if path.exists():
+                        meta_path = meta_dir / (path.stem + '.meta.json')
+                        if meta_path.exists():
+                            with open(meta_path, 'r') as f:
+                                meta = json.load(f)
+                            self.file_lengths.append(meta['num_tokens'])
+                        else:
+                            with open(path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            self.file_lengths.append(len(data))
+                    else:
+                        self.file_lengths.append(0)
+                except Exception:
                     self.file_lengths.append(0)
-            except Exception:
-                self.file_lengths.append(0)
 
         self.valid_indices = [
             i for i, l in enumerate(self.file_lengths)
@@ -61,7 +81,7 @@ class TokenDataset(Dataset):
 
         # FIFO 缓存最近加载的文件（随机采样下 FIFO ≈ LRU）
         self._cache: dict[int, list[int]] = {}
-        self._cache_max = 16
+        self._cache_max = 128
 
     def _resolve_path(self, file_path: str) -> Path:
         """将 split 文件中的路径解析为实际 token 文件路径。"""
@@ -146,7 +166,7 @@ def create_dataloader(split_file: str, data_dir: str = 'data/processed',
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=8,
         pin_memory=False,   # PyTorch 2.8 + CUDA 12.8 pin_memory bug
-        prefetch_factor=2,
+        prefetch_factor=4,
     )
