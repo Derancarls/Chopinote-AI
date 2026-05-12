@@ -11,7 +11,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
+from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from .config import ModelConfig, TrainingConfig
@@ -41,10 +42,7 @@ class Trainer:
         self.model_config = model_config
         self.train_config = train_config
         self.device = device
-        # 备份目录：优先使用 autodl-fs 持久存储，否则放在 output_dir 同级
-        _autodl = Path('../autodl-fs/chopinote/checkpoint_backups')
-        self.backup_dir = _autodl if _autodl.parent.parent.exists() else \
-            Path(train_config.output_dir) / 'backups'
+        self.backup_dir = Path(train_config.output_dir) / 'backups'
 
         # 去重参数（weight tying 会导致同一 tensor 作为多个 Parameter 被 yield）
         params = list(dict.fromkeys(model.parameters()))
@@ -54,7 +52,7 @@ class Trainer:
             weight_decay=0.1,
             betas=(0.9, 0.95),
         )
-        self.scaler = GradScaler(enabled=(device.type == 'cuda'))
+        self.scaler = GradScaler('cuda')
         self.scheduler = _get_scheduler(
             self.optimizer, train_config.warmup_steps, train_config.total_steps
         )
@@ -315,10 +313,11 @@ class Trainer:
                 dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
-                num_workers=4,
+                num_workers=8,
                 pin_memory=False,
                 collate_fn=collate_fn,
                 drop_last=True,
+                prefetch_factor=4,
             )
 
             # 预计算 loss 屏蔽 token ID 集合
@@ -335,7 +334,7 @@ class Trainer:
             self.optimizer = AdamW(
                 params, lr=phase.lr, weight_decay=0.1, betas=(0.9, 0.95),
             )
-            self.scaler = GradScaler(enabled=(self.device.type == 'cuda'))
+            self.scaler = GradScaler('cuda')
             self.scheduler = _get_scheduler(self.optimizer, phase.warmup_steps, phase.total_steps)
 
             # 阶段训练循环

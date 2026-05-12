@@ -18,6 +18,8 @@ venv/
 # 训练产物
 checkpoints/
 logs/
+processlog/
+training_logs/
 
 # 生成数据
 data/processed/

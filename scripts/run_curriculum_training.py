@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
+torch.set_float32_matmul_precision('high')   # TF32: 免费加速，不增加显存
 
 from chopinote_model.config import ModelConfig, TrainingConfig, PhaseConfig, TokenLossMask
 from chopinote_model.model import MusicTransformer
@@ -57,11 +58,13 @@ def main():
     parser.add_argument('--phase2-warmup', type=int, default=2000,
                         help='Phase 2 warmup 步数 (default: 2000)')
     # 通用
-    parser.add_argument('--batch-size', type=int, default=4,
-                        help='batch size (default: 4)')
+    parser.add_argument('--batch-size', type=int, default=2,
+                        help='batch size (default: 2)')
     parser.add_argument('--output-dir', type=str,
-                        default='../autodl-fs/chopinote/checkpoints',
-                        help='checkpoint 输出目录')
+                        default='/root/autodl-tmp/chopinote/checkpoints',
+                        help='checkpoint 输出目录（默认 400G 数据盘）')
+    parser.add_argument('--log-dir', type=str, default='./logs',
+                        help='TensorBoard 日志目录 (default: ./logs)')
     parser.add_argument('--resume', type=str, default=None,
                         help='从 checkpoint 恢复（跳过之前的 phase）')
     args = parser.parse_args()
@@ -99,6 +102,7 @@ def main():
     train_config = TrainingConfig(
         batch_size=args.batch_size,
         output_dir=args.output_dir,
+        log_dir=args.log_dir,
         data_dir=args.data_dir,
         phases=[phase1, phase2],
     )

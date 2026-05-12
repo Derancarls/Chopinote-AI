@@ -31,18 +31,13 @@ class CausalSelfAttention(nn.Module):
         # 小节目对偏置表: 覆盖 measure 距离 [-(M-1), (M-1)]
         self.measure_bias = nn.Parameter(torch.zeros(2 * config.max_measures - 1, config.n_heads))
 
-    def _get_rel_bias(self, T_q: int, T_k: int) -> torch.Tensor:
-        """生成相对位置偏置矩阵。
-
-        Returns:
-            (1, n_heads, T_q, T_k) — 可广播到 attention scores
-        """
-        i = torch.arange(T_q, device=self.rel_bias.device).view(-1, 1)   # (T_q, 1)
-        j = torch.arange(T_k, device=self.rel_bias.device).view(1, -1)   # (1, T_k)
-        dist = i - j + self.max_len - 1                                   # (T_q, T_k)
+    def _get_rel_bias(self, T_q: int, T_k: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        i = torch.arange(T_q, device=self.rel_bias.device).view(-1, 1)
+        j = torch.arange(T_k, device=self.rel_bias.device).view(1, -1)
+        dist = i - j + self.max_len - 1
         dist = dist.clamp(0, 2 * self.max_len - 2)
-        bias = self.rel_bias[dist]                                         # (T_q, T_k, n_heads)
-        return bias.permute(2, 0, 1).unsqueeze(0)                          # (1, n_heads, T_q, T_k)
+        bias = self.rel_bias[dist]                                        # (T_q, T_k, n_heads)
+        return bias.permute(2, 0, 1).unsqueeze(0).to(dtype)              # (1, nH, T_q, T_k)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 kv_cache: Optional[list] = None,
@@ -66,19 +61,20 @@ class CausalSelfAttention(nn.Module):
             kv_cache[0] = k
             kv_cache[1] = v
 
-        # 相对位置注意力（方案 C: 偏置通过 attn_mask 传入）
-        total_bias = self._get_rel_bias(T, k.size(2))
+        # 相对位置偏置 (fp16 = 省一半显存，与 attention scores 精度一致)
+        total_bias = self._get_rel_bias(T, k.size(2), dtype=q.dtype)
 
-        # padding mask: 禁止注意 padding 位置的 key（mask 中为 0 的位置）
+        # padding mask（batch 内 pattern 相同，只取第一行避免广播出 (B,...) 张量）
         if mask is not None:
             T_kv = k.size(2)
-            if mask.size(1) < T_kv:
-                # 推理 KV-cache 情况：past keys 都是有效位置
-                pad_bias = torch.zeros(B, T_kv, device=mask.device, dtype=total_bias.dtype)
-                pad_bias[:, :mask.size(1)] = torch.where(mask.bool(), 0.0, float('-inf'))
+            dtype = total_bias.dtype
+            m = mask[0]  # (T,) — 所有样本 padding 模式一致
+            if m.size(0) < T_kv:
+                pad_bias = torch.zeros(T_kv, device=mask.device, dtype=dtype)
+                pad_bias[:m.size(0)] = torch.where(m.bool(), 0.0, float('-inf')).to(dtype)
             else:
-                pad_bias = torch.where(mask.bool(), 0.0, float('-inf'))
-            total_bias = total_bias + pad_bias.unsqueeze(1).unsqueeze(2)
+                pad_bias = torch.where(m.bool(), 0.0, float('-inf')).to(dtype)
+            total_bias = total_bias + pad_bias.view(1, 1, 1, -1)  # (1,nH,T,T) + (1,1,1,T)
 
         # ── 小节目对偏置 ──────────────────────────────────
         if measure_ids is not None:
@@ -86,21 +82,18 @@ class CausalSelfAttention(nn.Module):
             if measure_ids.dim() == 1:
                 m_q = measure_ids[-T:]    # (T_q,) — 当前输入的 measure_ids
                 m_k = measure_ids         # (T_total,) — 全部
-                dist = m_q.unsqueeze(-1) - m_k.unsqueeze(0)  # (T_q, T_k)
             else:
-                m_q = measure_ids[:, -T:]  # (B, T_q)
-                m_k = measure_ids          # (B, T_k)
-                dist = m_q.unsqueeze(2) - m_k.unsqueeze(1)  # (B, T_q, T_k)
+                # 只用第一个样本的 measure 结构，避免广播出 (B,nH,T,T) 的 3-4 GiB 分配
+                m_q = measure_ids[0, -T:]  # (T_q,)
+                m_k = measure_ids[0]        # (T_k,)
+            dist = m_q.unsqueeze(-1) - m_k.unsqueeze(0)  # (T_q, T_k)
 
             dist = dist.clamp(0, 2 * self.max_measures - 2).long()
-            meas_bias = self.measure_bias[dist]  # (..., T_q, T_k, n_heads)
+            mb = self.measure_bias.to(dtype=q.dtype)   # fp16 查表，省一半显存
+            meas_bias = mb[dist]                        # (T_q, T_k, n_heads)
+            meas_bias = meas_bias.permute(2, 0, 1).unsqueeze(0)  # (1, nH, T_q, T_k)
 
-            if meas_bias.dim() == 4:
-                meas_bias = meas_bias.permute(0, 3, 1, 2)   # (B, nH, T_q, T_k)
-            else:
-                meas_bias = meas_bias.permute(2, 0, 1).unsqueeze(0)  # (1, nH, T_q, T_k)
-
-            total_bias = total_bias + meas_bias
+            total_bias = total_bias + meas_bias  # 同 shape，不广播
         # ──────────────────────────────────────────────────
 
         if kv_cache is not None and kv_cache[0] is not None:
