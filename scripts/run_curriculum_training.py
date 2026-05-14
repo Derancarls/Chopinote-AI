@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 torch.set_float32_matmul_precision('high')   # TF32: 免费加速，不增加显存
+torch.backends.cudnn.benchmark = True        # cuDNN autotune
 
 from chopinote_model.config import ModelConfig, TrainingConfig, PhaseConfig, TokenLossMask
 from chopinote_model.model import MusicTransformer
@@ -60,6 +61,8 @@ def main():
     # 通用
     parser.add_argument('--batch-size', type=int, default=2,
                         help='batch size (default: 2)')
+    parser.add_argument('--compile', action='store_true', default=False,
+                        help='启用 torch.compile (mode=reduce-overhead)')
     parser.add_argument('--output-dir', type=str,
                         default='/root/autodl-tmp/chopinote/checkpoints',
                         help='checkpoint 输出目录（默认 400G 数据盘）')
@@ -74,7 +77,7 @@ def main():
 
     # Model
     model_config = ModelConfig()
-    model = MusicTransformer(model_config)
+    model = MusicTransformer(model_config).to(dtype=torch.bfloat16)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f'模型参数量: {total_params:,}')
 
@@ -101,6 +104,7 @@ def main():
 
     train_config = TrainingConfig(
         batch_size=args.batch_size,
+        compile=args.compile,
         output_dir=args.output_dir,
         log_dir=args.log_dir,
         data_dir=args.data_dir,

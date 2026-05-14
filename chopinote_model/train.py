@@ -11,8 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.cuda.amp import autocast
-from torch.amp import GradScaler
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from .config import ModelConfig, TrainingConfig
@@ -52,13 +51,11 @@ class Trainer:
             weight_decay=0.1,
             betas=(0.9, 0.95),
         )
-        self.scaler = GradScaler('cuda')
         self.scheduler = _get_scheduler(
             self.optimizer, train_config.warmup_steps, train_config.total_steps
         )
 
-        self.global_step = 0     # 优化器步数
-        self._accum_step = 0
+        self.global_step = 0
         self.best_loss = float('inf')
         self._last_avg_loss = float('inf')
 
@@ -81,7 +78,6 @@ class Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'scaler_state_dict': self.scaler.state_dict(),
             'loss': loss,
             'config': self.model_config,
         }, step_path)
@@ -171,12 +167,6 @@ class Trainer:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         except Exception:
             logger.warning('调度器状态恢复失败，已重新初始化')
-        if 'scaler_state_dict' in checkpoint:
-            try:
-                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            except Exception:
-                logger.warning('GradScaler 状态恢复失败，已重新初始化')
-
         self.global_step = checkpoint['step']
         self.best_loss = checkpoint.get('loss', float('inf'))
         logger.info(f'Resumed from checkpoint: {checkpoint_path} (step {self.global_step})')
@@ -213,6 +203,7 @@ class Trainer:
                     f'effective_batch={config.effective_batch_size}')
 
         _vocab_checked = False
+        _accum_step = 0
 
         while self.global_step < config.total_steps:
             for batch in train_dataloader:
@@ -229,7 +220,7 @@ class Trainer:
                         f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}'
                     _vocab_checked = True
 
-                with autocast(enabled=(self.device.type == 'cuda')):
+                with autocast(self.device.type, dtype=torch.bfloat16):
                     logits = model(input_ids, attention_mask)
                     loss = nn.functional.cross_entropy(
                         logits.view(-1, logits.size(-1)),
@@ -240,13 +231,12 @@ class Trainer:
                     loss = loss / max(1, (labels != -100).sum())
                 total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
-                self.scaler.scale(loss).backward()
-                self._accum_step += 1
+                loss.backward()
+                _accum_step += 1
 
-                if self._accum_step % config.grad_accum_steps == 0:
+                if _accum_step % config.grad_accum_steps == 0:
                     total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
+                    optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     self.global_step += 1
@@ -313,11 +303,11 @@ class Trainer:
                 dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
-                num_workers=8,
+                num_workers=2,
+                persistent_workers=True,
                 pin_memory=False,
                 collate_fn=collate_fn,
                 drop_last=True,
-                prefetch_factor=4,
             )
 
             # 预计算 loss 屏蔽 token ID 集合
@@ -329,12 +319,11 @@ class Trainer:
                 masked_ids = phase.loss_mask.get_masked_token_ids(t)
                 logger.info(f'  屏蔽 token 数: {len(masked_ids)}')
 
-            # 重建 optimizer / scheduler / scaler
+            # 重建 optimizer / scheduler
             params = list(dict.fromkeys(model.parameters()))
             self.optimizer = AdamW(
                 params, lr=phase.lr, weight_decay=0.1, betas=(0.9, 0.95),
             )
-            self.scaler = GradScaler('cuda')
             self.scheduler = _get_scheduler(self.optimizer, phase.warmup_steps, phase.total_steps)
 
             # 阶段训练循环
@@ -364,7 +353,7 @@ class Trainer:
                     if masked_ids:
                         labels = self._apply_loss_mask(labels, masked_ids)
 
-                    with autocast(enabled=(self.device.type == 'cuda')):
+                    with autocast('cuda', dtype=torch.bfloat16):
                         logits = model(input_ids, attention_mask)
                         loss = nn.functional.cross_entropy(
                             logits.view(-1, logits.size(-1)),
@@ -375,13 +364,12 @@ class Trainer:
                         loss = loss / max(1, (labels != -100).sum())
                     total_loss += loss.item()
                     loss = loss / config.grad_accum_steps
-                    self.scaler.scale(loss).backward()
+                    loss.backward()
                     _phase_accum += 1
 
                     if _phase_accum % config.grad_accum_steps == 0:
                         total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
+                        self.optimizer.step()
                         self.scheduler.step()
                         self.optimizer.zero_grad()
                         phase_step += 1
@@ -445,7 +433,7 @@ class Trainer:
             labels = batch['labels'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
 
-            with autocast(enabled=(self.device.type == 'cuda')):
+            with autocast('cuda', dtype=torch.bfloat16):
                 logits = self.model(input_ids, attention_mask)
             loss = nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
