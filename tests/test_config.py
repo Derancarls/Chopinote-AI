@@ -31,8 +31,8 @@ class TestTrainingConfig:
 
     def test_defaults(self):
         config = TrainingConfig()
-        assert config.lr == 2e-4
-        assert config.warmup_steps == 2000
+        assert config.lr == 1.5e-4
+        assert config.warmup_steps == 4000
         assert config.total_steps == 100000
 
     def test_override(self):

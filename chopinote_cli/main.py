@@ -583,14 +583,14 @@ def save_to_musicxml(
 ):
     """将 token 序列保存为 MusicXML 文件。"""
     from chopinote_model.generate import (
-        tokens_to_notes, notes_to_score, _inject_directions_in_musicxml,
+        tokens_to_notes, notes_to_score,
+        _inject_directions_in_musicxml, _cleanup_accidentals,
     )
 
     notes = tokens_to_notes(token_ids, tokenizer)
     score = notes_to_score(notes, grid_size=tokenizer.grid_size, max_bars=max_bars)
     score.write('musicxml', fp=output_path)
 
-    # ── 后处理：踏板 + 渐强渐弱 + 八度记号 ──────────────
     _inject_directions_in_musicxml(
         output_path,
         pedal_events=getattr(score, '_pedal_events', []),
@@ -598,100 +598,10 @@ def save_to_musicxml(
         octave_events=getattr(score, '_octave_events', []),
         all_keys=getattr(score, '_all_keys', None),
     )
-    # ─────────────────────────────────────────────────
-
-    # ── 后处理：清理多余的还原记号（保留合法的） ────────
     _cleanup_accidentals(output_path)
-    # ─────────────────────────────────────────────────
 
     num_bars = max(n['bar'] for n in notes) if notes else 0
     return num_bars
-
-
-# 调号 fifths → 各 step 的默认 alter 值
-# fifths > 0 = 升号调, fifths < 0 = 降号调, 0 = C 大调/A 小调
-_KEY_SIG_ALTER: dict[int, dict[str, int]] = {
-    -7: {'C':-1,'D':-1,'E':-1,'F':-1,'G':-1,'A':-1,'B':-1},
-    -6: {'C':-1,'D':-1,'E':-1,'F':-1,'G':-1,'A':-1,'B': 0},
-    -5: {'C':-1,'D': 0,'E':-1,'F':-1,'G':-1,'A':-1,'B': 0},
-    -4: {'C':-1,'D': 0,'E':-1,'F':-1,'G': 0,'A':-1,'B': 0},
-    -3: {'C': 0,'D': 0,'E':-1,'F':-1,'G': 0,'A': 0,'B': 0},
-    -2: {'C': 0,'D': 0,'E':-1,'F': 0,'G': 0,'A': 0,'B': 0},
-    -1: {'C': 0,'D': 0,'E': 0,'F':-1,'G': 0,'A': 0,'B': 0},
-     0: {'C': 0,'D': 0,'E': 0,'F': 0,'G': 0,'A': 0,'B': 0},
-     1: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 0,'A': 0,'B': 0},
-     2: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 1,'A': 0,'B': 0},
-     3: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 1,'A': 1,'B': 0},
-     4: {'C': 0,'D': 0,'E': 1,'F': 1,'G': 1,'A': 1,'B': 0},
-     5: {'C': 0,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 0},
-     6: {'C': 0,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 1},
-     7: {'C': 1,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 1},
-}
-
-
-def _cleanup_accidentals(path: str):
-    """清理 MusicXML 中多余的还原记号。
-
-    逐小节扫描，只保留确实在"取消"某个升降号的还原号：
-    - 如果本小节内该音级有前置升降号（alter≠0）→ 保留（取消升降号）
-    - 如果调号对该音级有默认升降（如 Gb 大调的 G）→ 保留（取消调号）
-    - 否则 → 去掉（凭空出现的还原号，多余）
-    """
-    with open(path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    import re
-
-    measure_pattern = re.compile(
-        r'(<measure[^>]*>.*?</measure>)', re.DOTALL
-    )
-    key_fifths_pattern = re.compile(r'<fifths>(-?\d+)</fifths>')
-    step_pattern = re.compile(r'<step>([A-G])</step>')
-    alter_pattern = re.compile(r'<alter>(-?\d+)</alter>')
-    note_pattern = re.compile(r'<note[^>]*>.*?</note>', re.DOTALL)
-
-    def _get_default_alter(step: str, fifths: int) -> int:
-        return _KEY_SIG_ALTER.get(fifths, {}).get(step, 0)
-
-    def _process_measure(measure_xml: str) -> str:
-        # 读取调号
-        fifths = 0
-        m = key_fifths_pattern.search(measure_xml)
-        if m:
-            fifths = int(m.group(1))
-
-        altered_steps: set[str] = set()
-
-        # 按顺序逐 note 处理
-        for nb in note_pattern.finditer(measure_xml):
-            note_xml = nb.group(0)
-            step_m = step_pattern.search(note_xml)
-            if not step_m:
-                continue
-            step = step_m.group(1)
-            alter_m = alter_pattern.search(note_xml)
-            alter = int(alter_m.group(1)) if alter_m else 0
-            default = _get_default_alter(step, fifths)
-
-            if alter != default:
-                altered_steps.add(step)
-
-            if '<accidental>natural</accidental>' in note_xml:
-                needed = (step in altered_steps) or (default != 0 and alter == 0)
-                if not needed:
-                    cleaned_note = re.sub(
-                        r'\s*<accidental>natural</accidental>\s*\n?', '\n', note_xml, count=1
-                    )
-                    measure_xml = measure_xml.replace(note_xml, cleaned_note, 1)
-        return measure_xml
-
-    result = measure_pattern.sub(
-        lambda m: _process_measure(m.group(1)), content
-    )
-
-    if result != content:
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(result)
 
 
 # -- 输出路径 --------------------------------------------------

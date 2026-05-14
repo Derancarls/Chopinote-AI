@@ -357,6 +357,7 @@ def tokens_to_notes(token_ids: list[int],
     cur_tuplet = None       # (actual, normal) or None
     cur_grace_type = None   # 'acciaccatura', 'appoggiatura', 'grace' or None
     current_tonic = 60      # 默认 C4，遇到 KEY token 时更新
+    cur_timesig = '4/4'     # 默认拍号
     i = 0
 
     while i < len(events):
@@ -509,10 +510,19 @@ def tokens_to_notes(token_ids: list[int],
             current_tonic = key_name_to_tonic_midi(evalue)
             i += 1
             continue
+        elif etype == REMITokenizer.TIMESIG:
+            cur_timesig = evalue
+            notes_list.append({
+                'bar': cur_bar, 'position': cur_pos,
+                'program': cur_program, 'subtrack': cur_subtrack,
+                'type': 'timesig', 'value': evalue,
+            })
+            i += 1
+            continue
         # ── 其他暂不支持的标记 ──────────────────────────
         elif etype in (REMITokenizer.CLEF,
                        REMITokenizer.REPEAT, REMITokenizer.JUMP, REMITokenizer.TEMPO,
-                       REMITokenizer.TIMESIG, REMITokenizer.BEAT,
+                       REMITokenizer.BEAT,
                        REMITokenizer.BASS, REMITokenizer.ANTICIPATE):
             i += 1
             continue
@@ -562,6 +572,7 @@ def notes_to_score(notes_list: list[dict],
         parts[key] = part
 
     max_existing_bar = max(bars.keys())
+    cur_timesig = '4/4'     # 默认拍号，遇 TimeSig event 更新
 
     # 收集踏板/渐强渐弱/八度记号事件（music21 Spanner 序列化有缺陷，后处理注入 XML）
     _pedal_events: list[dict] = []
@@ -572,11 +583,18 @@ def notes_to_score(notes_list: list[dict],
         if bar_idx > max_bars:
             break
 
+        # 查找本小节是否有拍号变更
+        for key in all_keys_sorted:
+            for entry in bars.get(bar_idx, {}).get(key, []):
+                if entry.get('type') == 'timesig':
+                    cur_timesig = entry['value']
+                    break
+
         meas_by_key: dict[Tuple[int, int], stream.Measure] = {}
         for key in all_keys_sorted:
             m = stream.Measure()
             m.number = bar_idx
-            m.timeSignature = meter.TimeSignature('4/4')
+            m.timeSignature = meter.TimeSignature(cur_timesig)
             meas_by_key[key] = m
 
         for key in all_keys_sorted:
@@ -883,5 +901,85 @@ def generate_to_musicxml(model: MusicTransformer, tokenizer: REMITokenizer,
         octave_events=getattr(score, '_octave_events', []),
         all_keys=getattr(score, '_all_keys', None),
     )
+    _cleanup_accidentals(output_path)
     logger.info(f'生成完成: {output_path}')
     return output_path
+
+
+# ── 还原记号后处理 ─────────────────────────────────────────
+
+# 调号 fifths → 各 step 的默认 alter 值
+_KEY_SIG_ALTER: dict[int, dict[str, int]] = {
+    -7: {'C':-1,'D':-1,'E':-1,'F':-1,'G':-1,'A':-1,'B':-1},
+    -6: {'C':-1,'D':-1,'E':-1,'F':-1,'G':-1,'A':-1,'B': 0},
+    -5: {'C':-1,'D': 0,'E':-1,'F':-1,'G':-1,'A':-1,'B': 0},
+    -4: {'C':-1,'D': 0,'E':-1,'F':-1,'G': 0,'A':-1,'B': 0},
+    -3: {'C': 0,'D': 0,'E':-1,'F':-1,'G': 0,'A': 0,'B': 0},
+    -2: {'C': 0,'D': 0,'E':-1,'F': 0,'G': 0,'A': 0,'B': 0},
+    -1: {'C': 0,'D': 0,'E': 0,'F':-1,'G': 0,'A': 0,'B': 0},
+     0: {'C': 0,'D': 0,'E': 0,'F': 0,'G': 0,'A': 0,'B': 0},
+     1: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 0,'A': 0,'B': 0},
+     2: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 1,'A': 0,'B': 0},
+     3: {'C': 0,'D': 0,'E': 0,'F': 1,'G': 1,'A': 1,'B': 0},
+     4: {'C': 0,'D': 0,'E': 1,'F': 1,'G': 1,'A': 1,'B': 0},
+     5: {'C': 0,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 0},
+     6: {'C': 0,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 1},
+     7: {'C': 1,'D': 1,'E': 1,'F': 1,'G': 1,'A': 1,'B': 1},
+}
+
+
+def _cleanup_accidentals(path: str):
+    """清理 MusicXML 中多余的还原记号。
+
+    逐小节扫描，只保留确实在"取消"某个升降号的还原号：
+    - 如果本小节内该音级有前置升降号（alter≠0）→ 保留
+    - 如果调号对该音级有默认升降 → 保留
+    - 否则 → 去掉
+    """
+    import re
+    with open(path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    measure_pattern = re.compile(r'(<measure[^>]*>.*?</measure>)', re.DOTALL)
+    key_fifths_pattern = re.compile(r'<fifths>(-?\d+)</fifths>')
+    step_pattern = re.compile(r'<step>([A-G])</step>')
+    alter_pattern = re.compile(r'<alter>(-?\d+)</alter>')
+    note_pattern = re.compile(r'<note[^>]*>.*?</note>', re.DOTALL)
+
+    def _get_default_alter(step: str, fifths: int) -> int:
+        return _KEY_SIG_ALTER.get(fifths, {}).get(step, 0)
+
+    def _process_measure(measure_xml: str) -> str:
+        fifths = 0
+        m = key_fifths_pattern.search(measure_xml)
+        if m:
+            fifths = int(m.group(1))
+        altered_steps: set[str] = set()
+
+        for nb in note_pattern.finditer(measure_xml):
+            note_xml = nb.group(0)
+            step_m = step_pattern.search(note_xml)
+            if not step_m:
+                continue
+            step = step_m.group(1)
+            alter_m = alter_pattern.search(note_xml)
+            alter = int(alter_m.group(1)) if alter_m else 0
+            default = _get_default_alter(step, fifths)
+
+            if alter != default:
+                altered_steps.add(step)
+
+            if '<accidental>natural</accidental>' in note_xml:
+                needed = (step in altered_steps) or (default != 0 and alter == 0)
+                if not needed:
+                    cleaned_note = re.sub(
+                        r'\s*<accidental>natural</accidental>\s*\n?', '\n', note_xml, count=1
+                    )
+                    measure_xml = measure_xml.replace(note_xml, cleaned_note, 1)
+        return measure_xml
+
+    result = measure_pattern.sub(lambda m: _process_measure(m.group(1)), content)
+
+    if result != content:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(result)

@@ -1,4 +1,5 @@
 """模型超参和训练配置。"""
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
@@ -96,6 +97,8 @@ class TrainingConfig:
     """训练配置（适配 RTX 5090 32GB / 1.24B 模型）。"""
     batch_size: int = 2
     grad_accum_steps: int = 16
+    # 以下字段仅在单阶段模式 (phases=None) 下生效
+    # 多阶段模式请通过 PhaseConfig 分别设置各阶段 lr / warmup / steps
     lr: float = 1.5e-4
     warmup_steps: int = 4000
     total_steps: int = 100000
@@ -103,9 +106,12 @@ class TrainingConfig:
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000
-    output_dir: str = "/root/autodl-tmp/chopinote/checkpoints"
-    log_dir: str = "./logs"
-    data_dir: str = "data/processed"
+    output_dir: str = field(default_factory=lambda: os.environ.get(
+        'CHOPINOTE_OUTPUT_DIR', '/root/autodl-tmp/chopinote/checkpoints'))
+    log_dir: str = field(default_factory=lambda: os.environ.get(
+        'CHOPINOTE_LOG_DIR', './logs'))
+    data_dir: str = field(default_factory=lambda: os.environ.get(
+        'CHOPINOTE_DATA_DIR', 'data/processed'))
     phases: Optional[List[PhaseConfig]] = None  # None = 单阶段模式，向后兼容
 
     @property

@@ -19,17 +19,118 @@ from .tokenizer import REMITokenizer, key_name_to_tonic_midi
 logger = logging.getLogger(__name__)
 
 
-class MusicXMLToREMI:
-    """MusicXML → REMI 转换器
-
-    解析双轨钢琴谱（左右手），按 grid 对齐并生成 REMI token 序列。
-    """
+class _BaseREMI:
+    """三个转换器共享的基类：__init__ + tokenize 包装 + 事件组装。"""
 
     def __init__(self, grid_size: int = 16, velocity_levels: int = 8):
         self.grid_size = grid_size
         self.velocity_levels = velocity_levels
         self.quarter_per_position = 4.0 / grid_size
         self.tokenizer = REMITokenizer(grid_size, velocity_levels)
+
+    def _tokenize_events(self, events: list, collect_metadata: bool = False,
+                         **extra_meta) -> Tuple:
+        """BOS/EOS 包装 + tokenize，统一 metadata 收集。"""
+        if not events:
+            return ([], {}) if collect_metadata else []
+        full_events = [(REMITokenizer.BOS, None)] + events + [(REMITokenizer.EOS, None)]
+        token_ids = self.tokenizer.tokenize(full_events)
+        if collect_metadata:
+            metadata = {
+                'grid_size': self.grid_size,
+                'velocity_levels': self.velocity_levels,
+                'num_events': len(events),
+                'num_measures': sum(1 for e in events if e[0] == REMITokenizer.BAR),
+                **extra_meta,
+            }
+            return token_ids, metadata
+        return token_ids
+
+    @staticmethod
+    def _assemble_events(merged: list, tonic_midi: int,
+                         key_changes: list, key_name: str | None
+                         ) -> List[Tuple[str, Optional[int]]]:
+        """从 merged 条目组装 REMI 事件序列（三转换器共享）。"""
+        # key change map
+        key_change_map: Dict[int, str] = {}
+        for chg_idx, (chg_measure, chg_key) in enumerate(key_changes):
+            if chg_idx > 0:
+                key_change_map[chg_measure] = chg_key
+
+        # pre-scan bass notes
+        pos_bass: Dict[Tuple[int, int], int] = {}
+        for _m, _pos, _prog, _sub, _pri, kind, data in merged:
+            if kind == 'n':
+                pitch = data[0]
+                k = (_m, _pos)
+                if k not in pos_bass or pitch < pos_bass[k]:
+                    pos_bass[k] = pitch
+
+        events: List[Tuple[str, Optional[int]]] = []
+        cur_measure = -1
+        cur_pos = -1
+        cur_program = -1
+        cur_subtrack = 0
+
+        for m, pos, prog, sub, _priority, kind, data in merged:
+            if m != cur_measure:
+                if cur_measure >= 0 and m in key_change_map:
+                    events.append((REMITokenizer.ANTICIPATE, key_change_map[m]))
+                events.append((REMITokenizer.BAR, None))
+                cur_measure = m
+                cur_pos = -1
+                cur_program = -1
+                if m in key_change_map:
+                    events.append((REMITokenizer.KEY, key_change_map[m]))
+
+            if pos != cur_pos:
+                pos = min(pos, 15)  # grid_size - 1
+                events.append((REMITokenizer.POSITION, pos))
+                cur_pos = pos
+                cur_program = -1
+                bass_pc = pos_bass.get((cur_measure, pos))
+                if bass_pc is not None:
+                    events.append((REMITokenizer.BASS, bass_pc % 12))
+
+            if prog != cur_program or sub != cur_subtrack:
+                if sub == 0:
+                    events.append((REMITokenizer.PROGRAM, str(prog)))
+                else:
+                    events.append((REMITokenizer.PROGRAM, f'{prog}_{sub}'))
+                cur_program = prog
+                cur_subtrack = sub
+
+            if kind == 'x':
+                ttype, val = data
+                events.append((ttype, val))
+            elif kind == 'g':
+                gn_type, pitch, vel_level, dur = data
+                interval = max(-60, min(60, pitch - tonic_midi))
+                events.append((REMITokenizer.GRACE_NOTE, gn_type))
+                events.append((REMITokenizer.NOTE_ON, interval))
+                events.append((REMITokenizer.VELOCITY, vel_level))
+                events.append((REMITokenizer.DURATION, dur))
+            elif kind == 'r':
+                (dur,) = data
+                events.append((REMITokenizer.REST, None))
+                events.append((REMITokenizer.DURATION, dur))
+            else:  # 'n'
+                pitch, vel_level, dur = data
+                interval = max(-60, min(60, pitch - tonic_midi))
+                events.append((REMITokenizer.NOTE_ON, interval))
+                events.append((REMITokenizer.VELOCITY, vel_level))
+                events.append((REMITokenizer.DURATION, dur))
+
+        if key_name:
+            events.insert(0, (REMITokenizer.KEY, key_name))
+        return events
+
+
+class MusicXMLToREMI(_BaseREMI):
+    """MusicXML → REMI 转换器
+
+    解析双轨钢琴谱（左右手），按 grid 对齐并生成 REMI token 序列。
+    """
 
     def convert(self, file_path: str, collect_metadata: bool = False
                 ) -> Tuple[List[int], dict]:
@@ -60,21 +161,7 @@ class MusicXMLToREMI:
     def _convert_score(self, score, file_path: str | None = None,
                        collect_metadata: bool = False) -> Tuple[List[int], dict]:
         events = self._score_to_events(score)
-        if not events:
-            return [], {}
-
-        full_events = [(REMITokenizer.BOS, None)] + events + [(REMITokenizer.EOS, None)]
-        token_ids = self.tokenizer.tokenize(full_events)
-
-        metadata = {}
-        if collect_metadata:
-            metadata = {
-                'grid_size': self.grid_size,
-                'velocity_levels': self.velocity_levels,
-                'num_events': len(events),
-                'num_measures': sum(1 for e in events if e[0] == REMITokenizer.BAR),
-            }
-        return token_ids, metadata
+        return self._tokenize_events(events, collect_metadata)
 
     def _clef_name(self, c) -> str:
         """Clef 对象 → 规范名称 (treble/bass/alto/tenor)。"""
@@ -354,8 +441,6 @@ class MusicXMLToREMI:
         if not all_notes and not extra and not all_rests and not all_grace_notes:
             return []
 
-        # 合并各类事件，按 (measure, position, program, subtrack, priority) 排序
-        # priority: 0=TimeSig, 1=extra, 1.5=GraceNote, 2=note, 2.5=Rest, 3=TupletEnd
         merged: List[Tuple[int, int, int, int, float, str, tuple]] = []
 
         for m_idx, pos, p_idx, ttype, val in extra:
@@ -378,105 +463,16 @@ class MusicXMLToREMI:
             merged.append((m_idx, pos, prog, sub, 1.5, 'g', (gn_type, gn_pitch, gn_vel, gn_dur)))
 
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
-
-        # ── pre-scan: Bass Note ──────────────────────────────
-        pos_bass: Dict[Tuple[int, int], int] = {}
-        for _m_idx, _pos, _prog, _sub, _pri, kind, data in merged:
-            if kind == 'n':
-                pitch = data[0]
-                key = (_m_idx, _pos)
-                if key not in pos_bass or pitch < pos_bass[key]:
-                    pos_bass[key] = pitch
-        # ──────────────────────────────────────────────────────
-
-        # ── key change map ──────────────────────────────────
-        key_change_map: Dict[int, str] = {}
-        for chg_idx, (chg_measure, chg_key) in enumerate(key_changes):
-            if chg_idx > 0:  # skip initial key
-                key_change_map[chg_measure] = chg_key
-        # ──────────────────────────────────────────────────────
-
-        # 组装事件序列
-        events: List[Tuple[str, Optional[int]]] = []
-        cur_measure = -1
-        cur_pos = -1
-        cur_program = -1
-        cur_subtrack = 0
-
-        for m, pos, prog, sub, _priority, kind, data in merged:
-            if m != cur_measure:
-                # ── Anticipate (just before BAR) ──
-                if cur_measure >= 0 and m in key_change_map:
-                    events.append((REMITokenizer.ANTICIPATE, key_change_map[m]))
-                # ──────────────────────────────────
-                events.append((REMITokenizer.BAR, None))
-                cur_measure = m
-                cur_pos = -1
-                cur_program = -1
-                # ── KEY change (just after BAR) ──
-                if m in key_change_map:
-                    events.append((REMITokenizer.KEY, key_change_map[m]))
-                # ─────────────────────────────────
-
-            if pos != cur_pos:
-                pos = min(pos, self.grid_size - 1)
-                events.append((REMITokenizer.POSITION, pos))
-                cur_pos = pos
-                cur_program = -1
-                # ── Bass token ──
-                bass_pc = pos_bass.get((cur_measure, pos))
-                if bass_pc is not None:
-                    events.append((REMITokenizer.BASS, bass_pc % 12))
-                # ─────────────────
-
-            if prog != cur_program or sub != cur_subtrack:
-                if sub == 0:
-                    events.append((REMITokenizer.PROGRAM, str(prog)))
-                else:
-                    events.append((REMITokenizer.PROGRAM, f'{prog}_{sub}'))
-                cur_program = prog
-                cur_subtrack = sub
-
-            if kind == 'x':
-                ttype, val = data
-                events.append((ttype, val))
-            elif kind == 'g':  # grace note
-                gn_type, pitch, vel_level, dur = data
-                interval = max(-60, min(60, pitch - tonic_midi))
-                events.append((REMITokenizer.GRACE_NOTE, gn_type))
-                events.append((REMITokenizer.NOTE_ON, interval))
-                events.append((REMITokenizer.VELOCITY, vel_level))
-                events.append((REMITokenizer.DURATION, dur))
-            elif kind == 'r':  # rest
-                (dur,) = data
-                events.append((REMITokenizer.REST, None))
-                events.append((REMITokenizer.DURATION, dur))
-            else:  # 'n' — note
-                pitch, vel_level, dur = data
-                interval = max(-60, min(60, pitch - tonic_midi))
-                events.append((REMITokenizer.NOTE_ON, interval))
-                events.append((REMITokenizer.VELOCITY, vel_level))
-                events.append((REMITokenizer.DURATION, dur))
-
-        # Key token 作为第一个内容事件（在 _convert_score 中紧跟 BOS）
-        if key_name:
-            events.insert(0, (REMITokenizer.KEY, key_name))
-        return events
+        return self._assemble_events(merged, tonic_midi, key_changes, key_name)
 
 
 
-class PDMXToREMI:
+class PDMXToREMI(_BaseREMI):
     """PDMX JSON → REMI 转换器
 
     读取 PDMX (MusicRender) JSON 格式，输出与 MusicXMLToREMI 相同的
     REMI 事件序列，兼容下游 tokenizer 和训练管线。
     """
-
-    def __init__(self, grid_size: int = 16, velocity_levels: int = 8):
-        self.grid_size = grid_size
-        self.velocity_levels = velocity_levels
-        self.quarter_per_position = 4.0 / grid_size
-        self.tokenizer = REMITokenizer(grid_size, velocity_levels)
 
     def convert(self, file_path: str, collect_metadata: bool = False
                 ) -> Union[List[int], Tuple[List[int], dict]]:
@@ -506,24 +502,16 @@ class PDMXToREMI:
         events = self._pdmx_to_events(data)
         if not events:
             return ([], {}) if collect_metadata else []
-
-        full_events = [(REMITokenizer.BOS, None)] + events + [(REMITokenizer.EOS, None)]
-        token_ids = self.tokenizer.tokenize(full_events)
-
-        metadata = {}
         if collect_metadata:
             md = data.get('metadata', {})
-            metadata = {
-                'grid_size': self.grid_size,
-                'velocity_levels': self.velocity_levels,
-                'num_events': len(events),
-                'num_measures': sum(1 for e in events if e[0] == REMITokenizer.BAR),
+            extra_meta = {
                 'title': md.get('title', ''),
                 'creators': md.get('creators', []),
                 'source_format': md.get('source_format', ''),
                 'num_tracks': len(data.get('tracks', [])),
             }
-        return (token_ids, metadata) if collect_metadata else token_ids
+            return self._tokenize_events(events, collect_metadata=True, **extra_meta)
+        return self._tokenize_events(events, collect_metadata=False)
 
     def _pdmx_to_events(self, data: dict) -> List[Tuple[str, Optional[int]]]:
         """PDMX MusicRender dict → REMI 事件列表。"""
@@ -711,93 +699,10 @@ class PDMXToREMI:
 
         # ── 6. 排序 ──────────────────────────────────────────
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
-
-        # ── pre-scan: Bass Note ──────────────────────────────
-        pos_bass: Dict[Tuple[int, int], int] = {}
-        for _m_idx, _pos, _prog, _sub, _pri, kind, data in merged:
-            if kind == 'n':
-                pitch = data[0]
-                key = (_m_idx, _pos)
-                if key not in pos_bass or pitch < pos_bass[key]:
-                    pos_bass[key] = pitch
-        # ──────────────────────────────────────────────────────
-
-        # ── key change map ──────────────────────────────────
-        key_change_map: Dict[int, str] = {}
-        for chg_idx, (chg_measure, chg_key) in enumerate(key_changes):
-            if chg_idx > 0:  # skip initial key
-                key_change_map[chg_measure] = chg_key
-        # ──────────────────────────────────────────────────────
-
-        # ── 7. 组装 REMI 事件序列 ──────────────────────────
-        events: List[Tuple[str, Optional[int]]] = []
-        cur_pos = -1
-        cur_program = -1
-        cur_subtrack = 0
-
-        # 按小节分组，确保空小节也被遍历
-        events_by_measure: Dict[int, list] = defaultdict(list)
-        for item in merged:
-            events_by_measure[item[0]].append(item)
-
-        for m in range(max_measure + 1):
-            # ── Anticipate (just before BAR) ──
-            if m in key_change_map:
-                events.append((REMITokenizer.ANTICIPATE, key_change_map[m]))
-            # ──────────────────────────────────
-            events.append((REMITokenizer.BAR, None))
-            cur_pos = -1
-            cur_program = -1
-            # ── KEY change (just after BAR) ──
-            if m in key_change_map:
-                events.append((REMITokenizer.KEY, key_change_map[m]))
-            # ─────────────────────────────────
-
-            for item in events_by_measure.get(m, []):
-                _m, pos, prog, sub, _priority, kind, data = item
-
-                if pos != cur_pos:
-                    pos = min(pos, self.grid_size - 1)
-                    events.append((REMITokenizer.POSITION, pos))
-                    cur_pos = pos
-                    cur_program = -1
-                    # ── Bass token ──
-                    bass_pc = pos_bass.get((m, pos))
-                    if bass_pc is not None:
-                        events.append((REMITokenizer.BASS, bass_pc % 12))
-                    # ─────────────────
-
-                if prog != cur_program or sub != cur_subtrack:
-                    if sub == 0:
-                        events.append((REMITokenizer.PROGRAM, str(prog)))
-                    else:
-                        events.append((REMITokenizer.PROGRAM, f'{prog}_{sub}'))
-                    cur_program = prog
-                    cur_subtrack = sub
-
-                if kind == 'x':
-                    ttype, val = data
-                    events.append((ttype, val))
-                elif kind == 'g':  # grace note
-                    gn_type, pitch, vel_level, dur = data
-                    interval = max(-60, min(60, pitch - tonic_midi))
-                    events.append((REMITokenizer.GRACE_NOTE, gn_type))
-                    events.append((REMITokenizer.NOTE_ON, interval))
-                    events.append((REMITokenizer.VELOCITY, vel_level))
-                    events.append((REMITokenizer.DURATION, dur))
-                else:  # 'n' — normal note
-                    pitch, vel_level, dur = data
-                    interval = max(-60, min(60, pitch - tonic_midi))
-                    events.append((REMITokenizer.NOTE_ON, interval))
-                    events.append((REMITokenizer.VELOCITY, vel_level))
-                    events.append((REMITokenizer.DURATION, dur))
-
-        if key_name:
-            events.insert(0, (REMITokenizer.KEY, key_name))
-        return events
+        return self._assemble_events(merged, tonic_midi, key_changes, key_name)
 
 
-class MIDIToREMI:
+class MIDIToREMI(_BaseREMI):
     """MIDI → REMI 转换器。
 
     用 music21 解析 MIDI 文件，提取音符骨架（音高/力度/时值/拍号/调号/
@@ -807,12 +712,6 @@ class MIDIToREMI:
     """
 
     _DRUM_PROGRAMS = set(range(112, 128))
-
-    def __init__(self, grid_size: int = 16, velocity_levels: int = 8):
-        self.grid_size = grid_size
-        self.velocity_levels = velocity_levels
-        self.quarter_per_position = 4.0 / grid_size
-        self.tokenizer = REMITokenizer(grid_size, velocity_levels)
 
     def convert(self, file_path: str, collect_metadata: bool = False):
         """解析 MIDI 文件并转换为 REMI token ID 列表。"""
@@ -834,25 +733,13 @@ class MIDIToREMI:
 
     def _convert_score(self, score, file_path=None, collect_metadata=False):
         events = self._score_to_events(score)
-        if not events:
-            if collect_metadata:
-                return [], {}
-            return []
-
-        full_events = [(REMITokenizer.BOS, None)] + events + [(REMITokenizer.EOS, None)]
-        token_ids = self.tokenizer.tokenize(full_events)
-
         if collect_metadata:
-            metadata = {
-                'grid_size': self.grid_size,
-                'velocity_levels': self.velocity_levels,
-                'num_events': len(events),
-                'num_measures': sum(1 for e in events if e[0] == REMITokenizer.BAR),
+            extra_meta = {
                 'num_notes': sum(1 for e in events if e[0] == REMITokenizer.NOTE_ON),
                 'source_format': 'midi',
             }
-            return token_ids, metadata
-        return token_ids
+            return self._tokenize_events(events, collect_metadata=True, **extra_meta)
+        return self._tokenize_events(events, collect_metadata=False)
 
     def _score_to_events(self, score) -> List[Tuple[str, Optional[Any]]]:
         """music21 Score → REMI 事件列表（骨架模式，无表现力标记）。"""
@@ -999,7 +886,6 @@ class MIDIToREMI:
         if not all_notes and not extra:
             return []
 
-        # ── 合并、排序、组装 ────────────────────────────────────
         merged: List[Tuple[int, int, int, int, float, str, tuple]] = []
 
         for m_idx, pos, p_idx, ttype, val in extra:
@@ -1011,75 +897,4 @@ class MIDIToREMI:
             merged.append((m_idx, pos, prog, sub, 2, 'n', (p, vl, dr)))
 
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
-
-        # ── pre-scan: Bass Note ──────────────────────────────
-        pos_bass: Dict[Tuple[int, int], int] = {}
-        for _m_idx, _pos, _prog, _sub, _pri, kind, data in merged:
-            if kind == 'n':
-                pitch = data[0]
-                key = (_m_idx, _pos)
-                if key not in pos_bass or pitch < pos_bass[key]:
-                    pos_bass[key] = pitch
-        # ──────────────────────────────────────────────────────
-
-        # ── key change map ──────────────────────────────────
-        key_change_map: Dict[int, str] = {}
-        for chg_idx, (chg_measure, chg_key) in enumerate(key_changes):
-            if chg_idx > 0:  # skip initial key
-                key_change_map[chg_measure] = chg_key
-        # ──────────────────────────────────────────────────────
-
-        # ── 组装事件序列 ───────────────────────────────────────
-        events: List[Tuple[str, Optional[Any]]] = []
-        cur_measure = -1
-        cur_pos = -1
-        cur_program = -1
-        cur_subtrack = 0
-
-        for m, pos, prog, sub, _priority, kind, data in merged:
-            if m != cur_measure:
-                # ── Anticipate (just before BAR) ──
-                if cur_measure >= 0 and m in key_change_map:
-                    events.append((REMITokenizer.ANTICIPATE, key_change_map[m]))
-                # ──────────────────────────────────
-                events.append((REMITokenizer.BAR, None))
-                cur_measure = m
-                cur_pos = -1
-                cur_program = -1
-                # ── KEY change (just after BAR) ──
-                if m in key_change_map:
-                    events.append((REMITokenizer.KEY, key_change_map[m]))
-                # ─────────────────────────────────
-
-            if pos != cur_pos:
-                pos = min(pos, self.grid_size - 1)
-                events.append((REMITokenizer.POSITION, pos))
-                cur_pos = pos
-                cur_program = -1
-                # ── Bass token ──
-                bass_pc = pos_bass.get((cur_measure, pos))
-                if bass_pc is not None:
-                    events.append((REMITokenizer.BASS, bass_pc % 12))
-                # ─────────────────
-
-            if prog != cur_program or sub != cur_subtrack:
-                if sub == 0:
-                    events.append((REMITokenizer.PROGRAM, str(prog)))
-                else:
-                    events.append((REMITokenizer.PROGRAM, f'{prog}_{sub}'))
-                cur_program = prog
-                cur_subtrack = sub
-
-            if kind == 'x':
-                ttype, val = data
-                events.append((ttype, val))
-            else:  # 'n' — note
-                pitch, vel_level, dur = data
-                interval = max(-60, min(60, pitch - tonic_midi))
-                events.append((REMITokenizer.NOTE_ON, interval))
-                events.append((REMITokenizer.VELOCITY, vel_level))
-                events.append((REMITokenizer.DURATION, dur))
-
-        if key_name:
-            events.insert(0, (REMITokenizer.KEY, key_name))
-        return events
+        return self._assemble_events(merged, tonic_midi, key_changes, key_name)
