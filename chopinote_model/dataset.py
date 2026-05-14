@@ -110,7 +110,7 @@ class TokenDataset(Dataset):
         return data
 
     def __getitem__(self, idx: int) -> dict:
-        file_idx = random.choice(self.valid_indices)
+        file_idx = self.valid_indices[idx % len(self.valid_indices)]
         tokens = self._load_tokens(file_idx)
 
         if len(tokens) <= self.max_seq_len + 1:

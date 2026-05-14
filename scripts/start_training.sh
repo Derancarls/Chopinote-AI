@@ -16,11 +16,11 @@ LOCK_FILE="/tmp/chopinote-train.lock"
 PID_FILE="/tmp/chopinote-train.pid"
 
 # 目录
-PROJECT_DIR="/root/Chopinote-AI"
-DATA_DIR="/root/autodl-tmp/data/processed"
-CHECKPOINT_DIR="/root/autodl-tmp/chopinote/checkpoints"
-LOG_DIR="/root/autodl-tmp/chopinote/logs"
-TB_DIR="/root/autodl-tmp/chopinote/tensorboard"
+PROJECT_DIR="${CHOPINOTE_PROJECT_DIR:-/root/Chopinote-AI}"
+DATA_DIR="${CHOPINOTE_DATA_DIR:-/root/autodl-tmp/data/processed}"
+CHECKPOINT_DIR="${CHOPINOTE_OUTPUT_DIR:-/root/autodl-tmp/chopinote/checkpoints}"
+LOG_DIR="${CHOPINOTE_LOG_DIR:-/root/autodl-tmp/chopinote/logs}"
+TB_DIR="${CHOPINOTE_TB_DIR:-/root/autodl-tmp/chopinote/tensorboard}"
 TB_PORT=6006
 
 mkdir -p "$LOG_DIR" "$TB_DIR" "$CHECKPOINT_DIR"

@@ -188,101 +188,22 @@ class Trainer:
 
     def _train_single_phase(self, train_dataloader: DataLoader,
                             val_dataloader: Optional[DataLoader] = None):
-        """单阶段训练循环。global_step 为优化器步数。"""
+        """单阶段训练循环（向后兼容）。"""
         config = self.train_config
-        model = self.model
-        optimizer = self.optimizer
-        scheduler = self.scheduler
-
-        model.train()
-        total_loss = 0.0
-        start_time = time.time()
-
         logger.info(f'开始训练 | batch_size={config.batch_size} '
                     f'accum={config.grad_accum_steps} '
                     f'effective_batch={config.effective_batch_size}')
-
-        _vocab_checked = False
-        _accum_step = 0
-
-        while self.global_step < config.total_steps:
-            for batch in train_dataloader:
-                if self.global_step >= config.total_steps:
-                    break
-
-                input_ids = batch['input_ids'].to(self.device)
-                labels = batch['labels'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-
-                if not _vocab_checked:
-                    max_id = max(input_ids.max().item(), labels.max().item() if labels.numel() else 0)
-                    assert max_id < model.config.vocab_size, \
-                        f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}'
-                    _vocab_checked = True
-
-                with autocast(self.device.type, dtype=torch.bfloat16):
-                    logits = model(input_ids, attention_mask)
-                    loss = nn.functional.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1),
-                        ignore_index=-100,
-                        reduction='sum',
-                    )
-                    loss = loss / max(1, (labels != -100).sum())
-                total_loss += loss.item()
-                loss = loss / config.grad_accum_steps
-                loss.backward()
-                _accum_step += 1
-
-                if _accum_step % config.grad_accum_steps == 0:
-                    total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    self.global_step += 1
-
-                    self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
-
-                    if self.global_step % config.logging_steps == 0:
-                        n_micro = config.logging_steps * config.grad_accum_steps
-                        avg_loss = total_loss / n_micro
-                        self._last_avg_loss = avg_loss
-                        self.writer.add_scalar('train/loss', avg_loss, self.global_step)
-                        self.writer.add_scalar('train/lr', scheduler.get_last_lr()[0], self.global_step)
-                        elapsed = time.time() - start_time
-                        logger.info(
-                            f'Step {self.global_step}/{config.total_steps} | '
-                            f'Loss: {avg_loss:.4f} | '
-                            f'LR: {scheduler.get_last_lr()[0]:.2e} | '
-                            f'Time: {elapsed:.1f}s'
-                        )
-                        total_loss = 0.0
-
-                    if val_dataloader is not None and \
-                       self.global_step % config.eval_steps == 0:
-                        val_loss = self.evaluate(val_dataloader)
-                        self.writer.add_scalar('val/loss', val_loss, self.global_step)
-                        logger.info(f'Validation loss: {val_loss:.4f}')
-                        model.train()
-
-                    if self.global_step % config.save_steps == 0:
-                        self.save_checkpoint(self._last_avg_loss)
-
-        self.save_checkpoint(self._last_avg_loss)
+        self._run_training_loop(
+            train_dataloader, config.total_steps, config.warmup_steps, config.lr,
+            eval_steps=config.eval_steps, save_steps=config.save_steps,
+            val_dataloader=val_dataloader,
+        )
         self.writer.close()
         logger.info('训练完成')
 
     def _train_multiphase(self, val_dataloader: Optional[DataLoader] = None):
-        """多阶段分层训练。
-
-        按 phases 列表顺序执行，每阶段：
-        - 从 phase.data_split_file 创建 DataLoader
-        - 若 phase.loss_mask 非空，屏蔽对应 token 的 loss
-        - 重建 optimizer/scheduler（使用阶段 LR 和 warmup）
-        - 模型参数在阶段之间保留
-        """
+        """多阶段分层训练。每阶段可设置独立的 LR、warmup、数据、loss 屏蔽。"""
         config = self.train_config
-        model = self.model
 
         for phase_idx, phase in enumerate(config.phases):
             logger.info(f'{"="*60}')
@@ -293,7 +214,6 @@ class Trainer:
             logger.info(f'  Loss 屏蔽: {phase.loss_mask is not None}')
             logger.info(f'{"="*60}')
 
-            # 创建本阶段 dataloader
             dataset = TokenDataset(
                 split_file=phase.data_split_file,
                 data_dir=config.data_dir,
@@ -309,105 +229,116 @@ class Trainer:
                 drop_last=True,
             )
 
-            # 预计算 loss 屏蔽 token ID 集合
             masked_ids: Optional[set] = None
             if phase.loss_mask is not None:
-                from .config import TokenLossMask
                 from chopinote_dataset.tokenizer import REMITokenizer
                 t = REMITokenizer(grid_size=16, velocity_levels=8)
                 masked_ids = phase.loss_mask.get_masked_token_ids(t)
                 logger.info(f'  屏蔽 token 数: {len(masked_ids)}')
 
-            # 重建 optimizer / scheduler
-            params = list(dict.fromkeys(model.parameters()))
-            self.optimizer = AdamW(
-                params, lr=phase.lr, weight_decay=0.1, betas=(0.9, 0.95),
+            self._run_training_loop(
+                phase_loader, phase.total_steps, phase.warmup_steps, phase.lr,
+                phase_name=phase.name, masked_ids=masked_ids,
+                eval_steps=phase.eval_steps, save_steps=phase.save_steps,
+                val_dataloader=val_dataloader,
             )
-            self.scheduler = _get_scheduler(self.optimizer, phase.warmup_steps, phase.total_steps)
-
-            # 阶段训练循环
-            model.train()
-            total_loss = 0.0
-            start_time = time.time()
-            phase_step = 0      # 优化器步数
-            _phase_accum = 0    # 微批次计数（每阶段 reset）
-            _vocab_checked = False
-
-            while phase_step < phase.total_steps:
-                for batch in phase_loader:
-                    if phase_step >= phase.total_steps:
-                        break
-
-                    input_ids = batch['input_ids'].to(self.device)
-                    labels = batch['labels'].to(self.device)
-                    attention_mask = batch['attention_mask'].to(self.device)
-
-                    if not _vocab_checked:
-                        max_id = max(input_ids.max().item(), labels.max().item() if labels.numel() else 0)
-                        assert max_id < model.config.vocab_size, \
-                            f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}'
-                        _vocab_checked = True
-
-                    # 应用 loss 屏蔽
-                    if masked_ids:
-                        labels = self._apply_loss_mask(labels, masked_ids)
-
-                    with autocast('cuda', dtype=torch.bfloat16):
-                        logits = model(input_ids, attention_mask)
-                        loss = nn.functional.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            labels.view(-1),
-                            ignore_index=-100,
-                            reduction='sum',
-                        )
-                        loss = loss / max(1, (labels != -100).sum())
-                    total_loss += loss.item()
-                    loss = loss / config.grad_accum_steps
-                    loss.backward()
-                    _phase_accum += 1
-
-                    if _phase_accum % config.grad_accum_steps == 0:
-                        total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
-                        phase_step += 1
-                        self.global_step += 1
-
-                        self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
-
-                        if phase_step % config.logging_steps == 0:
-                            n_micro = config.logging_steps * config.grad_accum_steps
-                            avg_loss = total_loss / n_micro
-                            self._last_avg_loss = avg_loss
-                            self.writer.add_scalar('train/loss', avg_loss, self.global_step)
-                            self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.global_step)
-                            elapsed = time.time() - start_time
-                            logger.info(
-                                f'[{phase.name}] Step {phase_step}/{phase.total_steps} '
-                                f'(global {self.global_step}) | '
-                                f'Loss: {avg_loss:.4f} | '
-                                f'LR: {self.scheduler.get_last_lr()[0]:.2e} | '
-                                f'Time: {elapsed:.1f}s'
-                            )
-                            total_loss = 0.0
-
-                        if val_dataloader is not None and \
-                           phase_step % phase.eval_steps == 0:
-                            val_loss = self.evaluate(val_dataloader)
-                            self.writer.add_scalar('val/loss', val_loss, self.global_step)
-                            logger.info(f'[{phase.name}] Validation loss: {val_loss:.4f}')
-                            model.train()
-
-                        if phase_step % phase.save_steps == 0:
-                            self.save_checkpoint(self._last_avg_loss)
-
-            # 阶段终了保存
-            self.save_checkpoint(self._last_avg_loss)
             logger.info(f'Phase {phase.name} 完成 (global_step={self.global_step})')
 
         self.writer.close()
         logger.info('多阶段训练完成')
+
+    def _run_training_loop(self, dataloader: DataLoader,
+                           total_steps: int, warmup_steps: int, lr: float,
+                           phase_name: str = '', masked_ids: Optional[set] = None,
+                           eval_steps: int | None = None,
+                           save_steps: int | None = None,
+                           val_dataloader: Optional[DataLoader] = None):
+        """共享训练循环（单阶段和多阶段共用）。"""
+        config = self.train_config
+        model = self.model
+
+        params = list(dict.fromkeys(model.parameters()))
+        self.optimizer = AdamW(params, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+        self.scheduler = _get_scheduler(self.optimizer, warmup_steps, total_steps)
+
+        model.train()
+        total_loss = 0.0
+        start_time = time.time()
+        local_step = 0
+        accum = 0
+        _vocab_checked = False
+
+        prefix = f'[{phase_name}] ' if phase_name else ''
+
+        while local_step < total_steps:
+            for batch in dataloader:
+                if local_step >= total_steps:
+                    break
+
+                input_ids = batch['input_ids'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+
+                if not _vocab_checked:
+                    max_id = max(input_ids.max().item(), labels.max().item() if labels.numel() else 0)
+                    assert max_id < model.config.vocab_size, \
+                        f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}'
+                    _vocab_checked = True
+
+                if masked_ids:
+                    labels = self._apply_loss_mask(labels, masked_ids)
+
+                with autocast('cuda', dtype=torch.bfloat16):
+                    logits = model(input_ids, attention_mask)
+                    loss = nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1),
+                        ignore_index=-100,
+                        reduction='sum',
+                    )
+                    loss = loss / max(1, (labels != -100).sum())
+                total_loss += loss.item()
+                loss = loss / config.grad_accum_steps
+                loss.backward()
+                accum += 1
+
+                if accum % config.grad_accum_steps == 0:
+                    total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    local_step += 1
+                    self.global_step += 1
+
+                    self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
+
+                    if local_step % config.logging_steps == 0:
+                        n_micro = config.logging_steps * config.grad_accum_steps
+                        avg_loss = total_loss / n_micro
+                        self._last_avg_loss = avg_loss
+                        self.writer.add_scalar('train/loss', avg_loss, self.global_step)
+                        self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.global_step)
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f'{prefix}Step {local_step}/{total_steps}'
+                            f'{f" (global {self.global_step})" if phase_name else ""} | '
+                            f'Loss: {avg_loss:.4f} | '
+                            f'LR: {self.scheduler.get_last_lr()[0]:.2e} | '
+                            f'Time: {elapsed:.1f}s'
+                        )
+                        total_loss = 0.0
+
+                    if val_dataloader is not None and eval_steps and \
+                       local_step % eval_steps == 0:
+                        val_loss = self.evaluate(val_dataloader)
+                        self.writer.add_scalar('val/loss', val_loss, self.global_step)
+                        logger.info(f'{prefix}Validation loss: {val_loss:.4f}')
+                        model.train()
+
+                    if save_steps and local_step % save_steps == 0:
+                        self.save_checkpoint(self._last_avg_loss)
+
+        self.save_checkpoint(self._last_avg_loss)
 
     @staticmethod
     def _apply_loss_mask(labels: torch.Tensor, masked_ids: set) -> torch.Tensor:
