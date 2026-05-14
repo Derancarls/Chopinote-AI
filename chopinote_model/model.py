@@ -8,6 +8,8 @@ from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
 
+_NEG_INF = float('-inf')
+
 
 class CausalSelfAttention(nn.Module):
     """单层因果自注意力 (支持 KV cache)。"""
@@ -27,17 +29,43 @@ class CausalSelfAttention(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
         # 相对位置偏置表: 覆盖相对距离 [-(L-1), (L-1)]
-        self.rel_bias = nn.Parameter(torch.zeros(2 * config.max_seq_len - 1, config.n_heads))
+        # bf16 参数省一半显存，同时 GradScaler 可接受 bf16 梯度（与 fp32 同 exponent range）
+        self.rel_bias = nn.Parameter(torch.zeros(2 * config.max_seq_len - 1, config.n_heads, dtype=torch.bfloat16))
         # 小节目对偏置表: 覆盖 measure 距离 [-(M-1), (M-1)]
-        self.measure_bias = nn.Parameter(torch.zeros(2 * config.max_measures - 1, config.n_heads))
+        self.measure_bias = nn.Parameter(torch.zeros(2 * config.max_measures - 1, config.n_heads, dtype=torch.bfloat16))
 
-    def _get_rel_bias(self, T_q: int, T_k: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    def _get_rel_bias(self, T_q: int, T_k: int) -> torch.Tensor:
         i = torch.arange(T_q, device=self.rel_bias.device).view(-1, 1)
         j = torch.arange(T_k, device=self.rel_bias.device).view(1, -1)
         dist = i - j + self.max_len - 1
         dist = dist.clamp(0, 2 * self.max_len - 2)
         bias = self.rel_bias[dist]                                        # (T_q, T_k, n_heads)
-        return bias.permute(2, 0, 1).unsqueeze(0).to(dtype)              # (1, nH, T_q, T_k)
+        return bias.permute(2, 0, 1).unsqueeze(0)                        # (1, nH, T_q, T_k)
+
+    def _attn_with_bias(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                        total_bias: torch.Tensor) -> torch.Tensor:
+        """逐 head 计算 attention，避免一次性分配 (B, nH, T, T) 的 4 GiB 张量。
+
+        sm_120(Blackwell) 上 SDPA backend 不支持 float attn_mask，
+        manual matmul 又在 24 GiB 占用下无法分配 (B, nH, T, T) 连续空间。
+        """
+        scale = self.head_dim ** -0.5
+        dropout_p = self.dropout.p if self.training else 0.0
+        B, nH, T, head_dim = q.shape
+        T_kv = k.size(2)
+        output_parts = []
+        causal = torch.triu(torch.ones(T, T_kv, device=q.device, dtype=torch.bool), diagonal=1)
+        causal = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T_kv)
+        for h in range(nH):
+            # (B, 1, T, T_kv) = ~64 MiB @ bf16 (B=2,T=4096)
+            score = (q[:, h:h+1] @ k[:, h:h+1].transpose(-2, -1)) * scale
+            score.masked_fill_(causal, _NEG_INF)
+            score = score + total_bias[:, h:h+1]
+            score = F.softmax(score, dim=-1, dtype=torch.float32).to(q.dtype)
+            score = F.dropout(score, p=dropout_p)
+            out = score @ v[:, h:h+1]
+            output_parts.append(out)
+        return torch.cat(output_parts, dim=1)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 kv_cache: Optional[list] = None,
@@ -61,20 +89,17 @@ class CausalSelfAttention(nn.Module):
             kv_cache[0] = k
             kv_cache[1] = v
 
-        # 相对位置偏置 (fp16 = 省一半显存，与 attention scores 精度一致)
-        total_bias = self._get_rel_bias(T, k.size(2), dtype=q.dtype)
+        # 相对位置偏置（AMP 下 autocast 自动处理精度统一）
+        total_bias = self._get_rel_bias(T, k.size(2))
 
         # padding mask（batch 内 pattern 相同，只取第一行避免广播出 (B,...) 张量）
         if mask is not None:
             T_kv = k.size(2)
-            dtype = total_bias.dtype
             m = mask[0]  # (T,) — 所有样本 padding 模式一致
+            pad_bias = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=total_bias.dtype)
             if m.size(0) < T_kv:
-                pad_bias = torch.zeros(T_kv, device=mask.device, dtype=dtype)
-                pad_bias[:m.size(0)] = torch.where(m.bool(), 0.0, float('-inf')).to(dtype)
-            else:
-                pad_bias = torch.where(m.bool(), 0.0, float('-inf')).to(dtype)
-            total_bias = total_bias + pad_bias.view(1, 1, 1, -1)  # (1,nH,T,T) + (1,1,1,T)
+                pad_bias = F.pad(pad_bias, (0, T_kv - m.size(0)), value=_NEG_INF)
+            total_bias += pad_bias.view(1, 1, 1, -1)  # in-place，与 total_bias 同 dtype
 
         # ── 小节目对偏置 ──────────────────────────────────
         if measure_ids is not None:
@@ -89,11 +114,10 @@ class CausalSelfAttention(nn.Module):
             dist = m_q.unsqueeze(-1) - m_k.unsqueeze(0)  # (T_q, T_k)
 
             dist = dist.clamp(0, 2 * self.max_measures - 2).long()
-            mb = self.measure_bias.to(dtype=q.dtype)   # fp16 查表，省一半显存
-            meas_bias = mb[dist]                        # (T_q, T_k, n_heads)
+            meas_bias = self.measure_bias[dist]              # (T_q, T_k, n_heads) fp32
             meas_bias = meas_bias.permute(2, 0, 1).unsqueeze(0)  # (1, nH, T_q, T_k)
 
-            total_bias = total_bias + meas_bias  # 同 shape，不广播
+            total_bias += meas_bias  # 同 shape，in-place 避免 1 GiB 分配
         # ──────────────────────────────────────────────────
 
         if kv_cache is not None and kv_cache[0] is not None:
@@ -103,16 +127,9 @@ class CausalSelfAttention(nn.Module):
                 dropout_p=0.0, is_causal=False,
             )
         else:
-            # 训练：手动构造因果掩码，合并到 total_bias 中
-            # is_causal=True 会忽略 attn_mask，导致 rel_bias/measure_bias 不生效
-            L = k.size(2)
-            causal_mask = torch.triu(torch.ones(T, L, device=x.device, dtype=torch.bool), diagonal=1)
-            total_bias = total_bias.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=total_bias,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False,
-            )
+            # 逐 head 计算，避免 (B, nH, T, T) = 2 GiB 连续分配导致 OOM
+            # sm_120(Blackwell) 上 flash/mem_efficient 均不支持非空 float attn_mask
+            y = self._attn_with_bias(q, k, v, total_bias)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -137,16 +154,17 @@ class TransformerBlock(nn.Module):
                 kv_cache: Optional[list] = None,
                 measure_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         if kv_cache is None and self.training:
-            x = x + checkpoint(self._ckpt_attn, self.ln1(x), mask, measure_ids,
-                               use_reentrant=False)
+            x = checkpoint(self._ckpt_block, x, mask, measure_ids,
+                           use_reentrant=False)
         else:
-            x = x + self.attn(self.ln1(x), mask, kv_cache, measure_ids)
-        x = x + self.ffn(self.ln2(x))
+            x = self._ckpt_block(x, mask, measure_ids)
         return x
 
-    def _ckpt_attn(self, x: torch.Tensor, mask: Optional[torch.Tensor],
-                   measure_ids: Optional[torch.Tensor]) -> torch.Tensor:
-        return self.attn(x, mask, None, measure_ids)
+    def _ckpt_block(self, x: torch.Tensor, mask: Optional[torch.Tensor],
+                    measure_ids: Optional[torch.Tensor]) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), mask, None, measure_ids)
+        x = x + self.ffn(self.ln2(x))
+        return x
 
 
 class MusicTransformer(nn.Module):
@@ -159,6 +177,10 @@ class MusicTransformer(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
+        # sm_120(Blackwell): flash attention 不支持 float attn_mask，
+        # 禁用后 SDPA dispatcher 自动走 mem_efficient（支持非空 mask，无 OOM）
+        torch.backends.cuda.enable_flash_sdp(False)
+
         self.blocks = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.n_layers)
         ])
@@ -169,8 +191,6 @@ class MusicTransformer(nn.Module):
         self.token_embedding.weight = self.lm_head.weight
 
         self._init_weights()
-
-        # torch.compile 实测在此模型上无加速（瓶颈在显存带宽而非计算），已移除
 
     def _init_weights(self):
         for name, p in self.named_parameters():

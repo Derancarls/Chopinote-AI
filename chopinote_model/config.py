@@ -8,7 +8,7 @@ class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
     vocab_size: int = 872
     d_model: int = 2048
-    n_layers: int = 24
+    n_layers: int = 20
     n_heads: int = 32
     d_ff: int = 8192
     max_seq_len: int = 4096

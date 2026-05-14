@@ -103,7 +103,7 @@ trap 'rm -f "$LOCK_FILE" "$PID_FILE"' EXIT
 # TF32: 免费 8 倍 matmul 加速，无显存开销，精度无损
 export TORCH_CUDNN_V8_API_ENABLED=1
 # 减少碎片化
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # 单 GPU 不需要 NCCL
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
@@ -257,7 +257,7 @@ tmux rename-window -t "$SESSION_NAME:0" "train"
 tmux send-keys -t "$SESSION_NAME:0" \
     "export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1" Enter
 tmux send-keys -t "$SESSION_NAME:0" \
-    "export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128" Enter
+    "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" Enter
 tmux send-keys -t "$SESSION_NAME:0" \
     "export TORCH_CUDNN_V8_API_ENABLED=1 TOKENIZERS_PARALLELISM=false" Enter
 tmux send-keys -t "$SESSION_NAME:0" \
@@ -301,7 +301,7 @@ echo "║  训练参数:                                                    ║"
 echo "║  模型: 1.22B params | batch_size=$BATCH_SIZE | accum=16 | seq=4096  ║"
 echo "║  Phase 1: ${PHASE1_STEPS} steps, LR=${PHASE1_LR}, warmup=${PHASE1_WARMUP}     ║"
 echo "║  Phase 2: ${PHASE2_STEPS} steps, LR=${PHASE2_LR}, warmup=${PHASE2_WARMUP}     ║"
-echo "║  GPU: TF32 ON | 数据加载: 8 workers | 不爆显存 ✓              ║"
+echo "║  GPU: TF32 ON | 数据加载: 主进程 | 不爆显存 ✓              ║"
 [[ -n "$LATEST_CKPT" ]] && echo "║  断点续训: step $LATEST_STEP                                  ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""

@@ -166,7 +166,6 @@ def create_dataloader(split_file: str, data_dir: str = 'data/processed',
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=8,
+        num_workers=0,
         pin_memory=False,   # PyTorch 2.8 + CUDA 12.8 pin_memory bug
-        prefetch_factor=4,
     )
