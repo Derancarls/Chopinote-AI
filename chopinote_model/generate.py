@@ -283,7 +283,6 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
 
     generated = seed.clone()
     bar_count = seed_tokens.count(bar_id)
-    cached_measure_ids = torch.cumsum((seed[0] == bar_id).int(), dim=0)  # (T_seed,)
 
     # 首轮 forward 处理全部 seed
     next_token = seed
@@ -293,8 +292,7 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
         if ctx_len > model.config.max_seq_len:
             next_token = generated[:, -1:]
 
-        logits = model.forward(next_token, kv_caches=kv_caches,
-                                measure_ids=cached_measure_ids)  # (1, T', V)
+        logits = model.forward(next_token, kv_caches=kv_caches)  # (1, T', V)
         logits = logits[:, -1, :] / temperature  # (1, V)
 
         # ── 音高限制：遮盖当前乐器音域外的 NOTE_ON token ──
@@ -326,15 +324,8 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
             current_key = ts[len(_key_prefix) + 1:-1]
             tonic_midi = key_name_to_tonic_midi(current_key)
 
-        # 更新 measure_ids 追踪
-        is_bar = (token_id == bar_id)
-        new_measure = bar_count + (1 if is_bar else 0)
-        cached_measure_ids = torch.cat(
-            [cached_measure_ids, torch.tensor([new_measure], device=device)]
-        )
-
-        if is_bar:
-            bar_count = new_measure
+        if token_id == bar_id:
+            bar_count += 1
             if bar_count >= max_bars:
                 break
 

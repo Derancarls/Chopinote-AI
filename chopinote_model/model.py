@@ -1,4 +1,4 @@
-"""Decoder-only Transformer (GPT 风格) 用于音乐生成。"""
+"""Decoder-only Transformer (GPT 风格) 用于音乐生成，RoPE 位置编码。"""
 from typing import Optional
 
 import torch
@@ -14,7 +14,7 @@ _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 
 
 class CausalSelfAttention(nn.Module):
-    """单层因果自注意力 (支持 KV cache)。"""
+    """单层因果自注意力 + RoPE (支持 KV cache)。"""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -24,55 +24,38 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.d_model = config.d_model
         self.max_len = config.max_seq_len
-        self.max_measures = config.max_measures
 
         self.qkv = FP8Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = FP8Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-        self.rel_slope = nn.Parameter(torch.ones(config.n_heads) * 0.01)
-        self.measure_bias = nn.Embedding(
-            2 * config.max_measures - 1, config.n_heads, dtype=torch.bfloat16)
+        # RoPE cache
+        self.register_buffer('_rope_cos', None, persistent=False)
+        self.register_buffer('_rope_sin', None, persistent=False)
 
-    def _build_total_bias(self, T: int, T_kv: int, mask: Optional[torch.Tensor],
-                          measure_ids: Optional[torch.Tensor],
-                          device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        i = torch.arange(T, device=device).view(-1, 1)
-        j = torch.arange(T_kv, device=device).view(1, -1)
-        pos_dist = (i - j).abs().unsqueeze(0).float()              # (1, T, T_kv)
-        total_bias = -self.rel_slope.view(-1, 1, 1) * pos_dist     # (nH, T, T_kv)
-        total_bias = total_bias.unsqueeze(0)                       # (1, nH, T, T_kv)
+    def _ensure_rope_cache(self, device: torch.device, dtype: torch.dtype):
+        if self._rope_cos is not None and self._rope_cos.device == device:
+            return
+        theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, device=device).float() / self.head_dim))
+        pos = torch.arange(self.max_len, device=device).float()
+        freqs = torch.outer(pos, theta)
+        self._rope_cos = freqs.cos().to(dtype)
+        self._rope_sin = freqs.sin().to(dtype)
 
-        if mask is not None:
-            m = mask[0]
-            pad_bias = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=total_bias.dtype)
-            if m.size(0) < T_kv:
-                pad_bias = F.pad(pad_bias, (0, T_kv - m.size(0)), value=_NEG_INF)
-            total_bias.add_(pad_bias.view(1, 1, 1, -1))
-
-        if measure_ids is not None:
-            if measure_ids.dim() == 1:
-                m_q = measure_ids[-T:]
-                m_k = measure_ids
-            else:
-                m_q = measure_ids[0, -T:]
-                m_k = measure_ids[0]
-            dist = m_q.unsqueeze(-1) - m_k.unsqueeze(0)
-            dist = dist.clamp(0, 2 * self.max_measures - 2).long()
-            meas_bias = self.measure_bias(dist)
-            meas_bias = meas_bias.permute(2, 0, 1).unsqueeze(0)
-            total_bias.add_(meas_bias)
-
-        causal = torch.triu(
-            torch.full((T, T_kv), _NEG_INF, device=device, dtype=total_bias.dtype),
-            diagonal=1,
-        )
-        total_bias.add_(causal)
-        return total_bias.to(dtype=dtype).contiguous()
+    @staticmethod
+    def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """对 (B, nH, T, head_dim) 施加 RoPE 旋转。"""
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        c = cos.unsqueeze(0).unsqueeze(0)
+        s = sin.unsqueeze(0).unsqueeze(0)
+        rotated = torch.empty_like(x)
+        rotated[..., 0::2] = x_even * c - x_odd * s
+        rotated[..., 1::2] = x_even * s + x_odd * c
+        return rotated
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
-                kv_cache: Optional[list] = None,
-                measure_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                kv_cache: Optional[list] = None) -> torch.Tensor:
         B, T, C = x.shape
 
         qkv = self.qkv(x)
@@ -82,25 +65,42 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
+        self._ensure_rope_cache(x.device, q.dtype)
+
         if kv_cache is not None and kv_cache[0] is not None:
+            cache_len = kv_cache[0].size(2)
             k = torch.cat([kv_cache[0], k], dim=2)
             v = torch.cat([kv_cache[1], v], dim=2)
-            kv_cache[0] = k
-            kv_cache[1] = v
-        elif kv_cache is not None:
+        else:
+            cache_len = 0
+
+        T_kv = k.size(2)
+
+        # RoPE: query 用最后 T 个位置, key 用全部 T_kv 个位置
+        q = self._apply_rope(q, self._rope_cos[cache_len:cache_len + T],
+                             self._rope_sin[cache_len:cache_len + T])
+        k = self._apply_rope(k, self._rope_cos[:T_kv], self._rope_sin[:T_kv])
+
+        if kv_cache is not None:
             kv_cache[0] = k
             kv_cache[1] = v
 
-        T_kv = k.size(2)
-        need_causal = (kv_cache is None or kv_cache[0] is None)
-        total_bias = self._build_total_bias(T, T_kv,
-                                            mask, measure_ids if need_causal else None,
-                                            x.device, q.dtype)
+        # 构建 attn_mask: is_causal 处理因果, mask 处理 padding
+        use_causal = kv_cache is None or kv_cache[0] is None or cache_len == 0
+        if mask is not None:
+            m = mask[0] if mask.dim() == 2 else mask
+            pad = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=q.dtype)
+            if pad.size(0) < T_kv:
+                pad = F.pad(pad, (0, T_kv - pad.size(0)), value=_NEG_INF)
+            attn_mask = pad.view(1, 1, 1, -1)
+        else:
+            attn_mask = None
+
         with sdpa_kernel(_SDPA_BACKENDS):
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=total_bias,
+                q, k, v, attn_mask=attn_mask,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False,
+                is_causal=use_causal,
             )
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -123,31 +123,25 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
-                kv_cache: Optional[list] = None,
-                measure_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                kv_cache: Optional[list] = None) -> torch.Tensor:
         need_ckpt = kv_cache is None and self.training
         if need_ckpt:
-            # use_reentrant=False 会追踪中间张量 metadata，与 FP8 内部 .to(fp8) 不兼容
-            # FP8 时用 use_reentrant=True 朴素重跑
             _reentrant = self.attn.qkv.use_fp8
             x = torch.utils.checkpoint.checkpoint(
-                self._forward, x, mask, measure_ids, None,
-                use_reentrant=_reentrant,
-            )
+                self._forward, x, mask, None, use_reentrant=_reentrant)
         else:
-            x = self._forward(x, mask, measure_ids, kv_cache)
+            x = self._forward(x, mask, kv_cache)
         return x
 
     def _forward(self, x: torch.Tensor, mask: Optional[torch.Tensor],
-                 measure_ids: Optional[torch.Tensor],
                  kv_cache: Optional[list] = None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), mask, kv_cache, measure_ids)
+        x = x + self.attn(self.ln1(x), mask, kv_cache)
         x = x + self.ffn(self.ln2(x))
         return x
 
 
 class MusicTransformer(nn.Module):
-    """Decoder-only Transformer 用于音乐 token 序列生成。"""
+    """Decoder-only Transformer 用于音乐 token 序列生成，RoPE 位置编码。"""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -179,22 +173,17 @@ class MusicTransformer(nn.Module):
 
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
-                kv_caches: Optional[list] = None,
-                measure_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                kv_caches: Optional[list] = None) -> torch.Tensor:
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, \
             f'序列长度 {T} 超过 max_seq_len {self.config.max_seq_len}'
-
-        if measure_ids is None:
-            bar_mask = (input_ids == self.config.bar_token_id).int()
-            measure_ids = torch.cumsum(bar_mask, dim=1)
 
         x = self.token_embedding(input_ids)
         x = self.dropout(x)
 
         for i, block in enumerate(self.blocks):
             cache = None if kv_caches is None else kv_caches[i]
-            x = block(x, attention_mask, cache, measure_ids)
+            x = block(x, attention_mask, cache)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
