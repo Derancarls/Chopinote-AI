@@ -148,6 +148,7 @@ class MusicTransformer(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.measure_embedding = nn.Embedding(config.max_measures + 1, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
         self.blocks = nn.ModuleList([
@@ -179,6 +180,9 @@ class MusicTransformer(nn.Module):
             f'序列长度 {T} 超过 max_seq_len {self.config.max_seq_len}'
 
         x = self.token_embedding(input_ids)
+        bar_mask = (input_ids == self.config.bar_token_id).int()
+        measure_ids = torch.cumsum(bar_mask, dim=1).clamp(0, self.config.max_measures)
+        x = x + self.measure_embedding(measure_ids)
         x = self.dropout(x)
 
         for i, block in enumerate(self.blocks):
