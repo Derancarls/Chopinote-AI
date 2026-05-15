@@ -103,6 +103,8 @@ class TrainingConfig:
     warmup_steps: int = 4000
     total_steps: int = 100000
     compile: bool = False
+    use_fp8: bool = False
+    fp8_warmup_steps: int = 100  # BF16 warmup 步数后切换 FP8
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000

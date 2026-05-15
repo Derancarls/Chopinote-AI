@@ -262,6 +262,15 @@ class Trainer:
         self.scheduler = _get_scheduler(self.optimizer, warmup_steps, total_steps)
 
         model.train()
+        _fp8_enabled = False
+        if config.use_fp8 and config.fp8_warmup_steps == 0:
+            model.set_fp8_mode(True)
+            _fp8_enabled = True
+            logger.info(f'{prefix}FP8 模式已启用 (warmup=0)')
+        elif config.use_fp8:
+            model.set_fp8_mode(False)
+            logger.info(f'{prefix}FP8 warmup 阶段: 前 {config.fp8_warmup_steps} 步使用 BF16')
+
         total_loss = 0.0
         start_time = time.time()
         local_step = 0
@@ -310,6 +319,12 @@ class Trainer:
                     local_step += 1
                     self.global_step += 1
 
+                    if not _fp8_enabled and config.use_fp8 and \
+                       local_step >= config.fp8_warmup_steps:
+                        model.set_fp8_mode(True)
+                        _fp8_enabled = True
+                        logger.info(f'{prefix}Step {local_step}: FP8 模式已启用')
+
                     self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
 
                     if local_step % config.logging_steps == 0:
@@ -318,6 +333,16 @@ class Trainer:
                         self._last_avg_loss = avg_loss
                         self.writer.add_scalar('train/loss', avg_loss, self.global_step)
                         self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.global_step)
+                        if _fp8_enabled:
+                            from .fp8_linear import FP8Linear
+                            scales_x, scales_w = [], []
+                            for m in model.modules():
+                                if isinstance(m, FP8Linear) and m._scale_x is not None:
+                                    scales_x.append(m._scale_x.item())
+                                    scales_w.append(m._scale_w.item())
+                            if scales_x:
+                                self.writer.add_scalar('train/fp8_scale_x', sum(scales_x) / len(scales_x), self.global_step)
+                                self.writer.add_scalar('train/fp8_scale_w', sum(scales_w) / len(scales_w), self.global_step)
                         elapsed = time.time() - start_time
                         logger.info(
                             f'{prefix}Step {local_step}/{total_steps}'
