@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from .config import ModelConfig
+from .fp8_linear import FP8Linear
 
 _NEG_INF = float('-inf')
 _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
@@ -25,12 +26,11 @@ class CausalSelfAttention(nn.Module):
         self.max_len = config.max_seq_len
         self.max_measures = config.max_measures
 
-        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
-        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.qkv = FP8Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.out_proj = FP8Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-        self.rel_bias = nn.Embedding(
-            2 * config.max_seq_len - 1, config.n_heads, dtype=torch.bfloat16)
+        self.rel_slope = nn.Parameter(torch.ones(config.n_heads) * 0.01)
         self.measure_bias = nn.Embedding(
             2 * config.max_measures - 1, config.n_heads, dtype=torch.bfloat16)
 
@@ -39,10 +39,9 @@ class CausalSelfAttention(nn.Module):
                           device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         i = torch.arange(T, device=device).view(-1, 1)
         j = torch.arange(T_kv, device=device).view(1, -1)
-        dist = i - j + self.max_len - 1
-        dist = dist.clamp(0, 2 * self.max_len - 2)
-        total_bias = self.rel_bias(dist)                     # (T, T_kv, nH)
-        total_bias = total_bias.permute(2, 0, 1).unsqueeze(0)  # (1, nH, T, T_kv)
+        pos_dist = (i - j).abs().unsqueeze(0).float()              # (1, T, T_kv)
+        total_bias = -self.rel_slope.view(-1, 1, 1) * pos_dist     # (nH, T, T_kv)
+        total_bias = total_bias.unsqueeze(0)                       # (1, nH, T, T_kv)
 
         if mask is not None:
             m = mask[0]
@@ -117,19 +116,23 @@ class TransformerBlock(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln2 = nn.LayerNorm(config.d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(config.d_model, config.d_ff),
+            FP8Linear(config.d_model, config.d_ff),
             nn.GELU(),
-            nn.Linear(config.d_ff, config.d_model),
+            FP8Linear(config.d_ff, config.d_model),
             nn.Dropout(config.dropout),
         )
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 kv_cache: Optional[list] = None,
                 measure_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if kv_cache is None and self.training:
+        need_ckpt = kv_cache is None and self.training
+        if need_ckpt:
+            # use_reentrant=False 会追踪中间张量 metadata，与 FP8 内部 .to(fp8) 不兼容
+            # FP8 时用 use_reentrant=True 朴素重跑
+            _reentrant = self.attn.qkv.use_fp8
             x = torch.utils.checkpoint.checkpoint(
                 self._forward, x, mask, measure_ids, None,
-                use_reentrant=False,
+                use_reentrant=_reentrant,
             )
         else:
             x = self._forward(x, mask, measure_ids, kv_cache)
@@ -168,6 +171,11 @@ class MusicTransformer(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02)
             elif 'bias' in name:
                 nn.init.zeros_(p)
+
+    def set_fp8_mode(self, enabled: bool):
+        for module in self.modules():
+            if isinstance(module, FP8Linear):
+                module.use_fp8 = enabled
 
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,

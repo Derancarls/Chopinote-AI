@@ -15,6 +15,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
+torch.set_float32_matmul_precision('high')
+torch.backends.cudnn.benchmark = True
 
 from chopinote_model.config import ModelConfig, TrainingConfig
 from chopinote_model.model import MusicTransformer
@@ -38,9 +40,9 @@ def main():
                         help='覆盖 batch_size')
     parser.add_argument('--lr', type=float, default=None,
                         help='覆盖学习率')
-    parser.add_argument('--data-dir', type=str, default='data/processed',
+    parser.add_argument('--data-dir', type=str, default='/root/autodl-tmp/data/processed',
                         help='数据目录')
-    parser.add_argument('--output-dir', type=str, default='../autodl-fs/chopinote/checkpoints',
+    parser.add_argument('--output-dir', type=str, default='/root/autodl-tmp/chopinote/checkpoints',
                         help='checkpoint 输出目录')
     args = parser.parse_args()
 
