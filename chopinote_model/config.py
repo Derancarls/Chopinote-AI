@@ -16,6 +16,7 @@ class ModelConfig:
     dropout: float = 0.15
     pad_token_id: int = 0
     bar_token_id: int = 4
+    max_measures: int = 256
     rope_theta: float = 10000.0
 
     @property

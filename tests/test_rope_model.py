@@ -137,13 +137,25 @@ class TestModelRoPE:
             if isinstance(m, FP8Linear):
                 assert not m.use_fp8
 
-    def test_no_measure_params(self):
-        """RoPE 模型不应有 rel_slope 或 measure_bias 参数。"""
+    def test_measure_embedding_params(self):
+        """RoPE 模型应有 measure_embedding 但无 ALiBi 的 rel_slope/measure_bias。"""
         config = ModelConfig(d_model=256, n_heads=4, n_layers=2, d_ff=1024)
         model = MusicTransformer(config)
         names = set(dict(model.named_parameters()).keys())
+        assert any('measure_embedding' in n for n in names), "应有 measure_embedding"
         assert not any('rel_slope' in n for n in names), "不应存在 ALiBi rel_slope"
-        assert not any('measure_bias' in n for n in names), "不应存在 measure_bias"
+        assert not any('measure_bias' in n for n in names), "不应存在旧 pairwise measure_bias"
+
+    def test_measure_embedding_forward(self):
+        """measure_embedding cumsum 正确追踪小节号。"""
+        config = ModelConfig(d_model=256, n_heads=4, n_layers=2, d_ff=1024,
+                             vocab_size=100, max_seq_len=64)
+        model = MusicTransformer(config).cuda()
+        # bars at positions 0, 3, 6 → measure_id: 0,0,0,1,1,1,1,2,2,2... (cumsum happens BEFORE bar token)
+        input_ids = torch.tensor([[4, 1, 2, 4, 3, 5, 6, 4, 7]], device='cuda')
+        logits = model(input_ids)
+        assert logits.shape == (1, 9, 100)
+        assert torch.isfinite(logits).all()
 
 
 class TestModelFP8:
