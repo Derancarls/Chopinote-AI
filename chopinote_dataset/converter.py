@@ -70,6 +70,7 @@ class _BaseREMI:
         cur_pos = -1
         cur_program = -1
         cur_subtrack = 0
+        current_tonic_midi = tonic_midi
 
         for m, pos, prog, sub, _priority, kind, data in merged:
             if m != cur_measure:
@@ -81,6 +82,7 @@ class _BaseREMI:
                 cur_program = -1
                 if m in key_change_map:
                     events.append((REMITokenizer.KEY, key_change_map[m]))
+                    current_tonic_midi = key_name_to_tonic_midi(key_change_map[m])
 
             if pos != cur_pos:
                 pos = min(pos, self.grid_size - 1)
@@ -104,7 +106,7 @@ class _BaseREMI:
                 events.append((ttype, val))
             elif kind == 'g':
                 gn_type, pitch, vel_level, dur = data
-                interval = max(-60, min(60, pitch - tonic_midi))
+                interval = max(-60, min(60, pitch - current_tonic_midi))
                 events.append((REMITokenizer.GRACE_NOTE, gn_type))
                 events.append((REMITokenizer.NOTE_ON, interval))
                 events.append((REMITokenizer.VELOCITY, vel_level))
@@ -116,7 +118,7 @@ class _BaseREMI:
                     events.append((REMITokenizer.DURATION, dur))
             else:  # 'n'
                 pitch, vel_level, dur = data
-                interval = max(-60, min(60, pitch - tonic_midi))
+                interval = max(-60, min(60, pitch - current_tonic_midi))
                 events.append((REMITokenizer.NOTE_ON, interval))
                 events.append((REMITokenizer.VELOCITY, vel_level))
                 events.append((REMITokenizer.DURATION, dur))
