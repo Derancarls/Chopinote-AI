@@ -903,6 +903,52 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
             print()
 
 
+# -- 评价模式 ----------------------------------------------------
+
+def _run_evaluate(args):
+    """评价模式入口：对输入乐谱做广义/狭义评价。"""
+    from chopinote_evaluator.score import Evaluator
+    from chopinote_evaluator.benchmarks.build_benchmarks import load_benchmarks
+
+    print('=== Chopinote-AI 乐谱评价 ===')
+    print()
+
+    benchmarks = load_benchmarks()
+    if not benchmarks:
+        print('[X] 基准数据未找到，请先运行 benchmarks/build_benchmarks.py')
+        sys.exit(1)
+
+    print(f'  输入: {args.input}')
+    print(f'  基准组: {args.group}')
+    print(f'  场景权重: α={args.alpha}')
+    if args.seed_path:
+        print(f'  种子: {args.seed_path}')
+    print()
+
+    ev = Evaluator(
+        benchmarks=benchmarks,
+        alpha=args.alpha,
+        group=args.group,
+    )
+
+    report = ev.evaluate(
+        score_path=args.input,
+        seed_path=args.seed_path,
+        checkpoint=args.checkpoint if args.evaluate else None,
+    )
+
+    print(report.to_text())
+
+    # JSON 输出
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(report.to_json())
+        print()
+        print(f'  JSON 报告已保存: {args.output}')
+
+    print()
+
+
 # -- 主入口 ----------------------------------------------------
 
 def main():
@@ -930,7 +976,8 @@ def main():
             '  chopin best.pt input.musicxml --seed 42 -n 3\n'
         ),
     )
-    parser.add_argument('checkpoint', help='模型权重文件路径 (.pt)')
+    parser.add_argument('checkpoint', nargs='?', default=None,
+                        help='模型权重文件路径 (.pt)，评价模式下可选')
     parser.add_argument('input', help='输入 MusicXML 乐谱文件路径')
     parser.add_argument('-o', '--output', default=None,
                         help='输出 MusicXML 文件路径')
@@ -980,7 +1027,29 @@ def main():
                         help='乐器切换偏置强度 (0~5, 越大切换越频繁, 默认 1.0)')
     parser.add_argument('--prog-switch-interval', type=int, default=None,
                         help='触发切换偏置的最少连续音符数 (1~128, 默认 12)')
+
+    # ── 评价模式 ─────────────────────────────────────────
+    parser.add_argument('--evaluate', action='store_true',
+                        help='评价模式：对输入的乐谱打分')
+    parser.add_argument('--seed-path', type=str, default=None,
+                        help='种子乐谱文件路径（续写场景评价）')
+    parser.add_argument('--alpha', type=float, default=0.3,
+                        help='场景权重 0~1（1=纯广义评价，0.3=续写评价）')
+    parser.add_argument('--group', type=str, default='all',
+                        help='对比基准组名（all, timesig_4_4, source_musescore 等）')
     args = parser.parse_args()
+
+    # ── 评价模式 ─────────────────────────────────────────
+    if args.evaluate:
+        _run_evaluate(args)
+        return
+
+    # 生成模式需要 checkpoint
+    if not args.checkpoint:
+        print('[X] 生成模式需要提供 checkpoint 路径')
+        print('  用法: chopin <checkpoint.pt> <input.musicxml>')
+        print('  评价: chopin --evaluate <input.musicxml>')
+        sys.exit(1)
 
     print('=== Chopinote-AI - 钢琴谱续写工具 ===')
     print()

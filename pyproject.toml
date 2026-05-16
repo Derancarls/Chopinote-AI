@@ -24,4 +24,4 @@ dependencies = [
 chopin = "chopinote_cli.main:main"
 
 [tool.setuptools.packages.find]
-include = ["chopinote_cli*", "chopinote_dataset*", "chopinote_model*"]
+include = ["chopinote_cli*", "chopinote_dataset*", "chopinote_model*", "chopinote_evaluator*"]
