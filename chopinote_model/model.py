@@ -95,7 +95,7 @@ class CausalSelfAttention(nn.Module):
             kv_cache[1] = v
 
         use_causal = kv_cache is None or kv_cache[0] is None or cache_len == 0
-        if mask is not None:
+        if mask is not None and use_causal:
             m = mask[0] if mask.dim() == 2 else mask
             pad = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=q.dtype)
             if pad.size(0) < T_kv:

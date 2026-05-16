@@ -46,8 +46,7 @@ class _BaseREMI:
             return token_ids, metadata
         return token_ids
 
-    @staticmethod
-    def _assemble_events(merged: list, tonic_midi: int,
+    def _assemble_events(self, merged: list, tonic_midi: int,
                          key_changes: list, key_name: str | None
                          ) -> List[Tuple[str, Optional[int]]]:
         """从 merged 条目组装 REMI 事件序列（三转换器共享）。"""
@@ -84,7 +83,7 @@ class _BaseREMI:
                     events.append((REMITokenizer.KEY, key_change_map[m]))
 
             if pos != cur_pos:
-                pos = min(pos, 15)  # grid_size - 1
+                pos = min(pos, self.grid_size - 1)
                 events.append((REMITokenizer.POSITION, pos))
                 cur_pos = pos
                 cur_program = -1
@@ -944,16 +943,16 @@ class MIDIToREMI(_BaseREMI):
 
                 # ── 音符提取 ────────────────────────────────────
                 for elem in flat.notesAndRests:
+                    offset = elem.offset
+                    pos = min(self.grid_size - 1,
+                              min(positions_in_measure - 1,
+                                  int(round(offset / self.quarter_per_position))))
+
                     if isinstance(elem, note.Rest):
                         dur_positions = max(1, min(self.grid_size,
                                                    int(round(elem.quarterLength / self.quarter_per_position))))
                         all_rests.append((measure_idx, pos, part_idx, dur_positions))
                         continue
-
-                    offset = elem.offset
-                    pos = min(self.grid_size - 1,
-                              min(positions_in_measure - 1,
-                                  int(round(offset / self.quarter_per_position))))
 
                     if isinstance(elem, note.Note):
                         pitches = [elem.pitch.midi]
