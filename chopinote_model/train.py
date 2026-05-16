@@ -17,6 +17,13 @@ from torch.utils.tensorboard import SummaryWriter
 from .config import ModelConfig, TrainingConfig
 from .dataset import TokenDataset, collate_fn
 
+try:
+    from liger_kernel.transformers import LigerCrossEntropyLoss
+    _ce_loss = LigerCrossEntropyLoss(ignore_index=-100, reduction='sum')
+    _LIGER_AVAILABLE = True
+except ImportError:
+    _LIGER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,15 +49,20 @@ class Trainer:
         self.train_config = train_config
         self.device = device
         self.backup_dir = Path(train_config.output_dir) / 'backups'
+        self._token_id_to_type, self._type_names = self._build_token_type_map()
 
         # 去重参数（weight tying 会导致同一 tensor 作为多个 Parameter 被 yield）
         params = list(dict.fromkeys(model.parameters()))
-        self.optimizer = AdamW(
-            params,
-            lr=train_config.lr,
-            weight_decay=0.1,
-            betas=(0.9, 0.95),
-        )
+        try:
+            self.optimizer = AdamW(
+                params, lr=train_config.lr, weight_decay=0.1,
+                betas=(0.9, 0.95), fused=True,
+            )
+        except (RuntimeError, TypeError):
+            self.optimizer = AdamW(
+                params, lr=train_config.lr, weight_decay=0.1,
+                betas=(0.9, 0.95),
+            )
         self.scheduler = _get_scheduler(
             self.optimizer, train_config.warmup_steps, train_config.total_steps
         )
@@ -158,15 +170,9 @@ class Trainer:
             logger.warning(f'Checkpoint 加载: {loaded} 个参数加载成功, '
                            f'{len(skipped)} 个 shape 不匹配已跳过')
 
-        # 优化器/调度器状态尽量恢复（跳过的参数无对应状态，PyTorch 自动处理）
-        try:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        except Exception:
-            logger.warning('优化器状态恢复失败，已重新初始化')
-        try:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        except Exception:
-            logger.warning('调度器状态恢复失败，已重新初始化')
+        # 保存优化器/调度器状态，等 _run_training_loop 创建 optimizer 后恢复
+        self._resume_opt_state = checkpoint.get('optimizer_state_dict')
+        self._resume_sched_state = checkpoint.get('scheduler_state_dict')
         self.global_step = checkpoint['step']
         self.best_loss = checkpoint.get('loss', float('inf'))
         logger.info(f'Resumed from checkpoint: {checkpoint_path} (step {self.global_step})')
@@ -258,10 +264,28 @@ class Trainer:
         model = self.model
 
         params = list(dict.fromkeys(model.parameters()))
-        self.optimizer = AdamW(params, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+        try:
+            self.optimizer = AdamW(params, lr=lr, weight_decay=0.1,
+                                   betas=(0.9, 0.95), fused=True)
+        except (RuntimeError, TypeError):
+            self.optimizer = AdamW(params, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
         self.scheduler = _get_scheduler(self.optimizer, warmup_steps, total_steps)
 
+        # 恢复 checkpoint 中的优化器/调度器状态（_run_training_loop 新创建了 optimizer）
+        if getattr(self, '_resume_opt_state', None) is not None:
+            try:
+                self.optimizer.load_state_dict(self._resume_opt_state)
+                if self._resume_sched_state is not None:
+                    self.scheduler.load_state_dict(self._resume_sched_state)
+                logger.info(f'{prefix}从 checkpoint 恢复 optimizer/scheduler 状态 (step {self.global_step})')
+            except Exception as e:
+                logger.warning(f'{prefix}无法恢复 optimizer 状态: {e}，使用新初始化')
+            self._resume_opt_state = None
+            self._resume_sched_state = None
+
         model.train()
+        model.set_gradient_checkpointing(config.gradient_checkpointing)
+        prefix = f'[{phase_name}] ' if phase_name else ''
         _fp8_enabled = False
         if config.use_fp8 and config.fp8_warmup_steps == 0:
             model.set_fp8_mode(True)
@@ -276,8 +300,6 @@ class Trainer:
         local_step = 0
         accum = 0
         _vocab_checked = False
-
-        prefix = f'[{phase_name}] ' if phase_name else ''
 
         while local_step < total_steps:
             for batch in dataloader:
@@ -299,12 +321,15 @@ class Trainer:
 
                 with autocast('cuda', dtype=torch.bfloat16):
                     logits = model(input_ids, attention_mask)
-                    loss = nn.functional.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1),
-                        ignore_index=-100,
-                        reduction='sum',
-                    )
+                    if _LIGER_AVAILABLE:
+                        loss = _ce_loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+                    else:
+                        loss = nn.functional.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            labels.view(-1),
+                            ignore_index=-100,
+                            reduction='sum',
+                        )
                     loss = loss / max(1, (labels != -100).sum())
                 total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
@@ -316,6 +341,8 @@ class Trainer:
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
+                    if _fp8_enabled:
+                        model.invalidate_fp8_caches()
                     local_step += 1
                     self.global_step += 1
 
@@ -333,6 +360,7 @@ class Trainer:
                         self._last_avg_loss = avg_loss
                         self.writer.add_scalar('train/loss', avg_loss, self.global_step)
                         self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.global_step)
+                        self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
                         if _fp8_enabled:
                             from .fp8_linear import FP8Linear
                             scales_x, scales_w = [], []
@@ -349,21 +377,96 @@ class Trainer:
                             f'{f" (global {self.global_step})" if phase_name else ""} | '
                             f'Loss: {avg_loss:.4f} | '
                             f'LR: {self.scheduler.get_last_lr()[0]:.2e} | '
+                            f'GN: {total_norm:.2f} | '
                             f'Time: {elapsed:.1f}s'
                         )
                         total_loss = 0.0
 
                     if val_dataloader is not None and eval_steps and \
                        local_step % eval_steps == 0:
-                        val_loss = self.evaluate(val_dataloader)
-                        self.writer.add_scalar('val/loss', val_loss, self.global_step)
-                        logger.info(f'{prefix}Validation loss: {val_loss:.4f}')
+                        val_metrics = self.evaluate(val_dataloader)
+                        self.writer.add_scalar('val/loss', val_metrics['loss'], self.global_step)
+                        # Log per-type accuracy
+                        acc_strs = []
+                        for key in sorted(val_metrics):
+                            if key.startswith('acc/'):
+                                self.writer.add_scalar(f'val/{key}', val_metrics[key], self.global_step)
+                                acc_strs.append(f'{key}={val_metrics[key]:.4f}')
+                        acc_log = '  '.join(acc_strs) if acc_strs else ''
+                        logger.info(f'{prefix}Val loss: {val_metrics["loss"]:.4f}  {acc_log}')
                         model.train()
 
                     if save_steps and local_step % save_steps == 0:
                         self.save_checkpoint(self._last_avg_loss)
 
         self.save_checkpoint(self._last_avg_loss)
+
+    def _build_token_type_map(self):
+        """构建 token ID → 类型名映射，用于 per-token-type accuracy 统计。"""
+        from chopinote_dataset.tokenizer import REMITokenizer
+
+        tokenizer = REMITokenizer(grid_size=16, velocity_levels=8)
+
+        # 自闭合 token（精确匹配）
+        exact = {
+            tokenizer.PAD: 'special', tokenizer.BOS: 'special',
+            tokenizer.EOS: 'special', tokenizer.MASK: 'special',
+            tokenizer.BAR: 'bar',
+            tokenizer.TUPLET_END: 'tuplet',
+            tokenizer.REST: 'rest',
+            tokenizer.ARPEGGIO: 'arpeggio',
+        }
+
+        # 参数化 token（前缀匹配）
+        prefixes = [
+            ('position', tokenizer.POSITION),
+            ('program', tokenizer.PROGRAM),
+            ('note', tokenizer.NOTE_ON),
+            ('velocity', tokenizer.VELOCITY),
+            ('duration', tokenizer.DURATION),
+            ('clef', tokenizer.CLEF),
+            ('dynamic', tokenizer.DYNAMIC),
+            ('hairpin', tokenizer.HAIRPIN),
+            ('artic', tokenizer.ARTIC),
+            ('ornament', tokenizer.ORNAMENT),
+            ('pedal', tokenizer.PEDAL),
+            ('slur', tokenizer.SLUR),
+            ('repeat', tokenizer.REPEAT),
+            ('jump', tokenizer.JUMP),
+            ('tempo', tokenizer.TEMPO),
+            ('tuplet', tokenizer.TUPLET_START),
+            ('timesig', tokenizer.TIMESIG),
+            ('grace_note', tokenizer.GRACE_NOTE),
+            ('key', tokenizer.KEY),
+            ('beat', tokenizer.BEAT),
+            ('octave', tokenizer.OCTAVE),
+            ('bass', tokenizer.BASS),
+            ('anticipate', tokenizer.ANTICIPATE),
+        ]
+
+        # 收集类型名，保持有序，unknown 放最后
+        seen: list = []
+        for name, _ in prefixes:
+            if name not in seen:
+                seen.append(name)
+        type_names = ['special', 'bar', *seen, 'rest', 'arpeggio', 'unknown']
+
+        # 构建 vocab_size 大小的 index 张量
+        num_types = len(type_names)
+        name_to_idx = {n: i for i, n in enumerate(type_names)}
+        type_index = torch.full((tokenizer.vocab_size,), name_to_idx['unknown'], dtype=torch.long)
+
+        for token_id in range(tokenizer.vocab_size):
+            token_str = tokenizer.decode_token(token_id)
+            if token_str in exact:
+                type_index[token_id] = name_to_idx[exact[token_str]]
+                continue
+            for name, prefix in prefixes:
+                if token_str.startswith(prefix):
+                    type_index[token_id] = name_to_idx[name]
+                    break
+
+        return type_index, type_names
 
     @staticmethod
     def _apply_loss_mask(labels: torch.Tensor, masked_ids: set) -> torch.Tensor:
@@ -377,11 +480,16 @@ class Trainer:
         return labels
 
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader) -> float:
-        """评估验证集 loss（token 加权平均）。"""
+    def evaluate(self, dataloader: DataLoader) -> dict:
+        """评估验证集。返回 dict，含 'loss' 和每个 token 类型的 'acc/<type>'。"""
         self.model.eval()
         total_sum = 0.0
         total_tokens = 0
+
+        num_types = len(self._type_names)
+        type_total = torch.zeros(num_types, dtype=torch.float, device=self.device)
+        type_correct = torch.zeros(num_types, dtype=torch.float, device=self.device)
+        type_idx_map = self._token_id_to_type.to(self.device)
 
         for batch in dataloader:
             input_ids = batch['input_ids'].to(self.device)
@@ -390,14 +498,40 @@ class Trainer:
 
             with autocast('cuda', dtype=torch.bfloat16):
                 logits = self.model(input_ids, attention_mask)
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100,
-                reduction='sum',
-            )
+
+            # ── Loss ──────────────────────────────────────
+            if _LIGER_AVAILABLE:
+                loss = _ce_loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+            else:
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100,
+                    reduction='sum',
+                )
             n_valid = max(1, (labels != -100).sum().item())
             total_sum += loss.item()
             total_tokens += n_valid
 
-        return total_sum / max(1, total_tokens)
+            # ── Per-type accuracy (fully vectorized) ──────
+            preds = logits.argmax(dim=-1)
+            valid = labels != -100
+            labels_v = labels[valid]
+            types_v = type_idx_map[labels_v]
+            correct_v = (preds[valid] == labels_v)
+
+            ones = torch.ones_like(types_v, dtype=torch.float)
+            type_total.scatter_add_(0, types_v, ones)
+            type_correct.scatter_add_(0, types_v, correct_v.float())
+
+        results = {'loss': total_sum / max(1, total_tokens)}
+        for i, name in enumerate(self._type_names):
+            if type_total[i] > 0:
+                results[f'acc/{name}'] = (type_correct[i] / type_total[i]).item()
+
+        # Overall accuracy
+        overall_total = type_total.sum().item()
+        if overall_total > 0:
+            results['acc/overall'] = (type_correct.sum() / overall_total).item()
+
+        return results

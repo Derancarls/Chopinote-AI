@@ -17,7 +17,10 @@ from dataclasses import dataclass, asdict
 import mido
 import numpy as np
 
+from .tokenizer import REMITokenizer, key_name_to_tonic_midi
+
 logger = logging.getLogger(__name__)
+_NO_KEY_WARNED = False
 
 # ── 调号 MIDI 映射 ──────────────────────────────────────────
 _KEY_SIG_MAP = {
@@ -37,10 +40,8 @@ _KEY_PC_MAP = {
 }
 _DRUM_CHANNEL = 9
 
-# Supported time signatures in REMI
-REMI_TIME_SIGS = {
-    '2/2', '2/4', '3/4', '4/4', '5/4', '6/8', '7/8', '9/8', '12/8'
-}
+# Supported time signatures in REMI (synced with REMITokenizer.TIME_SIGNATURES)
+REMI_TIME_SIGS = set(REMITokenizer.TIME_SIGNATURES)
 
 
 def _key_name_from_sf(sharps_flats: int, minor: bool) -> str:
@@ -48,15 +49,6 @@ def _key_name_from_sf(sharps_flats: int, minor: bool) -> str:
     if minor:
         return _KEY_SIG_MAP.get(sharps_flats, 'C')
     return _KEY_SIG_MAJOR.get(sharps_flats, 'C')
-
-
-def _key_name_to_tonic_midi(key_name: str) -> int:
-    """Key name → MIDI tonic pitch (octave 4), default 60."""
-    if not key_name:
-        return 60
-    root = key_name[:-1] if key_name.endswith('m') else key_name
-    pc = _KEY_PC_MAP.get(root, 0)
-    return pc + 60
 
 
 class FastMIDIToREMI:
@@ -84,6 +76,9 @@ class FastMIDIToREMI:
         self.ANTICIPATE = '<Anticipate'
         self.BEAT = '<Beat'
         self.BASS = '<Bass'
+        self.GRACE_NOTE = '<GraceNote'
+        self.REST = '<Rest>'
+        self.PEDAL = '<Pedal'
         self.BOS = '<BOS>'
         self.EOS = '<EOS>'
 
@@ -155,7 +150,9 @@ class FastMIDIToREMI:
                     raw_events.append((abs_tick, 0, track_idx, msg))
                 elif msg.type == 'key_signature':
                     raw_events.append((abs_tick, 0, track_idx, msg))
-                # Ignore other events (pitchwheel, control change, etc.)
+                elif msg.type == 'control_change' and hasattr(msg, 'control') and msg.control == 64:
+                    raw_events.append((abs_tick, msg.channel if hasattr(msg, 'channel') else 0,
+                                       track_idx, msg))
 
         if not raw_events:
             return []
@@ -169,6 +166,7 @@ class FastMIDIToREMI:
         time_sig_map: List[Tuple[int, int, int]] = []  # (tick, numerator, denominator)
         key_sig_map: List[Tuple[int, int, bool]] = []  # (tick, sharps_flats, minor)
         program_map: Dict[int, int] = {}  # channel → program
+        pedal_events: List[Tuple[int, bool]] = []  # (tick, is_down)
 
         for tick, channel, track_idx, msg in raw_events:
             if msg.type == 'set_tempo':
@@ -189,6 +187,8 @@ class FastMIDIToREMI:
                 key_sig_map.append((tick, key_str, minor))
             elif msg.type == 'program_change':
                 program_map[channel] = msg.program
+            elif msg.type == 'control_change' and msg.control == 64:
+                pedal_events.append((tick, msg.value >= 64))
 
         # Sort tempo/time_sig/key maps by tick
         tempo_map.sort(key=lambda x: x[0])
@@ -324,7 +324,7 @@ class FastMIDIToREMI:
         used_channels = set(ch for _, ch, _, _, _, _ in notes)
         for ch in used_channels:
             prog = program_map.get(ch, 0)
-            if prog >= 112:  # Drum channel / drum programs
+            if ch == _DRUM_CHANNEL or prog >= 112:  # Drum channel / drum programs
                 continue
             sub_cnt = program_counts.get(prog, 0)
             sub = sub_cnt if sub_cnt < 4 else 0
@@ -338,6 +338,11 @@ class FastMIDIToREMI:
         master_ts = _get_time_sig(first_qn) or (4, 4)
         master_num, master_den = master_ts
         first_key = _get_key_name(first_qn)
+        if first_key is None:
+            global _NO_KEY_WARNED
+            if not _NO_KEY_WARNED:
+                logger.info("MIDI 无调号信息，默认 C 大调")
+                _NO_KEY_WARNED = True
 
         measure_notes: Dict[int, List] = {}
         measure_tempos: Dict[int, int] = {}
@@ -361,9 +366,12 @@ class FastMIDIToREMI:
             dur_positions = max(1, min(self.grid_size,
                                        int(round(dur_qn / self.quarter_per_position))))
 
+            GRACE_DURATION_THRESHOLD_QN = 0.25 * self.quarter_per_position
+            is_grace = dur_qn < GRACE_DURATION_THRESHOLD_QN
+
             if channel in channel_program_map:
                 prog, sub = channel_program_map[channel]
-                measure_notes[meas].append((pos, prog, sub, pitch, vel_level, dur_positions))
+                measure_notes[meas].append((pos, prog, sub, pitch, vel_level, dur_positions, is_grace))
 
         # ── 7. Precompute measure start quarter positions ────────────────
         all_measures = sorted(set(list(measure_notes.keys()) +
@@ -409,12 +417,30 @@ class FastMIDIToREMI:
         # ── 9. Pre-scan bass notes ──────────────────────────────────────
         pos_bass: Dict[Tuple[int, int], int] = {}
         for m, notes_in_m in measure_notes.items():
-            for pos, prog, sub, pitch, vel_level, dur_pos in notes_in_m:
+            for pos, prog, sub, pitch, vel_level, dur_pos, *_ in notes_in_m:
                 key = (m, pos)
                 if key not in pos_bass or pitch < pos_bass[key]:
                     pos_bass[key] = pitch
 
-        # ── 10. Build event sequence ────────────────────────────────────
+        # ── 10. Convert pedal events to (measure, pos) ──────────────────
+        pedal_at_pos: Dict[Tuple[int, int], List[str]] = {}
+        for tick, is_down in pedal_events:
+            qn = _tick_to_quarter(tick)
+            meas, pos_qn = _get_measure(qn)
+            pos = min(self.grid_size - 1, int(round(pos_qn / self.quarter_per_position)))
+            action = 'start' if is_down else 'end'
+            pedal_at_pos.setdefault((meas, pos), []).append(action)
+
+        # Also include pedal measures in all_measures
+        if pedal_at_pos:
+            for m, _ in pedal_at_pos:
+                if m not in all_measures:
+                    all_measures.append(m)
+            all_measures.sort()
+        if all_measures[-1] > len(measure_starts) - 1:
+            measure_starts = _build_measure_starts(all_measures[-1])
+
+        # ── 11. Build event sequence ────────────────────────────────────
         events: List[Tuple[str, Optional[Any]]] = []
         initial_key = first_key or 'C'
         last_key_name: Optional[str] = None
@@ -453,10 +479,10 @@ class FastMIDIToREMI:
 
             # Group notes by position
             pos_notes: Dict[int, List] = {}
-            for pos, prog, sub, pitch, vel_level, dur_pos in notes_in_m:
+            for pos, prog, sub, pitch, vel_level, dur_pos, is_grace in notes_in_m:
                 if pos not in pos_notes:
                     pos_notes[pos] = []
-                pos_notes[pos].append((prog, sub, pitch, vel_level, dur_pos))
+                pos_notes[pos].append((prog, sub, pitch, vel_level, dur_pos, is_grace))
 
             for pos in pos_notes:
                 pos_notes[pos].sort(key=lambda x: (x[0], x[1]))
@@ -478,13 +504,21 @@ class FastMIDIToREMI:
                         events.append((self.BEAT, beat_num))
                         break
 
+                # Rest token: beat position with no notes from any channel
+                if not pos_notes.get(pos):
+                    events.append((self.REST, None))
+
+                # Sustained pedal events at this position
+                for action in pedal_at_pos.get((m, pos), []):
+                    events.append((self.PEDAL, action))
+
                 # Bass token
                 bass_pc = pos_bass.get((m, pos))
                 if bass_pc is not None:
                     events.append((self.BASS, bass_pc % 12))
 
                 # Notes at this position
-                for prog, sub, pitch, vel_level, dur_pos in pos_notes.get(pos, []):
+                for prog, sub, pitch, vel_level, dur_pos, is_grace in pos_notes.get(pos, []):
                     if prog != cur_prog or sub != cur_sub:
                         if sub == 0:
                             events.append((self.PROGRAM, str(prog)))
@@ -493,11 +527,16 @@ class FastMIDIToREMI:
                         cur_prog = prog
                         cur_sub = sub
 
-                    tonic = _key_name_to_tonic_midi(initial_key)
+                    tonic = key_name_to_tonic_midi(initial_key)
                     interval = max(-60, min(60, pitch - tonic))
-                    events.append((self.NOTE_ON, interval))
-                    events.append((self.VELOCITY, vel_level))
-                    events.append((self.DURATION, dur_pos))
+
+                    if is_grace:
+                        events.append((self.GRACE_NOTE, 'grace'))
+                        events.append((self.NOTE_ON, interval))
+                    else:
+                        events.append((self.NOTE_ON, interval))
+                        events.append((self.VELOCITY, vel_level))
+                        events.append((self.DURATION, dur_pos))
 
         return events
 
@@ -527,6 +566,35 @@ class FastMusicMetadata:
 
 
 def compute_file_hash(file_path: str) -> str:
+    """Compute MD5 hash of a file. Uses .hash sidecar as cache if available.
+
+    If a .hash sidecar file exists next to the source file, reads it instead
+    of re-hashing the content. Otherwise computes the hash and writes the sidecar
+    for future use.
+    """
+    sidecar = file_path + '.hash'
+    if os.path.exists(sidecar):
+        try:
+            with open(sidecar) as f:
+                cached = f.read().strip()
+                if cached and len(cached) == 32:
+                    return cached
+        except (OSError, ValueError):
+            pass
+
+    h = _compute_file_hash_raw(file_path)
+
+    try:
+        with open(sidecar, 'w') as f:
+            f.write(h)
+    except OSError:
+        pass
+
+    return h
+
+
+def _compute_file_hash_raw(file_path: str) -> str:
+    """Compute MD5 hash from file content (no sidecar, always reads file)."""
     h = hashlib.md5()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):

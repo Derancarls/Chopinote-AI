@@ -420,7 +420,7 @@ def main():
     processed_hashes = build_processed_hashes()
     logger.info(f"Existing token hashes: {len(processed_hashes)}")
 
-    n_workers = min(25, cpu_count())
+    n_workers = 24
     logger.info(f"Workers: {n_workers}, Timeout: {PER_FILE_TIMEOUT}s per file")
 
     overall_start = time.time()

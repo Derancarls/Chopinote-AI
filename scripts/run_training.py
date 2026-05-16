@@ -40,6 +40,14 @@ def main():
                         help='覆盖 batch_size')
     parser.add_argument('--lr', type=float, default=None,
                         help='覆盖学习率')
+    parser.add_argument('--compile', action='store_true', default=False,
+                        help='启用 torch.compile')
+    parser.add_argument('--use-fp8', action='store_true', default=False,
+                        help='启用 FP8 混合精度（Blackwell tensor core 加速）')
+    parser.add_argument('--fp8-warmup-steps', type=int, default=100,
+                        help='FP8 前用 BF16 warmup 的步数 (default: 100)')
+    parser.add_argument('--no-checkpointing', action='store_true', default=False,
+                        help='关闭 gradient checkpointing 提高训练速度')
     parser.add_argument('--data-dir', type=str, default='/root/autodl-tmp/data/processed',
                         help='数据目录')
     parser.add_argument('--output-dir', type=str, default='/root/autodl-tmp/chopinote/checkpoints',
@@ -49,10 +57,14 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f'设备: {device}')
 
-    model_config = ModelConfig()
+    model_config = ModelConfig(gradient_checkpointing=not args.no_checkpointing)
     train_config = TrainingConfig(
         output_dir=args.output_dir,
         data_dir=args.data_dir,
+        compile=args.compile,
+        use_fp8=args.use_fp8,
+        fp8_warmup_steps=args.fp8_warmup_steps,
+        gradient_checkpointing=not args.no_checkpointing,
     )
 
     # CLI 参数覆盖
@@ -67,7 +79,10 @@ def main():
                 f'd_model={model_config.d_model}, n_layers={model_config.n_layers}')
     logger.info(f'Train config: batch_size={train_config.batch_size}, '
                 f'accum={train_config.grad_accum_steps}, '
-                f'total_steps={train_config.total_steps}')
+                f'total_steps={train_config.total_steps}, '
+                f'compile={train_config.compile}, '
+                f'fp8={train_config.use_fp8}, '
+                f'checkpointing={train_config.gradient_checkpointing}')
 
     # 数据
     train_loader = create_dataloader(

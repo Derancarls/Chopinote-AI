@@ -10,7 +10,13 @@ from .config import ModelConfig
 from .fp8_linear import FP8Linear
 
 _NEG_INF = float('-inf')
+
+# cuDNN attention (Blackwell 优化) 优先于 flash/efficient
 _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+try:
+    _SDPA_BACKENDS.insert(0, SDPBackend.CUDNN_ATTENTION)
+except AttributeError:
+    pass
 
 
 class CausalSelfAttention(nn.Module):
@@ -44,15 +50,19 @@ class CausalSelfAttention(nn.Module):
 
     @staticmethod
     def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """对 (B, nH, T, head_dim) 施加 RoPE 旋转。"""
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        c = cos.unsqueeze(0).unsqueeze(0)
-        s = sin.unsqueeze(0).unsqueeze(0)
-        rotated = torch.empty_like(x)
-        rotated[..., 0::2] = x_even * c - x_odd * s
-        rotated[..., 1::2] = x_even * s + x_odd * c
-        return rotated
+        """对 (B, nH, T, head_dim) 施加 RoPE 旋转 — torch.compile 友好版本。
+
+        将 even/odd 对 reshape 为 (-1, 2)，用 stack+flatten 替代
+        empty_like + strided assignment，编译器可直接融合为单一 kernel。
+        """
+        T = x.shape[2]
+        x_pairs = x.reshape(*x.shape[:-1], -1, 2)          # (B, nH, T, head_dim/2, 2)
+        x_even, x_odd = x_pairs.unbind(-1)                  # each (B, nH, T, head_dim/2)
+        c = cos[:T].unsqueeze(0).unsqueeze(0)
+        s = sin[:T].unsqueeze(0).unsqueeze(0)
+        r_even = x_even * c - x_odd * s
+        r_odd = x_even * s + x_odd * c
+        return torch.stack([r_even, r_odd], dim=-1).flatten(-2)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 kv_cache: Optional[list] = None) -> torch.Tensor:
@@ -76,7 +86,6 @@ class CausalSelfAttention(nn.Module):
 
         T_kv = k.size(2)
 
-        # RoPE: query 用最后 T 个位置, key 用全部 T_kv 个位置
         q = self._apply_rope(q, self._rope_cos[cache_len:cache_len + T],
                              self._rope_sin[cache_len:cache_len + T])
         k = self._apply_rope(k, self._rope_cos[:T_kv], self._rope_sin[:T_kv])
@@ -85,7 +94,6 @@ class CausalSelfAttention(nn.Module):
             kv_cache[0] = k
             kv_cache[1] = v
 
-        # 构建 attn_mask: is_causal 处理因果, mask 处理 padding
         use_causal = kv_cache is None or kv_cache[0] is None or cache_len == 0
         if mask is not None:
             m = mask[0] if mask.dim() == 2 else mask
@@ -121,10 +129,11 @@ class TransformerBlock(nn.Module):
             FP8Linear(config.d_ff, config.d_model),
             nn.Dropout(config.dropout),
         )
+        self.use_checkpointing = config.gradient_checkpointing
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 kv_cache: Optional[list] = None) -> torch.Tensor:
-        need_ckpt = kv_cache is None and self.training
+        need_ckpt = self.use_checkpointing and kv_cache is None and self.training
         if need_ckpt:
             _reentrant = self.attn.qkv.use_fp8
             x = torch.utils.checkpoint.checkpoint(
@@ -172,16 +181,34 @@ class MusicTransformer(nn.Module):
             if isinstance(module, FP8Linear):
                 module.use_fp8 = enabled
 
+    def invalidate_fp8_caches(self):
+        """optimizer.step() 后调用，使所有 FP8 权重量化缓存失效。"""
+        for module in self.modules():
+            if isinstance(module, FP8Linear):
+                module.invalidate_cache()
+
+    def set_gradient_checkpointing(self, enabled: bool):
+        """运行时开关 gradient checkpointing。"""
+        for block in self.blocks:
+            block.use_checkpointing = enabled
+
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
-                kv_caches: Optional[list] = None) -> torch.Tensor:
+                kv_caches: Optional[list] = None,
+                measure_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, \
             f'序列长度 {T} 超过 max_seq_len {self.config.max_seq_len}'
 
         x = self.token_embedding(input_ids)
-        bar_mask = (input_ids == self.config.bar_token_id).int()
-        measure_ids = torch.cumsum(bar_mask, dim=1).clamp(0, self.config.max_measures)
+        if measure_ids is None:
+            bar_mask = (input_ids == self.config.bar_token_id).int()
+            measure_ids = torch.cumsum(bar_mask, dim=1).clamp(0, self.config.max_measures)
+        elif measure_ids.ndim == 1:
+            measure_ids = measure_ids.unsqueeze(0)
+        # KV cache 下 measure_ids 可能比 input_ids 长，截取尾部
+        if measure_ids.size(1) > T:
+            measure_ids = measure_ids[:, -T:]
         x = x + self.measure_embedding(measure_ids)
         x = self.dropout(x)
 

@@ -34,6 +34,7 @@ class TokenDataset(Dataset):
 
         # 加载 token 长度索引（由预处理生成的 token_lengths.json）
         index_path = self.data_dir / 'token_lengths.json'
+        meta_dir = self.data_dir / 'metadata'
         if index_path.exists():
             import gc
             with open(index_path, 'r') as fh:
@@ -44,9 +45,21 @@ class TokenDataset(Dataset):
             ]
             del length_index
             gc.collect()  # 释放 ~300MB dict，避免 DataLoader fork 时 COW 复制
+            # 对 length=0 的文件回退到 metadata（验证集文件可能不在索引中）
+            for i, (fp, length) in enumerate(zip(self.file_paths, self.file_lengths)):
+                if length == 0:
+                    try:
+                        path = self._resolve_path(fp)
+                        if path.exists():
+                            meta_path = meta_dir / (path.stem + '.meta.json')
+                            if meta_path.exists():
+                                with open(meta_path, 'r') as f:
+                                    meta = json.load(f)
+                                self.file_lengths[i] = meta['num_tokens']
+                    except Exception:
+                        pass
         else:
             # 回退：逐文件读取 meta
-            meta_dir = self.data_dir / 'metadata'
             self.file_lengths: list[int] = []
             for fp in self.file_paths:
                 try:
