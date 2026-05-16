@@ -61,8 +61,8 @@ def main():
     parser.add_argument('--phase2-warmup', type=int, default=2000,
                         help='Phase 2 warmup 步数 (default: 2000)')
     # 通用
-    parser.add_argument('--batch-size', type=int, default=2,
-                        help='batch size (default: 2)')
+    parser.add_argument('--batch-size', type=int, default=8,
+                        help='batch size per step (default: 8)')
     parser.add_argument('--compile', action='store_true', default=False,
                         help='启用 torch.compile (mode=reduce-overhead)')
     parser.add_argument('--use-fp8', action='store_true', default=False,
@@ -149,7 +149,7 @@ def main():
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=train_config.batch_size,
+            batch_size=32,  # eval 无 backward，大 batch 安全，从 ~2.5h 缩到 ~8min
             shuffle=False,
             num_workers=0,
             pin_memory=False,
