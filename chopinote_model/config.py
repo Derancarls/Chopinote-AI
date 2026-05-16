@@ -97,8 +97,8 @@ class PhaseConfig:
 @dataclass
 class TrainingConfig:
     """训练配置（适配 RTX 5090 32GB / 1.24B 模型）。"""
-    batch_size: int = 2
-    grad_accum_steps: int = 16
+    batch_size: int = 8
+    grad_accum_steps: int = 4
     # 以下字段仅在单阶段模式 (phases=None) 下生效
     # 多阶段模式请通过 PhaseConfig 分别设置各阶段 lr / warmup / steps
     lr: float = 1.5e-4

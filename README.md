@@ -1,176 +1,102 @@
 # Chopinote-AI
 
-输入一首钢琴曲（MusicXML），让 AI 帮你续写下去，生成完整的古典风格乐谱。
+> 输入一段开头，AI 为你续写完整的古典钢琴曲。
+
+给定一首曲子的前几小节（MusicXML 格式），Chopinote-AI 以自回归方式逐 token 生成风格匹配的后续乐章，输出标准 MusicXML，可在 MuseScore、Finale、Sibelius 等打谱软件中直接打开和编辑。
 
 ---
 
-## 它能做什么
+## 核心架构
 
-给你一首曲子的开头片段，比如肖邦的前奏曲前几小节，Chopinote-AI 会用自回归的方式逐 token 续写，生成风格匹配的后续乐章。最终输出标准的 MusicXML 文件，可以在 MuseScore、Finale、Sibelius 等打谱软件中打开和编辑。
+### Decoder-only Transformer (1.01B)
 
-支持以下音乐元素的生成：
+纯 GPT 风格的自回归架构，24 层 Transformer decoder，d_model=2048，32 注意力头，在 RTX 5090 (32GB) 上以 BF16 训练。与大多数音乐生成模型不同，Chopinote-AI 的设计围绕一个核心理念：**让音乐结构成为模型的原生属性，而非事后附加的约束**。
 
-- **音符骨架**：音高、节奏、和声、多声部
-- **力度**：ppp 到 fff，渐强/渐弱
-- **演奏法**：跳音、重音、保持音、琶音、装饰音（颤音/回音/波音）
-- **踏板**：延音踏板记号
-- **连音**：三连音、五连音等
-- **乐器**：支持 General MIDI 标准的所有乐器，多轨同时生成
-- **拍号/调号/速度**：可锁定或自由变化
+### 音程制相对音高编码（核心创新）
 
----
+传统 REMI 方案将 Note_ON 编码为绝对 MIDI 音高（如 `Note_ON 60` = 中央 C），但 Chopinote-AI 存储的是**到主音的半音程**（如 `Note_ON 0` = 主音，`Note_ON -3` = 下方小三度）。这使得：
 
-## 快速开始
+- **调性归纳是模型的原生能力**——模型学到的是音程关系而非绝对音高，同一段旋律在不同调性上是相同的 token 序列
+- **转调自然泛化**——模型无需为每个调性重新学习音高分布
+- **数据效率更高**——调性信息不必从零开始学习，训练信号集中在真正的音乐模式上
 
-### 安装
+### Anticipate Token（提前调性预告）
 
-```bash
-pip install -e .
-```
+在调性变化发生的**前一小节**插入预告 token（如 `<Anticipate Key G>`），提前通知模型即将到来的转调。这给注意力机制一个和声准备的窗口期，使转调过渡更自然——这是其他开源 REMI 方案中少见的显式设计。
 
-### 下载预训练权重
+### 小节嵌入 + RoPE 双重位置感知
 
-```bash
-# 推荐使用 checkpoints/step_94000_best.pt（v0.1.2-Beta1）
-# 下载后放到 checkpoints/ 目录即可
-```
+模型同时使用两种位置信息：
 
-### 基本使用
+- **RoPE（旋转位置编码）**：编码 token 在序列中的绝对和相对位置，支持 KV cache 推理加速。针对 Blackwell GPU 做了 cuDNN 注意力后端优先调度，并重写为 `torch.compile` 友好的 reshape+stack 模式。
+- **小节嵌入（Measure Embedding）**：在每个 token 的嵌入上叠加其所属小节的嵌入向量。模型不仅知道"第几个 token"，还知道"第几个小节"，这对音乐的长程结构建模至关重要。
 
-```bash
-# 交互式续写：输入一首 MusicXML，AI 帮你写完
-chopin checkpoints/step_94000_best.pt input.musicxml
+两者结合使模型同时拥有序列级和小节级的双重位置感知。
 
-# 指定输出文件
-chopin checkpoints/step_94000_best.pt input.musicxml -o output.musicxml
+### 两阶段课程学习
 
-# 一次生成多份变体
-chopin checkpoints/step_94000_best.pt input.musicxml -n 5
-```
+大多数音乐生成模型使用单一训练策略，但 Chopinote-AI 模拟人类学琴的路径：
 
-### 控制生成风格
+| 阶段 | 数据 | 学习目标 | Loss 屏蔽 |
+|------|------|----------|-----------|
+| **Phase 1 (预训练)** | MIDI（120K steps） | 音符骨架：音高、节奏、和声、结构 | 屏蔽所有表现力 token（力度/踏板/演奏法等 69 个 token 不计入 loss） |
+| **Phase 2 (微调)** | MusicXML（50K steps） | 表现力细节：力度、踏板、装饰音、表情记号 | 全量 loss，所有 token 参与学习 |
 
-```bash
-# 使用预设风格
-chopin checkpoints/step_94000_best.pt input.musicxml --preset baroque
-chopin checkpoints/step_94000_best.pt input.musicxml --preset romantic
-chopin checkpoints/step_94000_best.pt input.musicxml --preset jazz
+MIDI 数据量远大于 MusicXML，先让模型掌握"写什么音符"，再学习"怎么写好听"。
 
-# 手动调节参数
-chopin checkpoints/step_94000_best.pt input.musicxml --temp 1.2 --top-k 40 --complexity 7
+### 乐器级物理约束
 
-# 锁定部分音乐要素
-chopin checkpoints/step_94000_best.pt input.musicxml --key-mode lock     # 保持原调性
-chopin checkpoints/step_94000_best.pt input.musicxml --time-mode lock    # 保持原拍号
-chopin checkpoints/step_94000_best.pt input.musicxml --tempo-mode lock   # 保持原速度
-```
+对每个乐器施加物理合理的复音上限：钢琴 ≤10 声部、弦乐/铜管/木管 ≤2、合成器 ≤6，并且 subtrack 级音域划分（小提琴、中提琴、大提琴、低音提琴独立）。生成时自动将超出音域的 Note_ON logits 置为 -inf，确保输出符合乐器物理限制。
 
-### 种子截取
+### 轻量化预设控制系统
 
-```bash
-# 只使用前 4 小节作为种子
-chopin checkpoints/step_94000_best.pt input.musicxml --seed-bars 4
-
-# 指定种子文件
-chopin checkpoints/step_94000_best.pt input.musicxml --seed input_seed.musicxml
-```
+内置 7 种风格预设（巴洛克、古典、浪漫、爵士、极简、管风琴圣咏、默认），每种预设封装了温度、top-k、复杂度、乐器、以及锁定策略的组合。同时支持 tunable 参数覆盖，无需重新训练即可切换生成风格。
 
 ---
 
-## 可用预设
+## 训练质量评估体系
 
-| 预设名 | 说明 | 复杂度 |
-|--------|------|--------|
-| `default` | 默认平衡模式 | 5 |
-| `dense` | 密集织体，音符多 | 7 |
-| `simple` | 简单织体，稀疏 | 2 |
-| `baroque` | 巴洛克风格 | 6 |
-| `romantic` | 浪漫主义风格 | 6 |
-| `classical` | 古典主义风格 | 4 |
-| `minimal` | 极简风格 | 2 |
-| `jazz` | 爵士风格 | 6 |
-| `church` | 圣咏风格 | 3 |
+28 种 token 类型的 per-type accuracy 独立追踪，每 1000 步在验证集上评估。训练时 TensorBoard 实时监控 loss / 学习率 / 梯度范数 / 各类准确率，运行状态通过 Launch Control 面板集中可视化。
 
 ---
 
-## 训练自己的模型
+## 技术亮点
 
-### 数据处理
-
-```bash
-# 准备训练数据（MusicXML → token 序列）
-python scripts/prepare_corpus.py
-
-# 包含本地文件和 MIDI 文件
-python scripts/prepare_corpus.py --include-local --include-midi
-
-# 带移调增强（±5 半音 = 11 倍扩充）
-python scripts/prepare_corpus.py --augment-transpose
-```
-
-### 训练
-
-```bash
-# 分层训练：先用 MIDI 预训练音符骨架，再用 MusicXML 微调细节
-python scripts/run_curriculum_training.py \
-    --midi-train-list data/processed/midi_train.txt \
-    --musicxml-train-list data/processed/train.txt \
-    --phase1-steps 250000 \
-    --phase2-steps 100000
-```
-
-训练时自动启用 TensorBoard 监控，可实时查看 loss、学习率、梯度变化。
-
----
-
-## 技术概要
-
-| 模块 | 说明 |
+| 特性 | 说明 |
 |------|------|
-| **模型架构** | Decoder-only Transformer，156M 参数，12 层，d_model=1024 |
-| **tokenizer** | REMI 编码，grid_size=16，velocity_levels=8，词表 837 |
-| **注意力** | FlashAttention + KV cache 推理 + gradient checkpointing 训练 |
-| **数据来源** | MusicXML 语料库 + PDMX 数据集 + MIDI 数据集（Lakh/Aria/Bread/MAESTRO） |
-| **训练策略** | 两阶段分层训练：Phase 1 MIDI 预训练（屏蔽表现力 token），Phase 2 全量微调 |
-| **硬件** | RTX 4090 24GB（当前配置完全利用可用显存） |
+| **RoPE + cuDNN Attention** | Blackwell GPU 原生优化，SDPA 后端优先使用 cuDNN Attention |
+| **FP8 可选量化** | 利用 RTX 5090 `torch._scaled_mm` 做 FP8 矩阵乘法，权重量化缓存避免重复计算 |
+| **Weight Tying** | 输入/输出嵌入共享权重矩阵，减少 1.7M 参数 |
+| **Gradient Checkpointing** | 整块 TransformerBlock（Attention+FFN）换入换出，激活显存节省 3.2GB |
+| **BF16 Autocast** | BF16 训练，无需 GradScaler，tf32 matmul 精度 |
+| **原子 Checkpoint 写入** | 临时文件 + rename 防写坏，自动清理历史存档 |
+| **25 Worker 并行预处理** | MD5 侧车缓存避免重复扫描，120 秒超时防 worker 挂死 |
 
 ---
 
-## 项目结构
+## 使用的公开数据集
 
-```
-├── chopinote_cli/main.py           CLI 入口
-├── chopinote_model/
-│   ├── config.py                   模型和训练配置
-│   ├── model.py                    Transformer 模型
-│   ├── train.py                    训练循环
-│   ├── generate.py                 推理生成
-│   └── dataset.py                  数据加载
-├── chopinote_dataset/
-│   ├── tokenizer.py                REMI 编解码（词表 837）
-│   ├── converter.py                乐谱 → token 转换
-│   ├── processor.py                批量预处理
-│   └── splitter.py                 数据集划分
-├── scripts/
-│   ├── prepare_corpus.py           数据准备
-│   ├── preprocess_pdmx.py          PDMX 预处理
-│   ├── run_curriculum_training.py  分层训练入口
-│   └── validate_generation.py      生成结果验证
-├── design_docs/                    待办任务与优化方向
-├── ROADMAP.md                      版本历史与功能清单
-├── data/                           数据集（raw/processed/outputs/test_seeds）
-├── checkpoints/                    模型权重
-├── archives/                       归档压缩包
-└── tests/                          测试（87 个）
-```
+Chopinote-AI 在以下公开数据集的预处理结果上训练：
 
----
+**MIDI 数据集：**
+- [MAESTRO v3.0.0](https://magenta.tensorflow.org/datasets/maestro) — 超过 200 小时的钢琴演奏 MIDI，由国际钢琴比赛录音对齐
+- [Lakh MIDI Dataset (lmd_full)](https://colinraffel.com/projects/lmd/) — 约 45,000 首 MIDI 歌曲，涵盖多种风格
+- [GiantMIDI-Piano](https://github.com/bytedance/GiantMIDI-Piano) — 10,854 首古典钢琴曲的 MIDI 转录
+- [POP909](https://github.com/music-x-lab/POP909-Dataset) — 909 首流行钢琴曲，带主旋律/伴奏分离
+- [Aria MIDI](https://github.com/seheonnn/Aria-MIDI-Dataset) — 多风格 MIDI 语料库
+- [Bread MIDI](https://github.com/pierredandurand/Bread-MIDI-Dataset) — 精选 MIDI 数据集
+- [MusicNet](https://homes.cs.washington.edu/~nfloehr/MusicNet/) — 330 首古典音乐录音 + 对齐标注
+- [EMOPIA](https://github.com/annahung31/EMOPIA) — 1,087 首流行钢琴曲，带情感标注
 
-## 版本历史
+**MusicXML 数据集：**
+- [ASAP](https://github.com/fosfrancesco/asap-dataset) — 222 首古典钢琴曲的同步录音 + 乐谱 (MusicXML + MIDI)
+- [ATEPP](https://github.com/CPJKU/ATEPP) — 144 首带有演奏法标注的古典钢琴曲
+- [Openscore](https://github.com/OpenScore) — 社区贡献的开放乐谱合集
 
-- **v0.1.2-Beta1**: 模型升级 156M、MIDI 转换管道、分层训练、测试体系
-- **v0.1.1-Beta5**: 移调增强、TensorBoard 监控、调性 Bug 修复
-- **v0.1.1-Beta4**: 连音 token、拍号 token、词表扩展
-- **v0.1.1-Beta3**: 预设系统、多轨保持、CLI 完善
-- **v0.1.0-Beta5**: 乐谱标记系统（力度/演奏法/装饰音/踏板）
-- **v0.1.0-beta1**: 首个可运行版本，基础模型 + 生成管线
+**其他格式数据集：**
+- PDMX（Pop Music XML）— 流行音乐乐谱数据集，包含丰富的 annotation（演奏法/力度/踏板/装饰音等）
+
+**内建语料库（config.yaml）：**
+- Chopin Complete Works (~250 首)
+- Bach Chorales (371 首)
+- Beethoven Sonatas (32 首)

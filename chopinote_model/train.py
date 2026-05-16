@@ -271,6 +271,8 @@ class Trainer:
             self.optimizer = AdamW(params, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
         self.scheduler = _get_scheduler(self.optimizer, warmup_steps, total_steps)
 
+        prefix = f'[{phase_name}] ' if phase_name else ''
+
         # 恢复 checkpoint 中的优化器/调度器状态（_run_training_loop 新创建了 optimizer）
         if getattr(self, '_resume_opt_state', None) is not None:
             try:
@@ -285,7 +287,6 @@ class Trainer:
 
         model.train()
         model.set_gradient_checkpointing(config.gradient_checkpointing)
-        prefix = f'[{phase_name}] ' if phase_name else ''
         _fp8_enabled = False
         if config.use_fp8 and config.fp8_warmup_steps == 0:
             model.set_fp8_mode(True)
