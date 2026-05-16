@@ -23,32 +23,10 @@ logger = logging.getLogger(__name__)
 _NO_KEY_WARNED = False
 
 # ── 调号 MIDI 映射 ──────────────────────────────────────────
-_KEY_SIG_MAP = {
-    -7: 'C#m', -6: 'F#m', -5: 'Bm', -4: 'Em', -3: 'Am',
-    -2: 'Dm', -1: 'Gm', 0: 'Am', 1: 'Em', 2: 'Bm', 3: 'F#m',
-    4: 'C#m', 5: 'G#m', 6: 'D#m', 7: 'A#m',
-}
-_KEY_SIG_MAJOR = {
-    -7: 'Cb', -6: 'Gb', -5: 'Db', -4: 'Ab', -3: 'Eb',
-    -2: 'Bb', -1: 'F', 0: 'C', 1: 'G', 2: 'D', 3: 'A',
-    4: 'E', 5: 'B', 6: 'F#', 7: 'C#',
-}
-_KEY_PC_MAP = {
-    'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3,
-    'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8,
-    'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11,
-}
 _DRUM_CHANNEL = 9
 
 # Supported time signatures in REMI (synced with REMITokenizer.TIME_SIGNATURES)
 REMI_TIME_SIGS = set(REMITokenizer.TIME_SIGNATURES)
-
-
-def _key_name_from_sf(sharps_flats: int, minor: bool) -> str:
-    """Convert MIDI key signature (sharps_flats, minor) to key name."""
-    if minor:
-        return _KEY_SIG_MAP.get(sharps_flats, 'C')
-    return _KEY_SIG_MAJOR.get(sharps_flats, 'C')
 
 
 class FastMIDIToREMI:
@@ -174,16 +152,9 @@ class FastMIDIToREMI:
             elif msg.type == 'time_signature':
                 time_sig_map.append((tick, msg.numerator, msg.denominator))
             elif msg.type == 'key_signature':
-                # mido key_signature: key='C', 'Am', etc. -> convert to our format
+                # mido key_signature natively provides key names as strings (e.g. 'C', 'Am')
                 key_str = msg.key
                 minor = key_str.endswith('m')
-                root = key_str[:-1] if minor else key_str
-                # Estimate sharps_flats from key name (reverse lookup)
-                sf = 0
-                for k, v in _KEY_PC_MAP.items():
-                    if k == root:
-                        # approximate - just store the key name for later
-                        pass
                 key_sig_map.append((tick, key_str, minor))
             elif msg.type == 'program_change':
                 program_map[channel] = msg.program
@@ -527,7 +498,7 @@ class FastMIDIToREMI:
                         cur_prog = prog
                         cur_sub = sub
 
-                    tonic = key_name_to_tonic_midi(initial_key)
+                    tonic = key_name_to_tonic_midi(last_key_name or initial_key)
                     interval = max(-60, min(60, pitch - tonic))
 
                     if is_grace:

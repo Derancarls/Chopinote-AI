@@ -373,7 +373,8 @@ class MusicXMLPreprocessor(_BasePreprocessor):
             file_path=file_path,
             composer=md.composer if md and md.composer else "Unknown",
             title=md.title if md and md.title else Path(file_path).stem,
-            genre=self._infer_genre(file_path, md),
+            genre=self._infer_genre(file_path, composer=md.composer if md and md.composer else '',
+                                 title=md.title if md and md.title else ''),
             year=md.date if md and md.date else None,
             # quarterLength → seconds: 使用速度（无速度时默认 120 BPM）
             duration_seconds=quarter_length * 60.0 / (tempo_value or 120.0),
@@ -390,29 +391,21 @@ class MusicXMLPreprocessor(_BasePreprocessor):
             hash_md5=self._compute_file_hash(file_path)
         )
     
-    def _infer_genre(self, file_path: str, md) -> str:
-        """推断音乐体裁"""
-        # 从文件名和路径推断
-        path_lower = file_path.lower()
-        
-        if 'ballad' in path_lower:
-            return 'ballade'
-        elif 'nocturne' in path_lower:
-            return 'nocturne'
-        elif 'etude' in path_lower:
-            return 'etude'
-        elif 'sonata' in path_lower:
-            return 'sonata'
-        elif 'prelude' in path_lower:
-            return 'prelude'
-        elif 'fugue' in path_lower:
-            return 'fugue'
-        elif 'chorale' in path_lower:
-            return 'chorale'
-        elif md and getattr(md, 'genericName', None):
-            return md.genericName
-        else:
-            return 'unknown'
+    def _infer_genre(self, file_path: str, composer: str = '', title: str = '') -> str:
+        """推断音乐体裁（共享实现：文件路径关键词 + 作曲家/标题关键词）。"""
+        combined = f'{file_path} {composer} {title}'.lower()
+        for kw, genre in [
+            ('sonata', 'sonata'), ('ballade', 'ballade'), ('nocturne', 'nocturne'),
+            ('etude', 'etude'), ('prelude', 'prelude'), ('fugue', 'fugue'),
+            ('chorale', 'chorale'), ('waltz', 'waltz'), ('symphony', 'symphony'),
+            ('concerto', 'concerto'), ('mass', 'mass'), ('requiem', 'requiem'),
+            ('suite', 'suite'), ('variation', 'variation'), ('rondo', 'rondo'),
+            ('march', 'march'), ('polonaise', 'polonaise'), ('mazurka', 'mazurka'),
+            ('impromptu', 'impromptu'), ('scherzo', 'scherzo'),
+        ]:
+            if kw in combined:
+                return genre
+        return 'unknown'
     
 
 
@@ -585,7 +578,7 @@ class PDMXPreprocessor(_BasePreprocessor):
             file_path=file_path,
             composer=composer,
             title=title,
-            genre=self._infer_genre(composer, title),
+            genre=self._infer_genre(file_path, composer=composer, title=title),
             year=None,
             duration_seconds=duration_seconds,
             num_measures=num_measures,
@@ -600,21 +593,6 @@ class PDMXPreprocessor(_BasePreprocessor):
             processing_time=0.0,
             hash_md5=self._compute_file_hash(file_path),
         )
-
-    def _infer_genre(self, composer: str, title: str) -> str:
-        combined = f'{composer} {title}'.lower()
-        for kw, genre in [
-            ('sonata', 'sonata'), ('ballade', 'ballade'), ('nocturne', 'nocturne'),
-            ('etude', 'etude'), ('prelude', 'prelude'), ('fugue', 'fugue'),
-            ('chorale', 'chorale'), ('waltz', 'waltz'), ('symphony', 'symphony'),
-            ('concerto', 'concerto'), ('mass', 'mass'), ('requiem', 'requiem'),
-            ('suite', 'suite'), ('variation', 'variation'), ('rondo', 'rondo'),
-            ('march', 'march'), ('polonaise', 'polonaise'), ('mazurka', 'mazurka'),
-            ('impromptu', 'impromptu'), ('scherzo', 'scherzo'),
-        ]:
-            if kw in combined:
-                return genre
-        return 'unknown'
 
     # ---- 以下方法与 MusicXMLPreprocessor 相同 ----
 
@@ -813,7 +791,7 @@ class MIDIPreprocessor(_BasePreprocessor):
             file_path=file_path,
             composer=composer,
             title=title,
-            genre=self._infer_genre(composer, title),
+            genre=self._infer_genre(file_path, composer=composer, title=title),
             year=None,
             duration_seconds=duration_seconds,
             num_measures=num_measures,
@@ -823,26 +801,11 @@ class MIDIPreprocessor(_BasePreprocessor):
             key_signature=key_sig,
             tempo=tempo_val,
             instruments=instruments,
-            has_chords=False,
+            has_chords=any(len(ch.notes) > 1 for ch in score.flat.getElementsByClass('Chord')),
             has_polyphony=len(list(score.parts)) > 1,
             processing_time=0.0,
             hash_md5=self._compute_file_hash(file_path),
         )
-
-    def _infer_genre(self, composer: str, title: str) -> str:
-        combined = f'{composer} {title}'.lower()
-        for kw, genre in [
-            ('sonata', 'sonata'), ('ballade', 'ballade'), ('nocturne', 'nocturne'),
-            ('etude', 'etude'), ('prelude', 'prelude'), ('fugue', 'fugue'),
-            ('chorale', 'chorale'), ('waltz', 'waltz'), ('symphony', 'symphony'),
-            ('concerto', 'concerto'), ('mass', 'mass'), ('requiem', 'requiem'),
-            ('suite', 'suite'), ('variation', 'variation'), ('rondo', 'rondo'),
-            ('march', 'march'), ('polonaise', 'polonaise'), ('mazurka', 'mazurka'),
-            ('impromptu', 'impromptu'), ('scherzo', 'scherzo'),
-        ]:
-            if kw in combined:
-                return genre
-        return 'unknown'
 
 
 
