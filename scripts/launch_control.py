@@ -156,28 +156,41 @@ def _run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
 
 
 def _gpu_info() -> dict:
-    """解析 nvidia-smi --query-gpu 输出。"""
-    r = _run(['nvidia-smi', '--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu',
+    """解析 nvidia-smi --query-gpu 输出，含功率、时钟。"""
+    r = _run(['nvidia-smi',
+              '--query-gpu=index,name,memory.used,memory.total,'
+              'utilization.gpu,temperature.gpu,power.draw,power.limit,'
+              'clocks.current.sm,clocks.current.memory',
               '--format=csv,noheader'])
     if r.returncode != 0:
         return {}
-    fields = r.stdout.strip().split(', ')
-    if len(fields) < 6:
+    fields = [f.strip() for f in r.stdout.strip().split(', ')]
+    if len(fields) < 10:
         return {}
-    try:
-        mem_used = int(fields[2].replace(' MiB', ''))
-        mem_total = int(fields[3].replace(' MiB', ''))
-        util = int(fields[4].replace(' %', ''))
-        temp = int(fields[5].replace(' ', ''))
-    except (ValueError, IndexError):
-        return {}
+
+    def _safe_int(v: str, default: int = 0) -> int:
+        try:
+            return int(v.replace(' MiB', '').replace(' %', '').replace(' MHz', ''))
+        except (ValueError, AttributeError):
+            return default
+
+    def _safe_float(v: str, default: float = 0.0) -> float:
+        try:
+            return float(v.replace(' W', ''))
+        except (ValueError, AttributeError):
+            return default
+
     return {
         'index': fields[0],
         'name': fields[1],
-        'mem_used_mib': mem_used,
-        'mem_total_mib': mem_total,
-        'util_pct': util,
-        'temp_c': temp,
+        'mem_used_mib': _safe_int(fields[2]),
+        'mem_total_mib': _safe_int(fields[3]),
+        'util_pct': _safe_int(fields[4]),
+        'temp_c': _safe_int(fields[5]),
+        'power_draw_w': _safe_float(fields[6]),
+        'power_limit_w': _safe_float(fields[7]),
+        'sm_clock_mhz': _safe_int(fields[8]),
+        'mem_clock_mhz': _safe_int(fields[9]),
     }
 
 
@@ -253,20 +266,29 @@ def _tail_lines(path: str, n: int = 50) -> list[str]:
 
 # ── 日志解析 ──────────────────────────────────────────────────
 _STEP_RE = re.compile(
-    r'(?:\[.+\]\s+)?Step (\d+)/(\d+)(?:\s*\(global (\d+)\))? \| Loss: ([\d.]+) \| LR: ([\de.\-+]+)'
+    r'(?:\[.+\]\s+)?Step (\d+)/(\d+)(?:\s*\(global (\d+)\))? \| '
+    r'Loss: ([\d.]+) \| LR: ([\de.\-+]+)(?: \| GN: ([\d.]+))?'
 )
 _PHASE_RE = re.compile(
     r'\[(.+?)\] Step \d+/\d+'
+)
+_VAL_LOSS_RE = re.compile(
+    r'(?:\[.+\]\s+)?Val loss: ([\d.]+)'
+)
+_VAL_ACC_RE = re.compile(
+    r'acc/(\w+)=([\d.]+)'
 )
 
 
 def _parse_training_progress(log_path: str) -> dict:
     """解析 crashes.log 获取最新训练进度。"""
-    lines = _tail_lines(log_path, 200)
+    lines = _tail_lines(log_path, 300)
     result = {
         'phase': None, 'phase_step': 0, 'phase_total': 0,
-        'global_step': 0, 'loss': None, 'lr': None,
-        'timestamps': [], 'steps': [],  # for throughput calc
+        'global_step': 0, 'loss': None, 'lr': None, 'grad_norm': None,
+        'val_loss': None, 'val_loss_step': 0, 'val_acc': {},
+        'step_time_s': None,
+        'loss_history': [],  # last N losses for trend
     }
 
     last_line_time = None
@@ -275,6 +297,16 @@ def _parse_training_progress(log_path: str) -> dict:
         if ts_match:
             last_line_time = ts_match.group(1)
 
+        # val loss + accuracy (earliest recent entry wins)
+        val_match = _VAL_LOSS_RE.search(line)
+        if val_match and result['val_loss'] is None:
+            result['val_loss'] = float(val_match.group(1))
+            result['val_loss_step'] = result['global_step']
+            # Parse accuracy metrics from same line
+            for type_name, acc_val in _VAL_ACC_RE.findall(line):
+                result['val_acc'][type_name] = float(acc_val)
+
+        # step progress (first, i.e. most recent, entry wins)
         step_match = _STEP_RE.search(line)
         if step_match and result['loss'] is None:
             phase_step_val = int(step_match.group(1))
@@ -284,14 +316,26 @@ def _parse_training_progress(log_path: str) -> dict:
             result['global_step'] = int(global_str) if global_str else phase_step_val
             result['loss'] = float(step_match.group(4))
             result['lr'] = float(step_match.group(5))
-            if last_line_time:
-                result['timestamps'].append(last_line_time)
-                result['steps'].append(result['global_step'])
+            gn_str = step_match.group(6)
+            result['grad_norm'] = float(gn_str) if gn_str else None
+
+            # Parse time from log: "... | Time: 123.4s"
+            time_m = re.search(r'\| Time: ([\d.]+)s', line)
+            if time_m:
+                result['step_time_s'] = float(time_m.group(1))
+                # step_time_s is cumulative elapsed, not per-step
+
+        # collect loss history for trend (up to 10)
+        step_any = _STEP_RE.search(line)
+        if step_any and len(result['loss_history']) < 10:
+            result['loss_history'].append(float(step_any.group(4)))
 
         phase_match = _PHASE_RE.search(line)
         if phase_match and result['phase'] is None:
             result['phase'] = phase_match.group(1)
 
+    # loss_history collected in reversed order → reverse back to chronological
+    result['loss_history'].reverse()
     return result
 
 
@@ -353,10 +397,22 @@ class CheckResult:
 
 
 class PreflightChecker:
-    """9 项预检。"""
+    """19 项预检。"""
 
     def __init__(self, config: TrainingConfig):
         self.config = config
+
+    def check_pytorch_cuda(self) -> CheckResult:
+        try:
+            import torch
+            py_ver = torch.__version__
+            cuda_ver = torch.version.cuda or 'N/A'
+            cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None
+            cc_str = f'{cc[0]}.{cc[1]}' if cc else 'N/A'
+            return CheckResult('PyTorch/CUDA', True,
+                               f'PT {py_ver} CUDA {cuda_ver} CC {cc_str}')
+        except Exception as e:
+            return CheckResult('PyTorch/CUDA', False, str(e))
 
     def check_gpu_available(self) -> CheckResult:
         try:
@@ -453,16 +509,148 @@ class PreflightChecker:
             return CheckResult('看门狗脚本', True, path)
         return CheckResult('看门狗脚本', True, '将重新生成', is_warning=True)
 
+    # ── 新增高级检查 ──────────────────────────────────────
+
+    def check_python_deps(self) -> CheckResult:
+        missing = []
+        for pkg in ['torch', 'liger_kernel', 'psutil', 'tensorboard']:
+            try:
+                __import__(pkg)
+            except ImportError:
+                missing.append(pkg)
+        if missing:
+            return CheckResult('Python 依赖', False, f'缺少: {", ".join(missing)}')
+        return CheckResult('Python 依赖', True, '核心依赖均已安装')
+
+    def check_config_model(self) -> CheckResult:
+        try:
+            from chopinote_model.config import ModelConfig
+            cfg = ModelConfig()
+            params = (cfg.vocab_size * cfg.d_model  # embedding
+                      + 2 * cfg.d_model * cfg.d_ff * cfg.n_layers  # MLP W1+W2
+                      + cfg.n_layers * (
+                          4 * cfg.d_model * (cfg.d_model // cfg.n_heads) * cfg.n_heads  # QKV+O
+                          + 4 * cfg.d_model  # LN
+                      )
+                      + cfg.d_model * cfg.vocab_size)  # lm_head
+            return CheckResult('模型配置', True,
+                               f'{cfg.n_layers}L/{cfg.n_heads}H/{cfg.d_model}d/'
+                               f'd_ff={cfg.d_ff} (~{params/1e6:.0f}M params)')
+        except Exception as e:
+            return CheckResult('模型配置', False, str(e))
+
+    def check_data_integrity(self) -> CheckResult:
+        """采样检查 token 文件是否能被正确加载。"""
+        train_list = self.config.train_list_path
+        if not os.path.exists(train_list):
+            return CheckResult('数据完整性', False, f'训练列表不存在: {train_list}')
+        try:
+            with open(train_list) as f:
+                files = [line.strip() for line in f if line.strip()]
+            if not files:
+                return CheckResult('数据完整性', False, '训练列表为空')
+            # 随机采样 3 个文件检查
+            import random
+            samples = random.sample(files, min(3, len(files)))
+            for fpath in samples:
+                # 匹配 TokenDataset._resolve_path 逻辑：优先 data_dir/tokens/<basename>
+                full = os.path.join(self.config.data_dir, 'tokens', os.path.basename(fpath))
+                if not os.path.exists(full):
+                    full = fpath if os.path.isabs(fpath) else os.path.join(self.config.data_dir, fpath)
+                if not os.path.exists(full):
+                    return CheckResult('数据完整性', False, f'文件缺失: {full}')
+                size = os.path.getsize(full)
+                if size == 0:
+                    return CheckResult('数据完整性', False, f'空文件: {full}')
+                # 尝试加载 token 文件 (JSON lines 格式)
+                try:
+                    with open(full) as fh:
+                        first_line = fh.readline().strip()
+                        if first_line:
+                            import json
+                            json.loads(first_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return CheckResult('数据完整性', False, f'无效 token 文件: {full}')
+            return CheckResult('数据完整性', True,
+                               f'{len(files)} 个 token 文件，采样 {len(samples)} 个正常')
+        except Exception as e:
+            return CheckResult('数据完整性', False, str(e))
+
+    def check_gpu_power_cap(self) -> CheckResult:
+        info = _gpu_info()
+        if not info:
+            return CheckResult('GPU 功率', False, '无法读取 nvidia-smi')
+        pct = info['power_draw_w'] / info['power_limit_w'] * 100 if info['power_limit_w'] > 0 else 0
+        return CheckResult('GPU 功率', True,
+                           f'{info["power_draw_w"]:.0f}W / {info["power_limit_w"]:.0f}W ({pct:.0f}%)')
+
+    def check_env_vars(self) -> CheckResult:
+        needed = ['CHOPINOTE_DATA_DIR', 'CHOPINOTE_OUTPUT_DIR']
+        found = []
+        missing = []
+        for var in needed:
+            if os.environ.get(var):
+                found.append(var)
+            else:
+                missing.append(var)
+        if missing:
+            return CheckResult('环境变量', False,
+                               f'未设置: {", ".join(missing)}')
+        return CheckResult('环境变量', True, f'已设置: {", ".join(found)}')
+
+    def check_disk_io(self) -> CheckResult:
+        """快速磁盘写入速度测试。"""
+        test_file = os.path.join(self.config.log_dir, '.io_test')
+        try:
+            os.makedirs(self.config.log_dir, exist_ok=True)
+            import tempfile
+            data = b'x' * 64 * 1024  # 64KB
+            t0 = time.time()
+            for _ in range(128):  # 8MB total
+                with open(test_file, 'ab') as f:
+                    f.write(data)
+            t1 = time.time()
+            os.remove(test_file)
+            speed = 8 / (t1 - t0) if (t1 - t0) > 0 else 0
+            if speed < 10:
+                return CheckResult('磁盘 I/O', False,
+                                   f'{speed:.0f} MB/s (过慢，建议 ≥50 MB/s)', is_warning=True)
+            return CheckResult('磁盘 I/O', True, f'{speed:.0f} MB/s')
+        except Exception as e:
+            return CheckResult('磁盘 I/O', False, str(e))
+
+    def check_checkpoint_dir(self) -> CheckResult:
+        ckpt_dir = self.config.checkpoint_dir
+        if not os.path.exists(ckpt_dir):
+            return CheckResult('Checkpoint 目录', True, f'{ckpt_dir} (将创建)')
+        ckpts = sorted(Path(ckpt_dir).glob('step_*.pt'))
+        latest = str(ckpts[-1].name) if ckpts else '无'
+        try:
+            usage = psutil.disk_usage(ckpt_dir)
+            free_gib = usage.free / 1024**3
+            return CheckResult('Checkpoint 目录', True,
+                               f'{len(ckpts)} 个存档, 最新: {latest}, 空闲 {free_gib:.0f} GiB')
+        except OSError:
+            return CheckResult('Checkpoint 目录', True, f'{len(ckpts)} 个存档')
+
     def run(self) -> list[CheckResult]:
         return [
+            self.check_pytorch_cuda(),
             self.check_gpu_available(),
             self.check_gpu_memory(),
+            self.check_gpu_power_cap(),
             self.check_zombie_processes(),
             self.check_tmux_session(),
             self.check_stale_locks(),
             self.check_data_files(),
+            self.check_data_integrity(),
+            self.check_checkpoint_dir(),
+            self.check_disk_io(),
             self.check_disk_space(),
+            self.check_env_vars(),
             self.check_model_import(),
+            self.check_config_model(),
+            self.check_python_deps(),
             self.check_watchdog_script(),
         ]
 
@@ -793,6 +981,9 @@ class Monitor:
         self._wd_log = os.path.join(config.log_dir, 'watchdog.log')
         self._prev_step = 0
         self._prev_time = time.time()
+        self._cached_steps_pm = 0.0
+        self._cached_tokens_ps = 0.0
+        self._cached_eta_s = 0.0
         self._dashboard_height = 0
 
     def _collect(self) -> dict:
@@ -802,10 +993,10 @@ class Monitor:
         train = _parse_training_progress(self._crash_log)
         wd = _parse_watchdog_status(self._wd_log)
 
-        # 吞吐量计算
-        steps_pm = 0
-        tokens_ps = 0
-        eta_s = 0
+        # 吞吐量计算（step 未推进时复用缓存值避免闪烁）
+        steps_pm = self._cached_steps_pm
+        tokens_ps = self._cached_tokens_ps
+        eta_s = self._cached_eta_s
         if train['loss'] is not None and train['global_step'] > 0:
             now = time.time()
             if self._prev_step > 0 and train['global_step'] > self._prev_step:
@@ -817,8 +1008,23 @@ class Monitor:
                     remaining = train['phase_total'] - train['global_step']
                     if steps_pm > 0:
                         eta_s = remaining / steps_pm * 60
+                    self._cached_steps_pm = steps_pm
+                    self._cached_tokens_ps = tokens_ps
+                    self._cached_eta_s = eta_s
             self._prev_step = train['global_step']
             self._prev_time = now
+
+        # Loss 趋势: 最近 5 个 loss 是上升还是下降
+        trend = '—'
+        history = train.get('loss_history', [])
+        if len(history) >= 5:
+            recent = history[-5:]
+            if recent[-1] < recent[0] * 0.99:
+                trend = f'{_GREEN}↓{_RESET}'
+            elif recent[-1] > recent[0] * 1.01:
+                trend = f'{_RED}↑{_RESET}'
+            else:
+                trend = f'{_DIM}→{_RESET}'
 
         # tmux 状态
         tmux_r = _run(['tmux', 'has-session', '-t', 'chopinote'])
@@ -849,6 +1055,7 @@ class Monitor:
                 'total_gib': mem.total / 1024**3,
                 'percent': mem.percent,
             },
+            'loss_trend': trend,
         }
 
     def _render(self, d: dict) -> str:
@@ -883,13 +1090,29 @@ class Monitor:
         # ── 指标行 ──────────────────────────────────
         loss_str = f'{t["loss"]:.4f}' if t['loss'] is not None else '--'
         lr_str = f'{t["lr"]:.2e}' if t['lr'] is not None else '--'
-        lines.append(box.row(f'Loss: {loss_str}    LR: {lr_str}'))
+        gn_str = f'{t["grad_norm"]:.2f}' if t['grad_norm'] is not None else '--'
+        trend_str = d.get('loss_trend', '—')
+        lines.append(box.row(f'Loss: {loss_str} {trend_str}    LR: {lr_str}    GN: {gn_str}'))
+
+        # ── Validation ──────────────────────────
+        if t['val_loss'] is not None:
+            acc_parts = []
+            for key in ('overall', 'note', 'duration', 'bar', 'dynamic', 'velocity', 'key', 'tempo'):
+                val = t.get('val_acc', {}).get(key)
+                if val is not None:
+                    display_key = {'overall': 'all', 'duration': 'dur', 'velocity': 'vel'}.get(key, key)
+                    acc_parts.append(f'{display_key} {val*100:.1f}%')
+            acc_str = f'  ▏{"  ".join(acc_parts)}' if acc_parts else ''
+            lines.append(box.row(f'Val Loss: {t["val_loss"]:.4f}  (step {t["val_loss_step"]:,}){acc_str}'))
 
         # ── GPU ──────────────────────────────────────
         if g:
             mem_str = f'{_fmt_size(g["mem_used_mib"]/1024)} / {_fmt_size(g["mem_total_mib"]/1024)}'
+            power_str = f'{g["power_draw_w"]:.0f}/{g["power_limit_w"]:.0f}W'
+            clock_str = f'{g["sm_clock_mhz"]}/{g["mem_clock_mhz"]}MHz'
             lines.append(box.hline('GPU'))
             lines.append(box.row(f'{g["name"]}  {mem_str}  {g["util_pct"]}%  {g["temp_c"]}°C'))
+            lines.append(box.row(f'{power_str}  {clock_str}'))
         else:
             lines.append(box.hline('GPU'))
             lines.append(box.row('GPU: N/A'))
@@ -900,7 +1123,12 @@ class Monitor:
             step_str = f'{tp["steps_per_min"]:.1f} step/min'
             tok_str = f'{tp["tokens_per_sec"]:.0f} tok/s'
             eta = _eta_str(tp['eta_seconds'])
-            lines.append(box.row(f'{step_str}  {tok_str}  ETA: {eta}'))
+            # step time from log if available
+            if t.get('step_time_s'):
+                cumulative_h = t['step_time_s'] / 3600
+                lines.append(box.row(f'{step_str}  {tok_str}  Elapsed: {cumulative_h:.1f}h  ETA: {eta}'))
+            else:
+                lines.append(box.row(f'{step_str}  {tok_str}  ETA: {eta}'))
         else:
             lines.append(box.row(f'{"等待数据..." if d["tmux_alive"] else "—"}'))
 
@@ -1062,14 +1290,29 @@ class StatusReporter:
         if train['global_step'] > 0:
             phase_name = train['phase'] or '?'
             print(f'  Phase:    {phase_name}  (step {train["global_step"]:,} / {train["phase_total"]:,})')
-            print(f'  Loss:     {train["loss"]:.4f}    LR: {train["lr"]:.2e}')
+            gn_str = f'  GN: {train["grad_norm"]:.2f}' if train['grad_norm'] else ''
+            print(f'  Loss:     {train["loss"]:.4f}    LR: {train["lr"]:.2e}{gn_str}')
+            if train['val_loss'] is not None:
+                acc_parts = []
+                for key in ('overall', 'note', 'duration', 'bar', 'dynamic', 'velocity', 'key', 'tempo'):
+                    val = train.get('val_acc', {}).get(key)
+                    if val is not None:
+                        display_key = {'overall': 'all', 'duration': 'dur', 'velocity': 'vel'}.get(key, key)
+                        acc_parts.append(f'{display_key}={val*100:.1f}%')
+                acc_str = f'  {"  ".join(acc_parts)}' if acc_parts else ''
+                print(f'  Val Loss: {train["val_loss"]:.4f}  (step {train["val_loss_step"]:,})')
+                if acc_parts:
+                    print(f'  Val Acc:  {acc_str}')
         else:
             print(f'  Phase:    {"—" if not tmux_alive else "加载中..."}')
 
         # GPU
         if gpu:
             mem_str = f'{_fmt_size(gpu["mem_used_mib"]/1024)} / {_fmt_size(gpu["mem_total_mib"]/1024)}'
+            power_str = f'{gpu["power_draw_w"]:.0f}/{gpu["power_limit_w"]:.0f}W'
+            clock_str = f'{gpu["sm_clock_mhz"]}/{gpu["mem_clock_mhz"]}MHz'
             print(f'  GPU:      {gpu["name"]}  |  {mem_str}  |  {gpu["util_pct"]}%  |  {gpu["temp_c"]}°C')
+            print(f'  GPU Power:{power_str}  Clocks: {clock_str}')
 
         # 看门狗
         wd_status = 'ACTIVE' if tmux_alive else 'STOPPED'

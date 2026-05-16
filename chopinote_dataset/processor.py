@@ -133,6 +133,30 @@ class _BasePreprocessor:
         }
 
     def _compute_file_hash(self, file_path: str) -> str:
+        """MD5 hash with .hash sidecar caching (shared across all formats)."""
+        sidecar = file_path + '.hash'
+        if os.path.exists(sidecar):
+            try:
+                with open(sidecar) as f:
+                    cached = f.read().strip()
+                    if cached and len(cached) == 32:
+                        return cached
+            except (OSError, ValueError):
+                pass
+
+        h = self._compute_file_hash_raw(file_path)
+
+        try:
+            with open(sidecar, 'w') as f:
+                f.write(h)
+        except OSError:
+            pass
+
+        return h
+
+    @staticmethod
+    def _compute_file_hash_raw(file_path: str) -> str:
+        """Compute MD5 hash from file content (no sidecar)."""
         h = hashlib.md5()
         with open(file_path, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):

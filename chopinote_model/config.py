@@ -9,7 +9,7 @@ class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
     vocab_size: int = 872
     d_model: int = 2048
-    n_layers: int = 20
+    n_layers: int = 24
     n_heads: int = 32
     d_ff: int = 8192
     max_seq_len: int = 4096
@@ -18,6 +18,7 @@ class ModelConfig:
     bar_token_id: int = 4
     max_measures: int = 256
     rope_theta: float = 10000.0
+    gradient_checkpointing: bool = True
 
     @property
     def head_dim(self) -> int:
@@ -106,6 +107,7 @@ class TrainingConfig:
     compile: bool = False
     use_fp8: bool = False
     fp8_warmup_steps: int = 100  # BF16 warmup 步数后切换 FP8
+    gradient_checkpointing: bool = True  # False = 关闭 checkpointing 提速（耗更多 VRAM）
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000

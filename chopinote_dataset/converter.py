@@ -111,9 +111,10 @@ class _BaseREMI:
                 events.append((REMITokenizer.VELOCITY, vel_level))
                 events.append((REMITokenizer.DURATION, dur))
             elif kind == 'r':
-                (dur,) = data
                 events.append((REMITokenizer.REST, None))
-                events.append((REMITokenizer.DURATION, dur))
+                if data is not None:
+                    (dur,) = data
+                    events.append((REMITokenizer.DURATION, dur))
             else:  # 'n'
                 pitch, vel_level, dur = data
                 interval = max(-60, min(60, pitch - tonic_midi))
@@ -121,8 +122,7 @@ class _BaseREMI:
                 events.append((REMITokenizer.VELOCITY, vel_level))
                 events.append((REMITokenizer.DURATION, dur))
 
-        if key_name:
-            events.insert(0, (REMITokenizer.KEY, key_name))
+        events.insert(0, (REMITokenizer.KEY, key_name or 'C'))
         return events
 
 
@@ -616,6 +616,86 @@ class PDMXToREMI(_BaseREMI):
                     merged.append((m, pos, prog, sub, 2, 'n',
                                    (n['pitch'], vel_level, dur)))
 
+        # ── 3.5 轨道注解（PDMX annotation → REMI token） ─────
+        # PDMX annotations carry articulation, dynamics, pedal, slur, etc.
+        _ARTIC_MAP = {
+            'articStaccatoAbove': 'staccato', 'articStaccatoBelow': 'staccato',
+            'articAccentAbove': 'accent', 'articAccentBelow': 'accent',
+            'articMarcatoAbove': 'marcato',
+            'articTenutoAbove': 'tenuto',
+            'articStaccatissimoAbove': 'staccato',
+            'fermata': 'fermata',
+        }
+        _ORNAM_IN_ARTIC = {
+            'ornamentTrill': 'trill', 'ornamentTremblement': 'mordent',
+            'trill': 'trill',
+        }
+        _DYN_MAP = {
+            'ppp': 'ppp', 'pp': 'pp', 'p': 'p', 'mp': 'mp', 'mf': 'mf',
+            'f': 'f', 'ff': 'ff', 'fff': 'fff',
+            'sfz': 'sfz', 'rfz': 'sfz', 'fp': 'fp',
+        }
+
+        def _ann_end_mp(et):
+            for em in sorted(measure_starts.keys(), reverse=True):
+                if et >= measure_starts[em]:
+                    ep = max(0, min(self.grid_size - 1,
+                              int(round((et - measure_starts[em]) / ticks_per_pos))))
+                    return em, ep
+            return 0, 0
+
+        for part_idx, track in enumerate(data.get('tracks', [])):
+            prog, sub = part_program_map[part_idx]
+            for ann in track.get('annotations', []):
+                ad = ann.get('annotation', {})
+                aname = ad.get('name', '')
+                asub = ad.get('subtype', '')
+                am = ann.get('measure', 1) - 1
+                if am not in measure_starts:
+                    continue
+                atime = ann.get('time', 0)
+                apos = max(0, min(self.grid_size - 1,
+                          int(round((atime - measure_starts[am]) / ticks_per_pos))))
+
+                if aname == 'Articulation':
+                    av = _ARTIC_MAP.get(asub)
+                    if av:
+                        merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.ARTIC, av)))
+                        continue
+                    ov = _ORNAM_IN_ARTIC.get(asub)
+                    if ov:
+                        merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.ORNAMENT, ov)))
+                elif aname == 'Dynamic':
+                    dv = _DYN_MAP.get(asub)
+                    if dv:
+                        merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.DYNAMIC, dv)))
+                elif aname == 'Tremolo':
+                    merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.ORNAMENT, 'tremolo')))
+                elif aname == 'Arpeggio':
+                    merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.ARPEGGIO, None)))
+                elif aname == 'PedalSpanner':
+                    dur = ad.get('duration', 0)
+                    merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.PEDAL, 'start')))
+                    if dur > 0:
+                        em, ep = _ann_end_mp(atime + dur)
+                        merged.append((em, ep, prog, sub, 1.0, 'x', (REMITokenizer.PEDAL, 'end')))
+                elif aname == 'SlurSpanner':
+                    dur = ad.get('duration', 0)
+                    merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.SLUR, 'start')))
+                    if dur > 0:
+                        em, ep = _ann_end_mp(atime + dur)
+                        merged.append((em, ep, prog, sub, 1.0, 'x', (REMITokenizer.SLUR, 'end')))
+                elif aname == 'OttavaSpanner':
+                    if asub in ('8va', '8vb', '15ma', '15mb'):
+                        dur = ad.get('duration', 0)
+                        merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.OCTAVE, asub)))
+                        if dur > 0:
+                            em, ep = _ann_end_mp(atime + dur)
+                            merged.append((em, ep, prog, sub, 1.0, 'x', (REMITokenizer.OCTAVE, 'end')))
+                elif aname == 'HairPinSpanner':
+                    hp = 'cresc' if ad.get('hairpin_type', 0) == 0 else 'dim'
+                    merged.append((am, apos, prog, sub, 1.0, 'x', (REMITokenizer.HAIRPIN, hp)))
+
         # ── 4. 拍号事件 ────────────────────────────────────
         last_ts = None
         for m in range(max_measure + 1):
@@ -696,6 +776,23 @@ class PDMXToREMI(_BaseREMI):
             elif bl.get('subtype') == 'end-repeat':
                 merged.append((m, 0, 0, 0, 0.8, 'x',
                                (REMITokenizer.REPEAT, 'end')))
+
+        # ── 5.7 Rest 生成（拍位无音符的空位） ─────────────────
+        occupied: Dict[int, set] = {}
+        for item in merged:
+            kd = item[5]
+            if kd in ('n', 'g'):
+                occupied.setdefault(item[0], set()).add(item[1])
+        for m in range(max_measure + 1):
+            ts_str = measure_ts.get(m, '4/4')
+            parts_ts = ts_str.split('/')
+            num, den = int(parts_ts[0]), int(parts_ts[1])
+            beat_int = 4.0 / den
+            bspace = max(1, int(round(beat_int / self.quarter_per_position)))
+            for bn in range(num):
+                bp = bn * bspace
+                if bp < self.grid_size and bp not in occupied.get(m, set()):
+                    merged.append((m, bp, 0, 0, 2.5, 'r', None))
 
         # ── 6. 排序 ──────────────────────────────────────────
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
@@ -800,9 +897,11 @@ class MIDIToREMI(_BaseREMI):
         if not part_program_map:
             return []
 
-        # 收集事件与音符
+        # 收集事件、音符、休止符
         extra: List[Tuple[int, int, int, str, Optional[Any]]] = []
         all_notes: List[Tuple[int, int, int, int, int, int]] = []
+        all_rests: List[Tuple[int, int, int, int]] = []
+        all_grace_notes: List[Tuple[int, int, int, str, int, int, int]] = []
         last_timesig: Optional[str] = None
 
         for part_idx, part in enumerate(parts):
@@ -838,10 +937,18 @@ class MIDIToREMI(_BaseREMI):
                                           REMITokenizer.TIMESIG, ts_str))
                             last_timesig = ts_str
 
+                    elif isinstance(elem, expressions.PedalMark):
+                        ped_type = 'start' if getattr(elem, 'type', 0) in (0, 'start') else 'end'
+                        extra.append((measure_idx, pos, part_idx,
+                                      REMITokenizer.PEDAL, ped_type))
+
                 # ── 音符提取 ────────────────────────────────────
                 for elem in flat.notesAndRests:
                     if isinstance(elem, note.Rest):
-                        continue  # V1: 不生成 Rest
+                        dur_positions = max(1, min(self.grid_size,
+                                                   int(round(elem.quarterLength / self.quarter_per_position))))
+                        all_rests.append((measure_idx, pos, part_idx, dur_positions))
+                        continue
 
                     offset = elem.offset
                     pos = min(self.grid_size - 1,
@@ -861,6 +968,15 @@ class MIDIToREMI(_BaseREMI):
 
                     dur_positions = max(1, min(self.grid_size,
                                                int(round(elem.quarterLength / self.quarter_per_position))))
+
+                    # Grace note detection (short-note heuristic)
+                    is_grace = getattr(elem.duration, 'isGrace', False) or \
+                        elem.quarterLength < 0.25 * self.quarter_per_position
+                    if is_grace:
+                        for p in pitches:
+                            all_grace_notes.append((measure_idx, pos, part_idx, 'grace',
+                                                    p, vel_level, 1))
+                        continue
 
                     for p in pitches:
                         all_notes.append((measure_idx, pos, part_idx, p, vel_level, dur_positions))
@@ -895,6 +1011,13 @@ class MIDIToREMI(_BaseREMI):
         for m_idx, pos, p_idx, p, vl, dr in all_notes:
             prog, sub = part_program_map[p_idx]
             merged.append((m_idx, pos, prog, sub, 2, 'n', (p, vl, dr)))
+        for m_idx, pos, p_idx, dr in all_rests:
+            prog, sub = part_program_map[p_idx]
+            merged.append((m_idx, pos, prog, sub, 2.5, 'r', (dr,)))
+        for m_idx, pos, p_idx, gn_type, gn_pitch, gn_vel, gn_dur in all_grace_notes:
+            prog, sub = part_program_map[p_idx]
+            merged.append((m_idx, pos, prog, sub, 1.5, 'g',
+                           (gn_type, gn_pitch, gn_vel, gn_dur)))
 
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
         return self._assemble_events(merged, tonic_midi, key_changes, key_name)

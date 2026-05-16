@@ -284,6 +284,10 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
     generated = seed.clone()
     bar_count = seed_tokens.count(bar_id)
 
+    # measure_ids 追踪（KV cache 模式下只有最新 token 输入模型，需外部维护）
+    cached_measure_ids = torch.cumsum((seed[0] == bar_id).int(), dim=0)  # (T_seed,)
+    seed_measure_count = cached_measure_ids[-1].item()  # 累计小节数
+
     # 首轮 forward 处理全部 seed
     next_token = seed
     ctx_len = seed.size(1)
@@ -292,7 +296,8 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
         if ctx_len > model.config.max_seq_len:
             next_token = generated[:, -1:]
 
-        logits = model.forward(next_token, kv_caches=kv_caches)  # (1, T', V)
+        logits = model.forward(next_token, kv_caches=kv_caches,
+                               measure_ids=cached_measure_ids)  # (1, T', V)
         logits = logits[:, -1, :] / temperature  # (1, V)
 
         # ── 音高限制：遮盖当前乐器音域外的 NOTE_ON token ──
@@ -315,6 +320,13 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
         generated = torch.cat([generated, next_token], dim=1)
         ctx_len = generated.size(1)
         token_id = next_token.item()
+
+        # 更新 measure_ids 追踪
+        is_bar = (token_id == bar_id)
+        new_measure = seed_measure_count + bar_count + (1 if is_bar else 0)
+        cached_measure_ids = torch.cat(
+            [cached_measure_ids, torch.tensor([new_measure], device=device)]
+        )
 
         # 追踪 Program / Key 变化
         ts = tokenizer.decode_token(token_id)

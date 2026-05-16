@@ -19,12 +19,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
+from torch.utils.data import DataLoader
 torch.set_float32_matmul_precision('high')   # TF32: 免费加速，不增加显存
 torch.backends.cudnn.benchmark = True        # cuDNN autotune
 
 from chopinote_model.config import ModelConfig, TrainingConfig, PhaseConfig, TokenLossMask
 from chopinote_model.model import MusicTransformer
 from chopinote_model.train import Trainer
+from chopinote_model.dataset import TokenDataset, collate_fn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +65,12 @@ def main():
                         help='batch size (default: 2)')
     parser.add_argument('--compile', action='store_true', default=False,
                         help='启用 torch.compile (mode=reduce-overhead)')
+    parser.add_argument('--use-fp8', action='store_true', default=False,
+                        help='启用 FP8 混合精度（Blackwell tensor core 加速）')
+    parser.add_argument('--fp8-warmup-steps', type=int, default=100,
+                        help='FP8 前用 BF16 warmup 的步数 (default: 100)')
+    parser.add_argument('--no-checkpointing', action='store_true', default=False,
+                        help='关闭 gradient checkpointing 提高训练速度')
     parser.add_argument('--output-dir', type=str,
                         default='/root/autodl-tmp/chopinote/checkpoints',
                         help='checkpoint 输出目录（默认 400G 数据盘）')
@@ -76,7 +84,7 @@ def main():
     logger.info(f'设备: {device}')
 
     # Model
-    model_config = ModelConfig()
+    model_config = ModelConfig(gradient_checkpointing=not args.no_checkpointing)
     model = MusicTransformer(model_config).to(dtype=torch.bfloat16)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f'模型参数量: {total_params:,}')
@@ -105,6 +113,9 @@ def main():
     train_config = TrainingConfig(
         batch_size=args.batch_size,
         compile=args.compile,
+        use_fp8=args.use_fp8,
+        fp8_warmup_steps=args.fp8_warmup_steps,
+        gradient_checkpointing=not args.no_checkpointing,
         output_dir=args.output_dir,
         log_dir=args.log_dir,
         data_dir=args.data_dir,
@@ -128,10 +139,26 @@ def main():
     if args.resume:
         trainer.load_checkpoint(args.resume)
 
-    # 多阶段训练（train() 自动检测 phases 配置）
-    trainer.train(val_dataloader=None)
-    # Note: val_dataloader=None，验证集在实际训练中使用 --val-list 指定
-    # 如需验证，可先创建 val_loader 传入
+    # 构建验证集 DataLoader（如果提供了 --val-list）
+    val_loader = None
+    if args.val_list:
+        val_dataset = TokenDataset(
+            split_file=args.val_list,
+            data_dir=args.data_dir,
+            max_seq_len=model_config.max_seq_len,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=collate_fn,
+            drop_last=False,
+        )
+        logger.info(f'验证集: {len(val_dataset)} 个样本，来自 {args.val_list}')
+
+    trainer.train(val_dataloader=val_loader)
 
 
 if __name__ == '__main__':
