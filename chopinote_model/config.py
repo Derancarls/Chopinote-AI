@@ -92,13 +92,14 @@ class PhaseConfig:
     loss_mask: Optional[TokenLossMask] = None        # None = 不屏蔽，全量 loss
     save_steps: int = 1000
     eval_steps: int = 1000
+    max_eval_batches: int = 500
 
 
 @dataclass
 class TrainingConfig:
     """训练配置（适配 RTX 5090 32GB / 1.24B 模型）。"""
-    batch_size: int = 8
-    grad_accum_steps: int = 4
+    batch_size: int = 32
+    grad_accum_steps: int = 1
     # 以下字段仅在单阶段模式 (phases=None) 下生效
     # 多阶段模式请通过 PhaseConfig 分别设置各阶段 lr / warmup / steps
     lr: float = 1.5e-4
@@ -111,6 +112,7 @@ class TrainingConfig:
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000
+    max_eval_batches: int = 500  # 限制验证批次数，0=不限制（全量）
     output_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_OUTPUT_DIR', '/root/autodl-tmp/chopinote/checkpoints'))
     log_dir: str = field(default_factory=lambda: os.environ.get(

@@ -17,8 +17,8 @@ PDMX_DIR = '/root/autodl-tmp/chopinote_data/data/raw/PDMX'
 # ── Step 1: 清空旧的 PDMX token ──────────────────────────────
 def clean_old_pdmx():
     logger.info("清空旧 PDMX token...")
-    token_dir = f'{DATA_DIR}/tokens'
-    meta_dir = f'{DATA_DIR}/metadata'
+    token_dir = f'{DATA_DIR}/tokens_v2'
+    meta_dir = f'{DATA_DIR}/metadata_v2'
     n = 0
     for f in os.listdir(token_dir):
         if f.startswith('Qm'):
@@ -84,7 +84,7 @@ def run_pdmx():
 
     # 验证各目录
     logger.info("按目录统计...")
-    meta_dir = f'{DATA_DIR}/metadata'
+    meta_dir = f'{DATA_DIR}/metadata_v2'
     dirs = {}
     for fname in os.listdir(meta_dir):
         if not fname.startswith('Qm'):

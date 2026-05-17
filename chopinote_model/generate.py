@@ -1,5 +1,8 @@
 """推理生成模块：自回归采样 → MusicXML 导出。"""
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -10,6 +13,65 @@ from music21 import stream, note, chord, meter, clef
 from .model import MusicTransformer
 from .config import ModelConfig
 from chopinote_dataset.tokenizer import REMITokenizer, key_name_to_tonic_midi
+
+
+@dataclass
+class SeedProfile:
+    """A 阶段输出：seed 的结构画像。"""
+    n_bars: int
+    bar_density: float
+    tonic_key: str | None = None
+    tonic_midi: int = 60
+    key_pitch_classes: frozenset | None = None
+    tempo: int = 120
+    programs: list = field(default_factory=list)
+    pitch_class_dist: list = field(default_factory=lambda: [1/12]*12)
+    interval_dist: list = field(default_factory=lambda: [0.04]*25)
+    velocity_mean: float = 64.0
+    rest_ratio: float = 0.1
+    density_series: list = field(default_factory=list)
+    voice_count: int = 1
+    time_sig: str = '4/4'
+
+
+@dataclass
+class GenerationParams:
+    """生成参数，A 设定初值，B 实时调整。"""
+    temperature: float = 1.0
+    top_k: int = 20
+    rest_penalty: float = 0.0
+    key_bias_strength: float = 2.0
+    max_polyphony: int = 10
+    complexity: float = 5.0
+    lock_key: bool = True
+    lock_time: bool = True
+    lock_tempo: bool = True
+    lock_program: bool = True
+    prog_switch_strength: float = 1.0
+    prog_switch_interval: int = 12
+
+    def copy(self) -> GenerationParams:
+        return GenerationParams(**self.__dict__)
+
+    def apply_adjustments(self, adjustments: dict[str, float]) -> GenerationParams:
+        """应用参数调整，按边界裁剪。"""
+        CLAMPS = {
+            'temperature': (0.3, 2.5),
+            'rest_penalty': (0.0, 10.0),
+            'key_bias_strength': (0.0, 5.0),
+            'complexity': (1.0, 10.0),
+            'top_k': (1, 100),
+            'prog_switch_strength': (0.0, 5.0),
+        }
+        for k, delta in adjustments.items():
+            if hasattr(self, k):
+                old = getattr(self, k)
+                new = old + delta
+                if k in CLAMPS:
+                    lo, hi = CLAMPS[k]
+                    new = max(lo, min(hi, new))
+                setattr(self, k, new)
+        return self
 
 logger = logging.getLogger(__name__)
 

@@ -183,7 +183,7 @@ def _convert_score(m21_score: music21.stream.Score) -> Score:
             for m21_note in m21_measure.flatten().notesAndRests:
                 if m21_note.isChord:
                     # 和弦：拆分为多个 note
-                    for chord_note in m21_note.chordNotes:
+                    for chord_note in m21_note.notes:
                         note_data = _extract_note_data(
                             chord_note, m21_measure, staff_idx,
                             current_time_sig, offset_map
@@ -391,11 +391,14 @@ def _extract_note_data(
     is_tie_start = False
     is_tie_stop = False
     if not is_rest:
-        for tie in m21_el.tie or []:
-            if tie.type == 'start':
-                is_tie_start = True
-            elif tie.type == 'stop':
-                is_tie_stop = True
+        tie_attr = m21_el.tie
+        if tie_attr is not None:
+            ties = tie_attr if isinstance(tie_attr, (list, tuple)) else [tie_attr]
+            for tie in ties:
+                if tie.type == 'start':
+                    is_tie_start = True
+                elif tie.type == 'stop':
+                    is_tie_stop = True
 
     # 连音
     tuplet_start = False
