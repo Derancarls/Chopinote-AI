@@ -25,6 +25,7 @@ if _project_root not in sys.path:
 
 from chopinote_model.config import ModelConfig
 from chopinote_model.model import MusicTransformer
+from chopinote_model.generate import GenerationParams
 from chopinote_dataset.tokenizer import REMITokenizer
 from chopinote_dataset.converter import MusicXMLToREMI
 from chopinote_cli.presets import Preset, get_preset, list_presets as _list_presets
@@ -265,6 +266,8 @@ def generate_with_progress(
     key_bias_strength: float = 2.0,
     prog_switch_strength: float = 1.0,
     prog_switch_interval: int = 12,
+    feedback_callback=None,
+    gen_params: Optional[GenerationParams] = None,
 ) -> tuple[torch.Tensor, dict]:
     """自回归生成，带 tqdm 进度条。
 
@@ -552,6 +555,23 @@ def generate_with_progress(
         if is_bar:
             bar_count += 1
             pbar.update(1)
+
+            # ── B 阶段反馈（每小节结束后调整参数） ──────
+            if feedback_callback is not None and gen_params is not None:
+                full_list = generated[0].tolist()
+                adjustments = feedback_callback(full_list, bar_count, gen_params)
+                if adjustments:
+                    gen_params.apply_adjustments(adjustments)
+                    temperature = gen_params.temperature
+                    rest_penalty = gen_params.rest_penalty
+                    key_bias_strength = gen_params.key_bias_strength
+                    if 'complexity' in adjustments:
+                        complexity = gen_params.complexity
+                        seed_complexity = _estimate_seed_complexity(seed_tokens, tokenizer)
+                        adjusted_complexity = complexity + (seed_complexity - 5.0)
+                        adjusted_complexity = max(0.0, min(10.0, adjusted_complexity))
+            # ─────────────────────────────────────────────
+
             if bar_count >= max_bars:
                 break
         else:
@@ -768,7 +788,9 @@ def display_seed_info(input_path: str, all_tokens: list[int],
 
 def generate_once(model, tokenizer, seed_tensor, device,
                   params: dict, model_vocab_size: int,
-                  generation_idx: int = 0) -> tuple[list[int], dict]:
+                  generation_idx: int = 0,
+                  feedback_callback=None,
+                  gen_params=None) -> tuple[list[int], dict]:
     """一次生成，返回 (token_id_list, stats)。不保存文件。"""
     seed = params.get('seed')
     if seed is not None:
@@ -792,6 +814,8 @@ def generate_once(model, tokenizer, seed_tensor, device,
         key_bias_strength=params.get('key_bias_strength', 2.0),
         prog_switch_strength=params.get('prog_switch_strength', 1.0),
         prog_switch_interval=params.get('prog_switch_interval', 12),
+        feedback_callback=feedback_callback,
+        gen_params=gen_params,
     )
     print()
 
@@ -808,7 +832,9 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
                            base_params: dict, base_output_path: str,
                            max_bars_total: int, model_vocab_size: int,
                            num_samples: int = 1, do_validate: bool = False,
-                           auto_save: bool = False):
+                           auto_save: bool = False,
+                           feedback_callback=None,
+                           gen_params=None):
     """主交互循环：生成 → 操作选择 → 保存/重试/变体/退出。
 
     当 num_samples > 1 时自动批量生成。
@@ -828,6 +854,8 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
             full_list, _ = generate_once(
                 model, tokenizer, seed_tensor, device,
                 params, model_vocab_size, i,
+                feedback_callback=feedback_callback,
+                gen_params=gen_params,
             )
             save_to_musicxml(full_list, tokenizer, path, max_bars_total)
             print(f'    [OK] 已保存: {os.path.abspath(path)}')
@@ -852,6 +880,8 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
         full_list, stats = generate_once(
             model, tokenizer, seed_tensor, device,
             params, model_vocab_size, gen_idx,
+            feedback_callback=feedback_callback,
+            gen_params=gen_params,
         )
 
         # 操作选择
@@ -1031,6 +1061,16 @@ def main():
     # ── 评价模式 ─────────────────────────────────────────
     parser.add_argument('--evaluate', action='store_true',
                         help='评价模式：对输入的乐谱打分')
+    parser.add_argument('--feedback', action='store_true',
+                        help='反馈模式：启用 A→B→C 生成-评价闭环')
+    parser.add_argument('--local-weight', type=float, default=0.5,
+                        help='B1 局部反馈权重 (0~1, 默认 0.5)')
+    parser.add_argument('--global-weight', type=float, default=0.5,
+                        help='B2 全局反馈权重 (0~1, 默认 0.5)')
+    parser.add_argument('--retry-threshold', type=float, default=0.55,
+                        help='C 阶段重试阈值 (0~1, 低于此值重试, 默认 0.55)')
+    parser.add_argument('--max-retries', type=int, default=3,
+                        help='C 阶段最大重试次数 (默认 3)')
     parser.add_argument('--seed-path', type=str, default=None,
                         help='种子乐谱文件路径（续写场景评价）')
     parser.add_argument('--alpha', type=float, default=0.3,
@@ -1226,6 +1266,61 @@ def main():
 
     print()
 
+    # ── 反馈模式：A 阶段（生成前评估） ─────────────────
+    feedback_callback = None
+    gen_params_obj = None
+    post_filter = None
+
+    if args.feedback:
+        from chopinote_evaluator.feedback_controller import (
+            PreGenerationEvaluator, NarrowFeedbackController, PostGenerationFilter,
+        )
+
+        # A 阶段：seed 结构画像
+        pre_eval = PreGenerationEvaluator(tokenizer, default_complexity=params.get('complexity'))
+        seed_profile, gen_params_obj = pre_eval.evaluate(seed_tokens)
+
+        # 将用户 CLI 参数同步到 gen_params_obj（B 阶段的调整基准）
+        _user_sync = {
+            'temperature': params.get('temperature', 1.0),
+            'top_k': params.get('top_k', 20),
+            'rest_penalty': params.get('rest_penalty', 0.0),
+            'key_bias_strength': params.get('key_bias_strength', 2.0),
+            'max_polyphony': params.get('max_polyphony', 10),
+            'complexity': params.get('complexity', 5.0),
+            'lock_key': params.get('lock_key', True),
+            'lock_time': params.get('lock_time', True),
+            'lock_tempo': params.get('lock_tempo', True),
+            'lock_program': params.get('lock_program', True),
+            'prog_switch_strength': params.get('prog_switch_strength', 1.0),
+            'prog_switch_interval': params.get('prog_switch_interval', 12),
+        }
+        for _k, _v in _user_sync.items():
+            if _v is not None and hasattr(gen_params_obj, _k):
+                setattr(gen_params_obj, _k, _v)
+
+        # B 阶段：生成中实时反馈
+        feedback_controller = NarrowFeedbackController(
+            seed_profile, tokenizer,
+            local_weight=args.local_weight,
+            global_weight=args.global_weight,
+        )
+
+        # C 阶段：生成后评价
+        post_filter = PostGenerationFilter(
+            tokenizer,
+            retry_threshold=args.retry_threshold,
+            max_retries=args.max_retries,
+        )
+
+        print(f'  [A 阶段] seed: {seed_profile.n_bars} 小节 | '
+              f'密度: {seed_profile.bar_density:.1f} notes/bar | '
+              f'调性: {seed_profile.tonic_key or "N/A"} | '
+              f'声部: {seed_profile.voice_count}')
+        print()
+
+        feedback_callback = feedback_controller.on_bar
+
     # -- 第 4 步：生成 + 交互循环 -------------------------
     print('[4/4] 开始续写...')
     seed_tensor = torch.tensor([seed_tokens], dtype=torch.long, device=device)
@@ -1237,7 +1332,43 @@ def main():
         params, output_path, max_bars_total, model_vocab_size,
         num_samples=args.num_samples, do_validate=args.validate,
         auto_save=has_cli_params,
+        feedback_callback=feedback_callback,
+        gen_params=gen_params_obj,
     )
+
+    # ── 反馈模式：C 阶段（生成后评价 + RL reward） ─────
+    if args.feedback and post_filter:
+        # 查找刚刚保存的 MusicXML 文件
+        saved_path = None
+        if os.path.isfile(output_path):
+            saved_path = output_path
+        else:
+            # 尝试查找最近保存的变体
+            candidates = sorted(Path.cwd().glob('output_chopinote_*.musicxml'),
+                                key=os.path.getmtime, reverse=True)
+            if candidates:
+                saved_path = str(candidates[0])
+
+        if saved_path:
+            print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
+            report = post_filter.evaluate(
+                saved_path,
+                seed_path=args.input,
+                checkpoint=args.checkpoint if args.feedback else None,
+            )
+            score = report.total_score if hasattr(report, 'total_score') else 0.0
+            print(f'      | 综合评分: {score:.4f} | '
+                  f'合法性: {"通过" if report.legality.passed else "失败"}')
+            if post_filter.should_retry(report):
+                print(f'      | [!] 得分 {score:.3f} < 阈值 {args.retry_threshold}，建议重试')
+            else:
+                print(f'      | [OK] 得分达标')
+
+            post_filter.log_reward(
+                report, gen_params_obj,
+                seed_info={'path': args.input, 'bars': max_bars_total},
+            )
+    # ─────────────────────────────────────────────────────
     print()
 
 

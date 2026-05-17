@@ -34,7 +34,7 @@ class TokenDataset(Dataset):
 
         # 加载 token 长度索引（由预处理生成的 token_lengths.json）
         index_path = self.data_dir / 'token_lengths.json'
-        meta_dir = self.data_dir / 'metadata'
+        meta_dir = self.data_dir / 'metadata_v2'
         if index_path.exists():
             import gc
             with open(index_path, 'r') as fh:
@@ -98,7 +98,7 @@ class TokenDataset(Dataset):
 
     def _resolve_path(self, file_path: str) -> Path:
         """将 split 文件中的路径解析为实际 token 文件路径。"""
-        path = self.data_dir / 'tokens' / Path(file_path).name
+        path = self.data_dir / 'tokens_v2' / Path(file_path).name
         if not path.exists():
             fallback = Path(file_path)
             if not fallback.is_absolute():
