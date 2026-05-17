@@ -115,14 +115,14 @@ class _BasePreprocessor:
         metadata.num_tokens = len(tokens)
         tid = f"{metadata.file_id}.tokens"
         mid = f"{metadata.file_id}.meta.json"
-        tp = os.path.join(output_dir, "tokens", tid)
+        tp = os.path.join(output_dir, "tokens_v2", tid)
         os.makedirs(os.path.dirname(tp), exist_ok=True)
         with open(tp, 'w', encoding='utf-8') as f:
             json.dump(tokens, f)
         metadata.processing_time = time.time() - t0
         md = asdict(metadata)
         md.update(conversion_metadata)
-        mp = os.path.join(output_dir, "metadata", mid)
+        mp = os.path.join(output_dir, "metadata_v2", mid)
         os.makedirs(os.path.dirname(mp), exist_ok=True)
         with open(mp, 'w', encoding='utf-8') as f:
             json.dump(md, f, indent=2, ensure_ascii=False)
@@ -209,6 +209,22 @@ class _BasePreprocessor:
         sp = os.path.join(output_dir, 'processing_stats.json')
         with open(sp, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
+
+    def _infer_genre(self, file_path: str, composer: str = '', title: str = '') -> str:
+        """推断音乐体裁（共享实现：文件路径关键词 + 作曲家/标题关键词）。"""
+        combined = f'{file_path} {composer} {title}'.lower()
+        for kw, genre in [
+            ('sonata', 'sonata'), ('ballade', 'ballade'), ('nocturne', 'nocturne'),
+            ('etude', 'etude'), ('prelude', 'prelude'), ('fugue', 'fugue'),
+            ('chorale', 'chorale'), ('waltz', 'waltz'), ('symphony', 'symphony'),
+            ('concerto', 'concerto'), ('mass', 'mass'), ('requiem', 'requiem'),
+            ('suite', 'suite'), ('variation', 'variation'), ('rondo', 'rondo'),
+            ('march', 'march'), ('polonaise', 'polonaise'), ('mazurka', 'mazurka'),
+            ('impromptu', 'impromptu'), ('scherzo', 'scherzo'),
+        ]:
+            if kw in combined:
+                return genre
+        return 'unknown'
 
 
 class MusicXMLPreprocessor(_BasePreprocessor):
@@ -391,23 +407,6 @@ class MusicXMLPreprocessor(_BasePreprocessor):
             hash_md5=self._compute_file_hash(file_path)
         )
     
-    def _infer_genre(self, file_path: str, composer: str = '', title: str = '') -> str:
-        """推断音乐体裁（共享实现：文件路径关键词 + 作曲家/标题关键词）。"""
-        combined = f'{file_path} {composer} {title}'.lower()
-        for kw, genre in [
-            ('sonata', 'sonata'), ('ballade', 'ballade'), ('nocturne', 'nocturne'),
-            ('etude', 'etude'), ('prelude', 'prelude'), ('fugue', 'fugue'),
-            ('chorale', 'chorale'), ('waltz', 'waltz'), ('symphony', 'symphony'),
-            ('concerto', 'concerto'), ('mass', 'mass'), ('requiem', 'requiem'),
-            ('suite', 'suite'), ('variation', 'variation'), ('rondo', 'rondo'),
-            ('march', 'march'), ('polonaise', 'polonaise'), ('mazurka', 'mazurka'),
-            ('impromptu', 'impromptu'), ('scherzo', 'scherzo'),
-        ]:
-            if kw in combined:
-                return genre
-        return 'unknown'
-    
-
 
 class PDMXPreprocessor(_BasePreprocessor):
     """PDMX JSON → REMI 预处理管道

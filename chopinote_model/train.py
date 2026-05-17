@@ -385,7 +385,7 @@ class Trainer:
 
                     if val_dataloader is not None and eval_steps and \
                        local_step % eval_steps == 0:
-                        val_metrics = self.evaluate(val_dataloader)
+                        val_metrics = self.evaluate(val_dataloader, config.max_eval_batches)
                         self.writer.add_scalar('val/loss', val_metrics['loss'], self.global_step)
                         # Log per-type accuracy
                         acc_strs = []
@@ -481,8 +481,10 @@ class Trainer:
         return labels
 
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader) -> dict:
-        """评估验证集。返回 dict，含 'loss' 和每个 token 类型的 'acc/<type>'。"""
+    def evaluate(self, dataloader: DataLoader, max_batches: int = 0) -> dict:
+        """评估验证集。返回 dict，含 'loss' 和每个 token 类型的 'acc/<type>'。
+        max_batches: 限制最大批次数，0=不限制（全量验证集）。
+        """
         self.model.eval()
         total_sum = 0.0
         total_tokens = 0
@@ -492,7 +494,9 @@ class Trainer:
         type_correct = torch.zeros(num_types, dtype=torch.float, device=self.device)
         type_idx_map = self._token_id_to_type.to(self.device)
 
-        for batch in dataloader:
+        for i, batch in enumerate(dataloader):
+            if max_batches > 0 and i >= max_batches:
+                break
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
