@@ -130,7 +130,6 @@ def kl_divergence(p: list[float], q: list[float], eps: float = 1e-10) -> float:
 def _density_z_tokens(tokens: list[int], tokenizer,
                       reference_density: float = 0.0) -> float:
     """密度 Z-score。reference_density=0 时用滑动窗口自身。"""
-    from chopinote_model.generate import tokenizer as _tk
     bar_id = tokenizer.bar_token_id
     bars = _tokens_by_bar(tokens, bar_id)
     if len(bars) < 2:

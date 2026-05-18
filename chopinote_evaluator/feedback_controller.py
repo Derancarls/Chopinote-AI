@@ -644,14 +644,74 @@ class PostGenerationFilter:
 
         return log_path
 
+    def find_problem_bars(self, report) -> list[int]:
+        """从评价报告中找出有问题的具体小节号。
+
+        扫描合法性问题的 measure 字段和理论违规的 measure，
+        返回问题小节列表（升序，去重）。
+        """
+        bars: set[int] = set()
+        if hasattr(report, 'legality') and report.legality:
+            for issue in report.legality.issues:
+                if issue.measure > 0:
+                    bars.add(issue.measure)
+
+        if report.general and isinstance(report.general, dict):
+            theory = report.general.get('theory', {})
+            violations = theory.get('violations', []) if isinstance(theory, dict) else []
+            for v in violations:
+                m = v.get('measure', 0) if isinstance(v, dict) else getattr(v, 'measure', 0)
+                if m > 0:
+                    bars.add(m)
+
+        return sorted(bars)
+
+    def get_rollback_point(
+        self,
+        report,
+        tokenizer,
+        full_tokens: list[int],
+        seed_bars: int = 0,
+        min_rollback_bars: int = 4,
+    ) -> int | None:
+        """找到第一个问题小节前的退回到 token 位置。
+
+        返回 token 序列中退回点的索引（退回点之后的 token 将被丢弃重新生成）。
+        退回点 = 问题小节的前一个小节的 BAR token 位置。
+        如果问题无法定位或退回后生成内容太少，返回 None。
+        """
+        problem_bars = self.find_problem_bars(report)
+        if not problem_bars:
+            return None
+
+        # 取第一个问题小节
+        first_bad_bar = problem_bars[0]
+        # 退回一整个小节，确保上下文干净
+        rollback_bar = max(1, first_bad_bar - 1)
+        # 至少保留 min_rollback_bars 节的生成内容（不含 seed）
+        if rollback_bar <= seed_bars + min_rollback_bars:
+            # 问题太靠前，退回意义不大
+            return None
+
+        # 在第 rollback_bar 小节对应的 BAR token 位置截断
+        bar_id = tokenizer.bar_token_id
+        bar_count = 0
+        for i, tid in enumerate(full_tokens):
+            if tid == bar_id:
+                bar_count += 1
+                if bar_count == rollback_bar:
+                    return i  # 退回点：从此处截断
+
+        return None
+
     def get_retry_adjustments(self, report, retry_count: int) -> dict[str, Any]:
-        """根据评价报告生成重试参数调整。"""
+        """根据评价报告生成重试参数调整（返回 DELTAs，apply_adjustments 做加法 + 裁切）。"""
         adj: dict[str, Any] = {}
 
         # 合法性失败 → 大幅降低温度
         if hasattr(report, 'legality') and report.legality and not report.legality.passed:
-            adj['temperature'] = max(0.3, 1.0 - retry_count * 0.15)
-            adj['rest_penalty'] = min(5.0, retry_count * 0.5)
+            adj['temperature'] = -min(0.7, retry_count * 0.15)
+            adj['rest_penalty'] = retry_count * 0.5
             return adj
 
         general = report.general or {}
@@ -660,19 +720,19 @@ class PostGenerationFilter:
         # 统计评分低 → 降低温度 + 增 key_bias
         stat_score = general.get('statistical_score', 0.5)
         if stat_score < 0.5:
-            adj['temperature'] = max(0.3, 1.0 - retry_count * 0.1)
-            adj['key_bias_strength'] = min(5.0, 2.0 + retry_count * 0.5)
+            adj['temperature'] = -retry_count * 0.1
+            adj['key_bias_strength'] = retry_count * 0.5
 
         # 理论评分低 → 降低复杂度
         theory_score = general.get('theory', {}).get('score', 0.5)
         if theory_score < 0.5:
-            adj['complexity'] = max(1.0, 5.0 - retry_count * 1.0)
+            adj['complexity'] = -retry_count * 1.0
 
         # 一致性评分低 → 增加 rest_penalty + 降低温度
         if specific:
             cons_score = specific.get('consistency_score', 0.5)
             if cons_score < 0.5:
-                adj['temperature'] = max(0.3, adj.get('temperature', 1.0) - 0.1)
-                adj['rest_penalty'] = min(5.0, adj.get('rest_penalty', 0.0) + retry_count * 0.3)
+                adj['temperature'] = adj.get('temperature', 0.0) - 0.1
+                adj['rest_penalty'] = adj.get('rest_penalty', 0.0) + retry_count * 0.3
 
         return adj
