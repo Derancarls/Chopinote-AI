@@ -268,6 +268,7 @@ def generate_with_progress(
     prog_switch_interval: int = 12,
     feedback_callback=None,
     gen_params: Optional[GenerationParams] = None,
+    rollback_from_token: Optional[int] = None,
 ) -> tuple[torch.Tensor, dict]:
     """自回归生成，带 tqdm 进度条。
 
@@ -295,6 +296,13 @@ def generate_with_progress(
     eos_id = tokenizer.eos_token_id
     bar_id = tokenizer.bar_token_id
     start_time = time.time()
+
+    # ── 退回重写：截断到指定位置 ─────────────────────────────
+    if rollback_from_token is not None:
+        truncate_pos = min(rollback_from_token, seed_tokens.size(1) - 1)
+        seed_tokens = seed_tokens[:, :truncate_pos]
+        logger.info("退回重写: 截断至 token %d (共 %d tokens)", truncate_pos, seed_tokens.size(1))
+    # ─────────────────────────────────────────────────────────
 
     # ── 音高限制准备 ──────────────────────────────────────────
     from chopinote_model.generate import (
@@ -600,6 +608,7 @@ def save_to_musicxml(
     tokenizer: REMITokenizer,
     output_path: str,
     max_bars: int = 256,
+    save_tokens: bool = False,
 ):
     """将 token 序列保存为 MusicXML 文件。"""
     from chopinote_model.generate import (
@@ -620,8 +629,29 @@ def save_to_musicxml(
     )
     _cleanup_accidentals(output_path)
 
+    # 保存 token 序列（用于退回重写和 DPO）
+    if save_tokens and token_ids:
+        tok_path = output_path.rsplit('.musicxml', 1)[0] + '.tokens'
+        try:
+            with open(tok_path, 'w') as f:
+                f.write(' '.join(str(t) for t in token_ids))
+        except OSError as e:
+            logger.warning('保存 token 文件失败: %s', e)
+
     num_bars = max(n['bar'] for n in notes) if notes else 0
     return num_bars
+
+
+# -- token 文件读写 -----------------------------------------------
+
+def load_tokens_file(tokens_path: str) -> list[int] | None:
+    """从 .tokens 文件加载 token ID 列表。"""
+    try:
+        with open(tokens_path) as f:
+            return [int(x) for x in f.read().strip().split()]
+    except (OSError, ValueError) as e:
+        logger.warning('加载 token 文件失败: %s', e)
+        return None
 
 
 # -- 输出路径 --------------------------------------------------
@@ -886,7 +916,7 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
 
         # 操作选择
         if auto_save:
-            save_to_musicxml(full_list, tokenizer, gen_path, max_bars_total)
+            save_to_musicxml(full_list, tokenizer, gen_path, max_bars_total, save_tokens=True)
             print(f'\n  [OK] 已保存: {os.path.abspath(gen_path)}')
             if do_validate:
                 from scripts.validate_generation import validate_generated_xml
@@ -906,7 +936,7 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
         choice = input('  请输入: ').strip().lower()
 
         if choice == 's':
-            save_to_musicxml(full_list, tokenizer, gen_path, max_bars_total)
+            save_to_musicxml(full_list, tokenizer, gen_path, max_bars_total, save_tokens=True)
             print(f'\n  [OK] 已保存: {os.path.abspath(gen_path)}')
             if do_validate:
                 from scripts.validate_generation import validate_generated_xml
@@ -1336,20 +1366,35 @@ def main():
         gen_params=gen_params_obj,
     )
 
-    # ── 反馈模式：C 阶段（生成后评价 + RL reward） ─────
+    # ── 反馈模式：C 阶段（生成后评价 + 退回重写 + RL reward） ─
     if args.feedback and post_filter:
-        # 查找刚刚保存的 MusicXML 文件
         saved_path = None
         if os.path.isfile(output_path):
             saved_path = output_path
         else:
-            # 尝试查找最近保存的变体
-            candidates = sorted(Path.cwd().glob('output_chopinote_*.musicxml'),
-                                key=os.path.getmtime, reverse=True)
+            # 只匹配本次运行时间戳的文件，避免拿到上次运行的结果 (#13)
+            base_stem = Path(output_path).stem  # e.g. output_chopinote_20260518_143000
+            candidates = sorted(
+                Path(output_path).parent.glob(f'{base_stem}*.musicxml'),
+                key=os.path.getmtime, reverse=True,
+            )
             if candidates:
                 saved_path = str(candidates[0])
 
-        if saved_path:
+        if not saved_path:
+            return
+
+        # 尝试退回重写（最多 max_retries 轮）
+        rollback_retries = 0
+        rollback_report = None
+        rollback_tokens = None
+
+        # 加载 token 序列（用于退回重写定位）
+        tok_path = saved_path.rsplit('.musicxml', 1)[0] + '.tokens'
+        if os.path.isfile(tok_path):
+            rollback_tokens = load_tokens_file(tok_path)
+
+        while rollback_retries < args.max_retries:
             print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
             report = post_filter.evaluate(
                 saved_path,
@@ -1357,17 +1402,74 @@ def main():
                 checkpoint=args.checkpoint if args.feedback else None,
             )
             score = report.total_score if hasattr(report, 'total_score') else 0.0
+            legality_ok = report.legality.passed if report.legality else True
             print(f'      | 综合评分: {score:.4f} | '
-                  f'合法性: {"通过" if report.legality.passed else "失败"}')
-            if post_filter.should_retry(report):
-                print(f'      | [!] 得分 {score:.3f} < 阈值 {args.retry_threshold}，建议重试')
-            else:
-                print(f'      | [OK] 得分达标')
+                  f'合法性: {"通过" if legality_ok else "失败"}')
 
-            post_filter.log_reward(
-                report, gen_params_obj,
-                seed_info={'path': args.input, 'bars': max_bars_total},
-            )
+            if not post_filter.should_retry(report):
+                print(f'      | [OK] 得分达标')
+                rollback_report = report
+                break
+
+            # ✂ 尝试退回重写
+            rollback_point = None
+            if rollback_tokens is not None:
+                rollback_point = post_filter.get_rollback_point(
+                    report, tokenizer, rollback_tokens,
+                    seed_bars=args.seed_bars,
+                )
+
+            if rollback_point is not None and rollback_retries < args.max_retries - 1:
+                rollback_retries += 1
+                # 应用更紧的参数
+                adj = post_filter.get_retry_adjustments(report, rollback_retries)
+                if gen_params_obj:
+                    gen_params_obj.apply_adjustments(adj)
+                # 截断 tokens 到退回点
+                rollback_tokens = rollback_tokens[:rollback_point]
+                # 重新生成
+                rollback_seed = torch.tensor([rollback_tokens], dtype=torch.long, device=device)
+                print(f'      | [退回重写 {rollback_retries}] '
+                      f'截断至第 {len(rollback_tokens)} token 重试, 参数: {adj}')
+                rollback_ids, _ = generate_with_progress(
+                    model, rollback_seed, tokenizer,
+                    max_bars=params['max_bars'],  # Fix #12: use continuation bars, not total
+                    temperature=gen_params_obj.temperature if gen_params_obj else 1.0,
+                    top_k=params.get('top_k', 20),
+                    effective_vocab_size=model_vocab_size,
+                    lock_key=gen_params_obj.lock_key if gen_params_obj else True,
+                    lock_time=gen_params_obj.lock_time if gen_params_obj else True,
+                    lock_tempo=gen_params_obj.lock_tempo if gen_params_obj else True,
+                    lock_program=gen_params_obj.lock_program if gen_params_obj else True,
+                    complexity=gen_params_obj.complexity if gen_params_obj else 5.0,
+                    rest_penalty=gen_params_obj.rest_penalty if gen_params_obj else 0.0,
+                    max_polyphony=params.get('max_polyphony', 10),
+                    key_bias_strength=gen_params_obj.key_bias_strength if gen_params_obj else 0.0,
+                    prog_switch_strength=gen_params_obj.prog_switch_strength if gen_params_obj else 1.0,  # Fix #14
+                    prog_switch_interval=gen_params_obj.prog_switch_interval if gen_params_obj else 12,    # Fix #14
+                    feedback_callback=feedback_callback,
+                    gen_params=gen_params_obj,
+                )
+                rollback_tokens = rollback_ids[0].tolist()
+                save_to_musicxml(rollback_tokens, tokenizer, saved_path, max_bars_total,
+                                 save_tokens=True)
+                continue
+            else:
+                print(f'      | [!] 得分 {score:.3f} < 阈值 {args.retry_threshold}'
+                      f'{"，无法退回" if rollback_point is None else "，已达最大退回次数"}')
+                rollback_report = report
+                break
+
+        # 记录 RL reward（含 output_path 供 DPO 训练匹配 .tokens 文件）
+        final_report = rollback_report or report
+        post_filter.log_reward(
+            final_report, gen_params_obj,
+            retry_count=rollback_retries,
+            seed_info={'path': args.input, 'bars': max_bars_total, 'seed_bars': args.seed_bars},
+            extra={'musicxml_path': saved_path},
+        )
+        if rollback_retries > 0:
+            print(f'      | 共退回重写 {rollback_retries} 次')
     # ─────────────────────────────────────────────────────
     print()
 

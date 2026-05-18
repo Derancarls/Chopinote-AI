@@ -65,12 +65,21 @@ class _BaseREMI:
                 if k not in pos_bass or pitch < pos_bass[k]:
                     pos_bass[k] = pitch
 
+        # Pre-scan: 每个小节有哪些 (prog, sub) 活跃（用于谱号传播）
+        parts_in_measure: Dict[int, set] = {}
+        for _m, _pos, _prog, _sub, _p, _kind, _data in merged:
+            parts_in_measure.setdefault(_m, set()).add((_prog, _sub))
+
         events: List[Tuple[str, Optional[int]]] = []
         cur_measure = -1
         cur_pos = -1
         cur_program = -1
         cur_subtrack = 0
         current_tonic_midi = tonic_midi
+        current_key_name = key_name or 'C'
+        current_timesig: Optional[str] = None
+        current_tempo: Optional[int] = None
+        current_clef: Dict[Tuple[int, int], str] = {}  # {(prog, sub): clef_name}
 
         for m, pos, prog, sub, _priority, kind, data in merged:
             if m != cur_measure:
@@ -80,9 +89,26 @@ class _BaseREMI:
                 cur_measure = m
                 cur_pos = -1
                 cur_program = -1
+
+                # ── 每小节起始注入继承的上下文 ──────────────
+                # 调号
                 if m in key_change_map:
                     events.append((REMITokenizer.KEY, key_change_map[m]))
                     current_tonic_midi = key_name_to_tonic_midi(key_change_map[m])
+                    current_key_name = key_change_map[m]
+                else:
+                    events.append((REMITokenizer.KEY, current_key_name))
+                # 拍号
+                if current_timesig is not None:
+                    events.append((REMITokenizer.TIMESIG, current_timesig))
+                # 速度
+                if current_tempo is not None:
+                    events.append((REMITokenizer.TEMPO, current_tempo))
+                # 谱号（仅该小节活跃的 (prog, sub)）
+                for _key in sorted(current_clef.keys()):
+                    if _key in parts_in_measure.get(m, set()):
+                        events.append((REMITokenizer.CLEF, current_clef[_key]))
+                # ──────────────────────────────────────────────
 
             if pos != cur_pos:
                 pos = min(pos, self.grid_size - 1)
@@ -104,6 +130,13 @@ class _BaseREMI:
             if kind == 'x':
                 ttype, val = data
                 events.append((ttype, val))
+                # 更新上下文跟踪器
+                if ttype == REMITokenizer.TIMESIG:
+                    current_timesig = val
+                elif ttype == REMITokenizer.TEMPO:
+                    current_tempo = val
+                elif ttype == REMITokenizer.CLEF:
+                    current_clef[(prog, sub)] = val
             elif kind == 'g':
                 gn_type, pitch, vel_level, dur = data
                 interval = max(-60, min(60, pitch - current_tonic_midi))
@@ -123,7 +156,6 @@ class _BaseREMI:
                 events.append((REMITokenizer.VELOCITY, vel_level))
                 events.append((REMITokenizer.DURATION, dur))
 
-        events.insert(0, (REMITokenizer.KEY, key_name or 'C'))
         return events
 
 
@@ -366,7 +398,12 @@ class MusicXMLToREMI(_BaseREMI):
                                           REMITokenizer.ORNAMENT, exp_name))
 
                     # 琶音记号
-                    if getattr(elem, 'arpeggio', None) is not None:
+                    has_arpeggio = False
+                    for exp in getattr(elem, 'expressions', []):
+                        if type(exp).__name__ == 'ArpeggioMark':
+                            has_arpeggio = True
+                            break
+                    if has_arpeggio:
                         extra.append((measure_idx, pos, part_idx,
                                       REMITokenizer.ARPEGGIO, None))
 
