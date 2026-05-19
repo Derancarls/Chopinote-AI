@@ -315,13 +315,34 @@ class Trainer:
                     max_id = max(input_ids.max().item(), labels.max().item() if labels.numel() else 0)
                     assert max_id < model.config.vocab_size, \
                         f'数据中存在 token ID {max_id} ≥ vocab_size {model.config.vocab_size}'
+                    if model.config.use_section_attention and 'section_ids' in batch:
+                        max_sec = batch['section_ids'].max().item()
+                        max_sec_type = batch['section_types'].max().item()
+                        assert max_sec <= model.config.max_sections, \
+                            f'section_id {max_sec} 超出 max_sections {model.config.max_sections}'
+                        assert max_sec_type < model.config.n_section_types, \
+                            f'section_type {max_sec_type} ≥ n_section_types {model.config.n_section_types}'
                     _vocab_checked = True
 
                 if masked_ids:
                     labels = self._apply_loss_mask(labels, masked_ids)
 
                 with autocast('cuda', dtype=torch.bfloat16):
-                    logits = model(input_ids, attention_mask)
+                    # ── 双任务 forward ────────────────────────────
+                    model_kwargs = {}
+                    if model.config.use_section_attention and 'section_ids' in batch:
+                        model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
+                        model_kwargs['section_types'] = batch['section_types'].to(self.device)
+                        model_kwargs['return_sec_head'] = True
+
+                    output = model(input_ids, attention_mask, **model_kwargs)
+                    if isinstance(output, tuple):
+                        logits, sec_head_logits = output
+                    else:
+                        logits = output
+                        sec_head_logits = None
+
+                    # Next-token prediction loss（主任务）
                     if _LIGER_AVAILABLE:
                         loss = _ce_loss(logits.view(-1, logits.size(-1)), labels.view(-1))
                     else:
@@ -332,6 +353,34 @@ class Trainer:
                             reduction='sum',
                         )
                     loss = loss / max(1, (labels != -100).sum())
+                    sec_loss_val = 0.0
+
+                    # Section prediction loss（辅助任务）
+                    if sec_head_logits is not None:
+                        sec_bars_target = batch['sec_bars_target'].to(self.device)
+                        sec_keys_target = batch['sec_keys_target'].to(self.device)
+                        sec_types_target = batch['sec_types_target'].to(self.device)
+
+                        # 检查是否有有效目标（避免 0/0 = NaN）
+                        has_sec_targets = (sec_bars_target != -1).any()
+                        if has_sec_targets:
+                            bars_loss = nn.functional.cross_entropy(
+                                sec_head_logits['bars'].permute(0, 2, 1),
+                                sec_bars_target, ignore_index=-1, reduction='sum',
+                            )
+                            keys_loss = nn.functional.cross_entropy(
+                                sec_head_logits['key'].permute(0, 2, 1),
+                                sec_keys_target, ignore_index=-1, reduction='sum',
+                            )
+                            types_loss = nn.functional.cross_entropy(
+                                sec_head_logits['type'].permute(0, 2, 1),
+                                sec_types_target, ignore_index=-1, reduction='sum',
+                            )
+                            sec_loss_val = bars_loss.item() + keys_loss.item() + types_loss.item()
+                            loss = loss + model.config.sec_loss_weight * (bars_loss + keys_loss + types_loss)
+                        else:
+                            sec_loss_val = 0.0
+
                 total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
                 loss.backward()
@@ -362,6 +411,8 @@ class Trainer:
                         self.writer.add_scalar('train/loss', avg_loss, self.global_step)
                         self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.global_step)
                         self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
+                        if sec_loss_val > 0:
+                            self.writer.add_scalar('train/sec_loss', sec_loss_val, self.global_step)
                         if _fp8_enabled:
                             from .fp8_linear import FP8Linear
                             scales_x, scales_w = [], []

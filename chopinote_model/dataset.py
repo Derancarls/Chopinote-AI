@@ -12,6 +12,7 @@ class TokenDataset(Dataset):
     """从 token JSON 文件中流式加载序列片段。
 
     每次 __getitem__ 随机选一个文件，随机裁剪出 max_seq_len 的片段。
+    若存在对应的 .sec.json 文件，额外加载段落标注数据用于段落感知训练。
     """
 
     def __init__(self, split_file: str, data_dir: str = 'data/processed',
@@ -122,6 +123,18 @@ class TokenDataset(Dataset):
             self._cache.pop(next(iter(self._cache)))
         return data
 
+    def _load_section_data(self, file_idx: int) -> Optional[dict]:
+        """加载段落标注数据。返回 None 表示无标注。"""
+        path = self._resolve_path(self.file_paths[file_idx])
+        sec_path = path.with_suffix('.sec.json')
+        if not sec_path.exists():
+            return None
+        try:
+            with open(sec_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     def __getitem__(self, idx: int) -> dict:
         file_idx = self.valid_indices[idx % len(self.valid_indices)]
         tokens = self._load_tokens(file_idx)
@@ -129,6 +142,7 @@ class TokenDataset(Dataset):
         if len(tokens) <= self.max_seq_len + 1:
             # 短序列直接取全部
             seq = torch.tensor(tokens, dtype=torch.long)
+            start = 0
         else:
             # 随机裁剪
             start = random.randint(0, len(tokens) - self.max_seq_len - 1)
@@ -141,10 +155,54 @@ class TokenDataset(Dataset):
         # attention mask: 1 表示有效 token
         attention_mask = torch.ones_like(input_ids)
 
+        # ── 段落数据加载 ────────────────────────────────────────
+        T = len(input_ids)
+        section_data = self._load_section_data(file_idx)
+        if section_data is not None:
+            sec_ids_all = section_data.get('section_ids', [])
+            sec_types_all = section_data.get('section_types', [])
+            n_total = len(sec_ids_all)
+
+            # 对齐到 token 裁剪窗口：section_data 与 tokens 等长
+            if start < n_total:
+                sec_ids = torch.tensor(
+                    sec_ids_all[start:start + T + 1][:-1], dtype=torch.long)
+                sec_types = torch.tensor(
+                    sec_types_all[start:start + T + 1][:-1], dtype=torch.long)
+            else:
+                sec_ids = torch.zeros(T, dtype=torch.long)
+                sec_types = torch.zeros(T, dtype=torch.long)
+
+            # 构建段落预测目标数组（仅在 Section token 位置有效）
+            sec_bars_target = torch.full((T,), -1, dtype=torch.long)
+            sec_keys_target = torch.full((T,), -1, dtype=torch.long)
+            sec_types_target = torch.full((T,), -1, dtype=torch.long)
+
+            token_positions = section_data.get('section_token_positions', [])
+            attrs_list = section_data.get('section_attrs', [])
+            for i, pos in enumerate(token_positions):
+                local_pos = pos - start
+                if 0 <= local_pos < T and i < len(attrs_list):
+                    attr = attrs_list[i]
+                    sec_bars_target[local_pos] = attr.get('bars', -1)
+                    sec_keys_target[local_pos] = attr.get('key', -1)
+                    sec_types_target[local_pos] = attr.get('type', -1)
+        else:
+            sec_ids = torch.zeros(T, dtype=torch.long)
+            sec_types = torch.zeros(T, dtype=torch.long)
+            sec_bars_target = torch.full((T,), -1, dtype=torch.long)
+            sec_keys_target = torch.full((T,), -1, dtype=torch.long)
+            sec_types_target = torch.full((T,), -1, dtype=torch.long)
+
         return {
             'input_ids': input_ids,
             'labels': labels,
             'attention_mask': attention_mask,
+            'section_ids': sec_ids,
+            'section_types': sec_types,
+            'sec_bars_target': sec_bars_target,
+            'sec_keys_target': sec_keys_target,
+            'sec_types_target': sec_types_target,
         }
 
 
@@ -162,11 +220,32 @@ def collate_fn(batch: list[dict]) -> dict:
     attention_mask = torch.nn.utils.rnn.pad_sequence(
         attention_mask, batch_first=True, padding_value=0)
 
-    return {
+    result = {
         'input_ids': input_ids,
         'labels': labels,
         'attention_mask': attention_mask,
     }
+
+    # ── 段落字段 padding ────────────────────────────────────────
+    if 'section_ids' in batch[0]:
+        section_ids = [b['section_ids'] for b in batch]
+        section_types = [b['section_types'] for b in batch]
+        sec_bars_target = [b['sec_bars_target'] for b in batch]
+        sec_keys_target = [b['sec_keys_target'] for b in batch]
+        sec_types_target = [b['sec_types_target'] for b in batch]
+
+        result['section_ids'] = torch.nn.utils.rnn.pad_sequence(
+            section_ids, batch_first=True, padding_value=0)
+        result['section_types'] = torch.nn.utils.rnn.pad_sequence(
+            section_types, batch_first=True, padding_value=0)
+        result['sec_bars_target'] = torch.nn.utils.rnn.pad_sequence(
+            sec_bars_target, batch_first=True, padding_value=-1)
+        result['sec_keys_target'] = torch.nn.utils.rnn.pad_sequence(
+            sec_keys_target, batch_first=True, padding_value=-1)
+        result['sec_types_target'] = torch.nn.utils.rnn.pad_sequence(
+            sec_types_target, batch_first=True, padding_value=-1)
+
+    return result
 
 
 def create_dataloader(split_file: str, data_dir: str = 'data/processed',

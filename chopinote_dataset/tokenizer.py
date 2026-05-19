@@ -103,6 +103,16 @@ class REMITokenizer:
     ARPEGGIO = '<Arpeggio>'        # 琶音记号（自闭合，无参数）
     BASS = '<Bass'                 # 低音音级: 0~11（C~B）
     ANTICIPATE = '<Anticipate'     # 预期调性变更目标: 如 Key C, Key G
+    SECTION = '<Section'           # 段落类型标记 (paragraph-aware)
+    SEC_SUM = '<SecSum>'           # 段落 summary token（每段一个）
+
+    # 段落类型名称（用于 Section token 构建）
+    SECTION_NAMES = [
+        'exposition', 'development', 'recapitulation',
+        'theme1', 'theme2', 'themen', 'intro', 'coda',
+        'bridge', 'cadenza', 'transition', 'variation', 'episode',
+        '0', '1', '2', '3', '4', '5', '6', '7',
+    ]
 
     # 最多支持的拍数（与 grid_size 16 对齐）
     MAX_BEATS = 16
@@ -334,6 +344,20 @@ class REMITokenizer:
             self._id_to_token[idx] = t
             idx += 1
 
+        # ── 段落感知 token（paragraph-aware）───────────────────
+
+        # <Section exposition> .. <Section 7>（21 个）
+        for sec_name in self.SECTION_NAMES:
+            t = f'{self.SECTION} {sec_name}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <SecSum>（段落 summary，自闭合）
+        self._token_to_id[self.SEC_SUM] = idx
+        self._id_to_token[idx] = self.SEC_SUM
+        idx += 1
+
     @property
     def vocab_size(self) -> int:
         return len(self._token_to_id)
@@ -464,4 +488,9 @@ class REMITokenizer:
             elif token.startswith(self.ANTICIPATE):
                 val = token[len(self.ANTICIPATE) + 1:-1]  # e.g. 'C', 'Am'
                 events.append((self.ANTICIPATE, val))
+            elif token.startswith(self.SECTION):
+                val = token[len(self.SECTION) + 1:-1]  # e.g. 'theme1', '0'
+                events.append((self.SECTION, val))
+            elif token == self.SEC_SUM:
+                events.append((self.SEC_SUM, None))
         return events

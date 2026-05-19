@@ -427,3 +427,283 @@ def generate_to_musicxml(model: MusicTransformer, tokenizer: REMITokenizer,
     return output_path
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  段落感知生成（两层生成：结构规划 → 细节填充）
+# ═══════════════════════════════════════════════════════════════════
+
+SECTION_PARAMS: dict[str, dict] = {
+    'theme1':       {'temperature': 0.9,  'key_bias_strength': 2.0, 'complexity': 5.0},
+    'theme2':       {'temperature': 1.0,  'key_bias_strength': 1.5, 'complexity': 4.0},
+    'development':  {'temperature': 1.3,  'key_bias_strength': 0.5, 'complexity': 7.0},
+    'bridge':       {'temperature': 1.1,  'key_bias_strength': 1.0, 'complexity': 3.0},
+    'cadenza':      {'temperature': 1.4,  'key_bias_strength': 0.0, 'complexity': 8.0},
+    'recapitulation': {'temperature': 0.8, 'key_bias_strength': 2.5, 'complexity': 5.0},
+    'coda':         {'temperature': 0.9,  'key_bias_strength': 2.0, 'complexity': 4.0},
+    'exposition':   {'temperature': 0.9,  'key_bias_strength': 2.0, 'complexity': 5.0},
+    'development_s': {'temperature': 1.3, 'key_bias_strength': 0.5, 'complexity': 7.0},
+    'intro':        {'temperature': 0.8,  'key_bias_strength': 1.5, 'complexity': 3.0},
+    'transition':   {'temperature': 1.0,  'key_bias_strength': 0.5, 'complexity': 4.0},
+    'variation':    {'temperature': 1.1,  'key_bias_strength': 1.5, 'complexity': 5.0},
+    'episode':      {'temperature': 1.2,  'key_bias_strength': 0.0, 'complexity': 6.0},
+}
+
+# Section 名 → token 前缀字符串（从 tokenizer SECTION_NAMES 自动生成，消除手工同步）
+def _build_section_token_map(tokenizer):
+    return {name: f'Section {name}' for name in tokenizer.SECTION_NAMES}
+
+
+@torch.no_grad()
+def generate_structure_plan(model: MusicTransformer, tokenizer: REMITokenizer,
+                            seed_tokens: list[int],
+                            form_constraint: Optional[dict] = None,
+                            max_new_tokens: int = 32,
+                            temperature: float = 1.0,
+                            top_k: int = 20) -> list[int]:
+    """Stage 1: 结构规划 — 只生成结构 token 的段落规划。
+
+    Args:
+        model: MusicTransformer
+        tokenizer: REMI tokenizer
+        seed_tokens: 种子 token 序列（前缀）
+        form_constraint: 可选，如 {"form": "sonata", "total_bars": 64}
+        max_new_tokens: 最多生成 token 数
+        temperature: 采样温度
+        top_k: top-k 采样
+
+    Returns:
+        结构 token 序列（包含 Section / Key / Anticipate 等结构 token）
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    # 从 tokenizer 动态构建 section token 名→字符串映射（零手工同步）
+    section_token_map = _build_section_token_map(tokenizer)
+
+    # 计算结构 token 的 ID 集合（Section, Key, Bar, Anticipate, Tempo, TimeSig 等）
+    section_ids_set = set()
+    for name in section_token_map.values():
+        tid = tokenizer.encode_token(f'<{name}>')
+        if tid != tokenizer.encode_token('<MASK>'):
+            section_ids_set.add(tid)
+
+    # 额外允许的结构 token
+    structure_prefixes = [
+        tokenizer.KEY, tokenizer.BAR, tokenizer.ANTICIPATE,
+        tokenizer.TEMPO, tokenizer.TIMESIG, tokenizer.SEC_SUM,
+    ]
+    for tid in range(tokenizer.vocab_size):
+        ts = tokenizer.decode_token(tid)
+        if any(ts.startswith(p) for p in structure_prefixes):
+            section_ids_set.add(tid)
+
+    structure_vocab = torch.tensor(list(section_ids_set), device=device)
+
+    seed = torch.tensor([seed_tokens], dtype=torch.long, device=device)
+    eos_id = tokenizer.eos_token_id
+
+    kv_caches = [[None, None] for _ in range(model.config.n_layers)]
+    generated = seed.clone()
+    next_token = seed
+    ctx_len = seed.size(1)
+
+    for _ in range(max_new_tokens):
+        if ctx_len > model.config.max_seq_len:
+            next_token = generated[:, -1:]
+
+        logits = model.forward(next_token, kv_caches=kv_caches)
+        logits = logits[:, -1, :] / temperature
+
+        # 只允许结构 token
+        structure_mask = torch.full_like(logits, float('-inf'))
+        structure_mask[:, structure_vocab] = 0.0
+        logits = logits + structure_mask
+
+        # top-k
+        if top_k > 0:
+            vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < vals[:, -1:]] = float('-inf')
+
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        generated = torch.cat([generated, next_token], dim=1)
+        ctx_len = generated.size(1)
+
+        if next_token.item() == eos_id:
+            break
+
+    # 移除 seed 部分，只返回结构 token
+    return generated[0, len(seed_tokens):].tolist()
+
+
+@torch.no_grad()
+def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
+                            seed_tokens: list[int],
+                            section_plan: Optional[list[dict]] = None,
+                            max_bars: int = 64,
+                            max_new_tokens: int = 4096,
+                            temperature: float = 1.0,
+                            top_k: int = 20) -> list[int]:
+    """Stage 2: 段落条件生成 — 按段落规划生成完整曲谱。
+
+    支持段落感知注意力：在生成过程中跟踪当前所属的 section_id / section_type，
+    并在 forward 时传入 section_ids / section_types，使 sec_bias 生效。
+
+    Args:
+        model: MusicTransformer
+        tokenizer: REMI tokenizer
+        seed_tokens: 种子 token 序列（前缀）
+        section_plan: 段落规划，每段含 type/bars/key 等信息。
+            如 [{"type": "exposition", "bars": 16, "key": "C"}, ...]
+        max_bars: 最多生成多少个小节
+        max_new_tokens: 最多生成多少新 token
+        temperature: 采样温度
+        top_k: top-k 采样
+
+    Returns:
+        完整的 token ID 序列（seed + generated）
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    seed = torch.tensor([seed_tokens], dtype=torch.long, device=device)
+    bar_id = tokenizer.bar_token_id
+    eos_id = tokenizer.eos_token_id
+
+    # ── 初始化 KV cache ──
+    kv_caches = [[None, None] for _ in range(model.config.n_layers)]
+
+    generated = seed.clone()
+    bar_count = seed_tokens.count(bar_id)
+    generated_bars = 0
+
+    # 追踪 measure_ids (KV cache 模式下需外部维护)
+    cached_measure_ids = torch.cumsum((seed[0] == bar_id).int(), dim=0)
+    seed_measure_count = cached_measure_ids[-1].item() if cached_measure_ids.numel() else 0
+
+    # ── 段落追踪 ──
+    # 根据 section_plan 预构建段落时间线
+    section_token_map = _build_section_token_map(tokenizer)
+    section_schedule = []  # [(start_bars, type_id, key_id), ...]
+    if section_plan:
+        planned_bars = 0
+        for sec in section_plan:
+            sec_type_name = sec.get('type', 'theme1')
+            n_bars = sec.get('bars', 8)
+            sec_key = sec.get('key', 'C')
+            # 从 tokenizer 动态获取 section token 名（回退到 section0）
+            sec_token_str = section_token_map.get(sec_type_name, 'Section section0')
+            sec_type_id = tokenizer.encode_token(f'<{sec_token_str}>')
+            section_schedule.append((planned_bars, sec_type_id, sec_key))
+            planned_bars += n_bars
+
+    def _get_section_id(bar_idx: int) -> int:
+        """返回给定 bar 位置的 section instance ID。"""
+        if not section_schedule:
+            return 0
+        for i, (start_bar, _, _) in enumerate(section_schedule):
+            if i + 1 < len(section_schedule):
+                if start_bar <= bar_idx < section_schedule[i + 1][0]:
+                    return i + 1
+            else:
+                if bar_idx >= start_bar:
+                    return i + 1
+        return 0
+
+    def _get_section_type_id(bar_idx: int) -> int:
+        """返回给定 bar 位置的 section type ID。"""
+        if not section_schedule:
+            return 0
+        for i, (start_bar, type_id, _) in enumerate(section_schedule):
+            if i + 1 < len(section_schedule):
+                if start_bar <= bar_idx < section_schedule[i + 1][0]:
+                    return type_id
+            else:
+                if bar_idx >= start_bar:
+                    return type_id
+        return 0
+
+    cur_params = GenerationParams()
+    cur_params.temperature = temperature
+    cur_params.top_k = top_k
+
+    next_token = seed
+    ctx_len = seed.size(1)
+
+    # 构建 seed 段的 section_ids 和 section_types
+    section_ids_list = []
+    section_types_list = []
+    current_bar_idx = 0
+    for tid in seed_tokens:
+        if use_sections := (section_plan is not None):
+            sec_id = _get_section_id(current_bar_idx)
+            sec_type_id = _get_section_type_id(current_bar_idx)
+        else:
+            sec_id = 0
+            sec_type_id = 0
+        section_ids_list.append(sec_id)
+        section_types_list.append(sec_type_id)
+        if tid == bar_id:
+            current_bar_idx += 1
+
+    for _ in range(max_new_tokens):
+        if ctx_len > model.config.max_seq_len:
+            next_token = generated[:, -1:]
+
+        # ── 构建 section 输入 ──
+        sec_kwargs = {}
+        if model.config.use_section_attention and section_plan is not None:
+            sec_ids_tensor = torch.tensor(
+                [section_ids_list[-next_token.size(1):]], dtype=torch.long, device=device)
+            sec_types_tensor = torch.tensor(
+                [section_types_list[-next_token.size(1):]], dtype=torch.long, device=device)
+            sec_kwargs['section_ids'] = sec_ids_tensor
+            sec_kwargs['section_types'] = sec_types_tensor
+
+        logits = model.forward(
+            next_token, kv_caches=kv_caches,
+            measure_ids=cached_measure_ids, **sec_kwargs,
+        )
+        logits = logits[:, -1, :] / cur_params.temperature
+
+        # top-k
+        if cur_params.top_k > 0:
+            vals, _ = torch.topk(logits, min(cur_params.top_k, logits.size(-1)))
+            logits[logits < vals[:, -1:]] = float('-inf')
+
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        generated = torch.cat([generated, next_token], dim=1)
+        ctx_len = generated.size(1)
+        token_id = next_token.item()
+
+        # 更新 measure_ids
+        is_bar = (token_id == bar_id)
+        new_measure = seed_measure_count + generated_bars + (1 if is_bar else 0)
+        cached_measure_ids = torch.cat(
+            [cached_measure_ids, torch.tensor([new_measure], device=device)]
+        )
+
+        # 更新段落追踪
+        if section_plan is not None:
+            if is_bar:
+                current_bar_idx += 1
+            sec_id = _get_section_id(current_bar_idx)
+            sec_type_id = _get_section_type_id(current_bar_idx)
+            section_ids_list.append(sec_id)
+            section_types_list.append(sec_type_id)
+        else:
+            section_ids_list.append(0)
+            section_types_list.append(0)
+
+        if token_id == bar_id:
+            bar_count += 1
+            generated_bars += 1
+            if bar_count >= max_bars:
+                break
+
+        if token_id == eos_id:
+            break
+
+    return generated[0].tolist()
+
+

@@ -7,7 +7,7 @@ from typing import List, Optional, Set
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
-    vocab_size: int = 886
+    vocab_size: int = 908
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 32
@@ -19,6 +19,17 @@ class ModelConfig:
     max_measures: int = 256
     rope_theta: float = 10000.0
     gradient_checkpointing: bool = True
+
+    # --- 段落感知（paragraph-aware） ---
+    use_section_attention: bool = True
+    n_section_types: int = 22          # 21 section types + padding
+    max_sections: int = 64             # 每曲最多 64 个段落实例
+    sec_bias_decay_len: int = 16       # 偏置距离衰减半衰期（小节）
+    sec_bias_alpha_init: float = 0.5   # 同实例偏置
+    sec_bias_beta_init: float = 0.15   # 同类型跨实例偏置
+    sec_bias_gamma_init: float = 0.05  # 跨类型偏置
+    sec_bias_delta_init: float = 0.2   # 边界桥接偏置
+    sec_loss_weight: float = 0.1       # 段落预测 loss 权重
 
     @property
     def head_dim(self) -> int:

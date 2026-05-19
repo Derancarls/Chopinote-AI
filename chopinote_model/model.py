@@ -1,4 +1,5 @@
-"""Decoder-only Transformer (GPT 风格) 用于音乐生成，RoPE 位置编码。"""
+"""Decoder-only Transformer (GPT 风格) 用于音乐生成，RoPE 位置编码 + 段落感知注意力。"""
+import math
 from typing import Optional
 
 import torch
@@ -20,7 +21,7 @@ except AttributeError:
 
 
 class CausalSelfAttention(nn.Module):
-    """单层因果自注意力 + RoPE (支持 KV cache)。"""
+    """单层因果自注意力 + RoPE (支持 KV cache + 段落偏置)。"""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -30,6 +31,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.d_model = config.d_model
         self.max_len = config.max_seq_len
+        self.use_section = config.use_section_attention
 
         self.qkv = FP8Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = FP8Linear(config.d_model, config.d_model, bias=False)
@@ -50,14 +52,9 @@ class CausalSelfAttention(nn.Module):
 
     @staticmethod
     def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """对 (B, nH, T, head_dim) 施加 RoPE 旋转 — torch.compile 友好版本。
-
-        将 even/odd 对 reshape 为 (-1, 2)，用 stack+flatten 替代
-        empty_like + strided assignment，编译器可直接融合为单一 kernel。
-        """
         T = x.shape[2]
-        x_pairs = x.reshape(*x.shape[:-1], -1, 2)          # (B, nH, T, head_dim/2, 2)
-        x_even, x_odd = x_pairs.unbind(-1)                  # each (B, nH, T, head_dim/2)
+        x_pairs = x.reshape(*x.shape[:-1], -1, 2)
+        x_even, x_odd = x_pairs.unbind(-1)
         c = cos[:T].unsqueeze(0).unsqueeze(0)
         s = sin[:T].unsqueeze(0).unsqueeze(0)
         r_even = x_even * c - x_odd * s
@@ -65,7 +62,8 @@ class CausalSelfAttention(nn.Module):
         return torch.stack([r_even, r_odd], dim=-1).flatten(-2)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
-                kv_cache: Optional[list] = None) -> torch.Tensor:
+                kv_cache: Optional[list] = None,
+                sec_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, T, C = x.shape
 
         qkv = self.qkv(x)
@@ -97,31 +95,60 @@ class CausalSelfAttention(nn.Module):
             kv_cache[1] = v
 
         use_causal = kv_cache is None or kv_cache[0] is None or cache_len == 0
-        if mask is not None and use_causal:
-            m = mask[0] if mask.dim() == 2 else mask
-            pad = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=q.dtype)
-            if pad.size(0) < T_kv:
-                pad = F.pad(pad, (0, T_kv - pad.size(0)), value=_NEG_INF)
-            attn_mask = pad.view(1, 1, 1, -1)
-        else:
-            attn_mask = None
 
-        with sdpa_kernel(_SDPA_BACKENDS):
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=use_causal,
-            )
+        # ── 段落偏置（段落感知注意力）───────────────────────────
+        if sec_bias is not None:
+            # 手动 attention（融合 causal mask + padding mask + sec_bias）
+            scale = self.head_dim ** -0.5
+            attn = (q @ k.transpose(-2, -1)) * scale  # (B, nH, T, T_kv)
+            attn = attn + sec_bias
+
+            # Causal mask
+            if use_causal:
+                causal = torch.triu(
+                    torch.full((T, T_kv), _NEG_INF, device=x.device, dtype=attn.dtype),
+                    diagonal=T_kv - T + 1)
+                attn = attn + causal[None, None, :, :]
+
+            # Padding mask
+            if mask is not None:
+                m = mask[0] if mask.dim() == 2 else mask
+                pad = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=attn.dtype)
+                if pad.size(0) < T_kv:
+                    pad = F.pad(pad, (0, T_kv - pad.size(0)), value=_NEG_INF)
+                attn = attn + pad.view(1, 1, 1, -1)
+
+            attn = F.softmax(attn, dim=-1)
+            attn = F.dropout(attn, p=self.dropout.p if self.training else 0.0)
+            y = attn @ v
+        else:
+            # 标准 SDPA 快速路径
+            if mask is not None and use_causal:
+                m = mask[0] if mask.dim() == 2 else mask
+                pad = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=q.dtype)
+                if pad.size(0) < T_kv:
+                    pad = F.pad(pad, (0, T_kv - pad.size(0)), value=_NEG_INF)
+                attn_mask = pad.view(1, 1, 1, -1)
+            else:
+                attn_mask = None
+
+            with sdpa_kernel(_SDPA_BACKENDS):
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=use_causal,
+                )
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN Transformer block: Attn → FFN 各带残差。"""
+    """Pre-LN Transformer block: Attn → FFN 各带残差。(支持段落偏置)"""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, layer_idx: int = 0):
         super().__init__()
+        self.layer_idx = layer_idx
         self.ln1 = nn.LayerNorm(config.d_model)
         self.attn = CausalSelfAttention(config)
         self.ln2 = nn.LayerNorm(config.d_model)
@@ -134,24 +161,47 @@ class TransformerBlock(nn.Module):
         self.use_checkpointing = config.gradient_checkpointing
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
-                kv_cache: Optional[list] = None) -> torch.Tensor:
+                kv_cache: Optional[list] = None,
+                sec_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         need_ckpt = self.use_checkpointing and kv_cache is None and self.training
         if need_ckpt:
             x = torch.utils.checkpoint.checkpoint(
-                self._forward, x, mask, None, use_reentrant=True)
+                self._forward, x, mask, None, sec_bias, use_reentrant=True)
         else:
-            x = self._forward(x, mask, kv_cache)
+            x = self._forward(x, mask, kv_cache, sec_bias)
         return x
 
     def _forward(self, x: torch.Tensor, mask: Optional[torch.Tensor],
-                 kv_cache: Optional[list] = None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), mask, kv_cache)
+                 kv_cache: Optional[list] = None,
+                 sec_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), mask, kv_cache, sec_bias)
         x = x + self.ffn(self.ln2(x))
         return x
 
 
+class SectionPredictionHead(nn.Module):
+    """段落属性预测头（双任务训练的辅助任务）。"""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.d_model = config.d_model
+        # 段落持续小节数预测（0-64 + padding）
+        self.bars_head = nn.Linear(config.d_model, 65)
+        # 段落主调预测（30 keys + padding）
+        self.key_head = nn.Linear(config.d_model, 31)
+        # 段落类型预测（22 types + padding）
+        self.type_head = nn.Linear(config.d_model, 23)
+
+    def forward(self, x: torch.Tensor) -> dict:
+        return {
+            'bars': self.bars_head(x),
+            'key': self.key_head(x),
+            'type': self.type_head(x),
+        }
+
+
 class MusicTransformer(nn.Module):
-    """Decoder-only Transformer 用于音乐 token 序列生成，RoPE 位置编码。"""
+    """Decoder-only Transformer 用于音乐 token 序列生成，RoPE + 段落感知注意力。"""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -161,8 +211,22 @@ class MusicTransformer(nn.Module):
         self.measure_embedding = nn.Embedding(config.max_measures + 1, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
+        # ── 段落感知组件 ──────────────────────────────────────
+        if config.use_section_attention:
+            # section_id = 0 表示无段落，embedding 为零向量
+            self.section_embedding = nn.Embedding(config.max_sections + 1, config.d_model)
+            self.section_type_embedding = nn.Embedding(config.n_section_types, config.d_model)
+            # 段落偏置可学习参数
+            self.sec_bias_alpha = nn.Parameter(torch.tensor(config.sec_bias_alpha_init))
+            self.sec_bias_beta = nn.Parameter(torch.tensor(config.sec_bias_beta_init))
+            self.sec_bias_gamma = nn.Parameter(torch.tensor(config.sec_bias_gamma_init))
+            self.sec_bias_delta = nn.Parameter(torch.tensor(config.sec_bias_delta_init))
+            self.register_buffer('sec_bias_decay_len', torch.tensor(config.sec_bias_decay_len, dtype=torch.float))
+            # 段落预测头
+            self.section_head = SectionPredictionHead(config)
+
         self.blocks = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.n_layers)
+            TransformerBlock(config, i) for i in range(config.n_layers)
         ])
         self.ln_f = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -176,6 +240,80 @@ class MusicTransformer(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02)
             elif 'bias' in name:
                 nn.init.zeros_(p)
+        # section_embedding id=0 为零向量（无段落）
+        if self.config.use_section_attention:
+            with torch.no_grad():
+                self.section_embedding.weight[0].zero_()
+
+    def _compute_sec_bias(self, section_ids: torch.Tensor,
+                          section_types: torch.Tensor,
+                          bar_positions: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算段落感知注意力偏置 (B, 1, T, T)。
+
+        sec_bias[i][j] =
+          α × same_instance(i,j)
+          + β × same_type_diff_instance(i,j) × exp(-|bar_i - bar_j| / decay_len)
+          - γ × diff_type(i,j)
+          + δ × boundary_region(i,j) × exp(-|bar_i - bar_j| / decay_len)
+        """
+        if not self.config.use_section_attention:
+            return None
+        if section_ids is None:
+            return None
+
+        B, T = section_ids.shape
+        device = section_ids.device
+        dtype = torch.bfloat16
+
+        # 对齐维度: (B, T, 1) vs (B, 1, T) → (B, T, T)
+        sid = section_ids.unsqueeze(-1)    # (B, T, 1)
+        st = section_types.unsqueeze(-1)   # (B, T, 1)
+        bar = bar_positions.unsqueeze(-1)  # (B, T, 1)
+
+        same_inst = (sid == sid.transpose(-2, -1)).to(dtype)      # (B, T, T)
+        same_type = (st == st.transpose(-2, -1)).to(dtype)        # (B, T, T)
+        bar_dist = (bar - bar.transpose(-2, -1)).abs().to(dtype)  # (B, T, T)
+
+        # 边界区域: 检测 section_id 变化的 bar 前后 4 小节
+        boundary_mask = self._compute_boundary_mask(section_ids, bar_positions)  # (B, T, T)
+
+        sec_bias = torch.zeros(B, 1, T, T, device=device, dtype=dtype)
+        sec_bias += self.sec_bias_alpha * same_inst.unsqueeze(1)
+        sec_bias += self.sec_bias_beta * (~same_inst.bool() & same_type.bool()).to(dtype).unsqueeze(1)
+        sec_bias -= self.sec_bias_gamma * (~same_type.bool()).to(dtype).unsqueeze(1)
+        sec_bias += self.sec_bias_delta * boundary_mask.unsqueeze(1)
+
+        # 距离衰减（适用于同类型跨实例和边界区域）
+        decay = torch.exp(-bar_dist.unsqueeze(1) / self.sec_bias_decay_len)
+        sec_bias = sec_bias * decay
+
+        return sec_bias  # (B, 1, T, T)
+
+    def _compute_boundary_mask(self, section_ids: torch.Tensor,
+                                bar_positions: torch.Tensor) -> torch.Tensor:
+        """计算边界桥接区域 mask：(B, T, T)，边界前后 4 小节的 token 间为 1。"""
+        B, T = section_ids.shape
+        device = section_ids.device
+
+        # 检测 bar 层级上的边界（section_id 改变的位置）
+        sid_prev = torch.cat([section_ids[:, :1], section_ids[:, :-1]], dim=1)
+        boundaries = (section_ids != sid_prev).float()  # (B, T)
+
+        # 计算每个 token 到最近边界的 bar 距离
+        bar = bar_positions.float()
+        boundary_bar_pos = bar * boundaries  # 边界位置的 bar number
+        # 计算每对 (i, j) 到边界的距离，简化版：检查是否存在边界在 i 和 j 之间
+        # 更简单的实现：i 和 j 属于不同 section 且相邻 → 边界区域
+        sid = section_ids  # (B, T)
+        # j 属于前一段（i 的左边第一个不同 section）
+        left_boundary = (sid[:, None, :] != sid[:, :, None]).float()  # (B, T, T)
+
+        # bar 距离 < 4 且属于不同 section → 边界区域
+        bar_diff = (bar[:, None, :] - bar[:, :, None]).abs()
+        near_boundary = (bar_diff <= 4.0).float()
+        boundary_mask = left_boundary * near_boundary
+
+        return boundary_mask  # (B, T, T)
 
     def set_fp8_mode(self, enabled: bool):
         for module in self.modules():
@@ -183,41 +321,70 @@ class MusicTransformer(nn.Module):
                 module.use_fp8 = enabled
 
     def invalidate_fp8_caches(self):
-        """optimizer.step() 后调用，使所有 FP8 权重量化缓存失效。"""
         for module in self.modules():
             if isinstance(module, FP8Linear):
                 module.invalidate_cache()
 
     def set_gradient_checkpointing(self, enabled: bool):
-        """运行时开关 gradient checkpointing。"""
         for block in self.blocks:
             block.use_checkpointing = enabled
 
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
                 kv_caches: Optional[list] = None,
-                measure_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                measure_ids: Optional[torch.Tensor] = None,
+                section_ids: Optional[torch.Tensor] = None,
+                section_types: Optional[torch.Tensor] = None,
+                return_sec_head: bool = False) -> torch.Tensor:
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, \
             f'序列长度 {T} 超过 max_seq_len {self.config.max_seq_len}'
 
+        # ── Token + Measure embedding ────────────────────────────
         x = self.token_embedding(input_ids)
         if measure_ids is None:
             bar_mask = (input_ids == self.config.bar_token_id).int()
             measure_ids = torch.cumsum(bar_mask, dim=1).clamp(0, self.config.max_measures)
         elif measure_ids.ndim == 1:
             measure_ids = measure_ids.unsqueeze(0)
-        # KV cache 下 measure_ids 可能比 input_ids 长，截取尾部
         if measure_ids.size(1) > T:
             measure_ids = measure_ids[:, -T:]
         x = x + self.measure_embedding(measure_ids)
+
+        # ── Section embedding ────────────────────────────────────
+        sec_bias = None
+        use_sec = self.config.use_section_attention and section_ids is not None
+        if use_sec:
+            if section_ids.ndim == 1:
+                section_ids = section_ids.unsqueeze(0)
+            if section_types.ndim == 1:
+                section_types = section_types.unsqueeze(0)
+            if section_ids.size(1) > T:
+                section_ids = section_ids[:, -T:]
+            if section_types.size(1) > T:
+                section_types = section_types[:, -T:]
+
+            x = x + self.section_embedding(section_ids)
+            x = x + self.section_type_embedding(section_types)
+
+            # 计算段落注意力偏置
+            if kv_caches is None:
+                sec_bias = self._compute_sec_bias(section_ids, section_types, measure_ids)
+
         x = self.dropout(x)
 
+        # ── Transformer blocks ───────────────────────────────────
         for i, block in enumerate(self.blocks):
             cache = None if kv_caches is None else kv_caches[i]
-            x = block(x, attention_mask, cache)
+            x = block(x, attention_mask, cache, sec_bias)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
+
+        # ── 段落预测头（双任务训练）────────────────────────────
+        if return_sec_head and use_sec:
+            # 在 Section token 位置提取 hidden state
+            sec_head_logits = self.section_head(x)
+            return logits, sec_head_logits
 
         return logits
