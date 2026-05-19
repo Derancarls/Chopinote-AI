@@ -133,14 +133,16 @@ class TestPDMXToREMI:
 
     def test_empty_data(self):
         p = PDMXToREMI()
-        ids = p.convert_pdmx({})
+        ids, meta = p.convert_pdmx({}, collect_metadata=True)
         assert ids == []
+        assert meta == {}
 
     def test_no_barlines(self):
         """无 barlines 时返回空列表。"""
         p = PDMXToREMI()
-        ids = p.convert_pdmx({'tracks': [{'notes': [{'measure': 1}]}]})
+        ids, meta = p.convert_pdmx({'tracks': [{'notes': [{'measure': 1}]}]}, collect_metadata=True)
         assert ids == []
+        assert meta == {}
 
     def test_basic_conversion(self, simple_data):
         p = PDMXToREMI()
@@ -223,8 +225,8 @@ class TestPDMXToREMI:
         d = REMITokenizer().detokenize(ids)
         assert any(t == ('<Dynamic', 'f') for t in d), "Dynamic f → <Dynamic f>"
 
-    def test_rfz_maps_to_sfz(self):
-        """rfz → sfz（折中映射）。"""
+    def test_rfz_maps_to_rfz(self):
+        """rfz → rfz（词表已包含 rfz）。"""
         p = PDMXToREMI()
         data = {
             'resolution': 480,
@@ -242,7 +244,7 @@ class TestPDMXToREMI:
         }
         ids = p.convert_pdmx(data)
         d = REMITokenizer().detokenize(ids)
-        assert any(t == ('<Dynamic', 'sfz') for t in d), "rfz → <Dynamic sfz>"
+        assert any(t == ('<Dynamic', 'rfz') for t in d), "rfz → <Dynamic rfz>"
 
     def test_pedal_spanner(self):
         """PedalSpanner → <Pedal start> / <Pedal end> 配对。"""

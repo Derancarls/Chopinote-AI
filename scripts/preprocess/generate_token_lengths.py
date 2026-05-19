@@ -7,7 +7,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 DATA_DIR = '/root/autodl-tmp/data/processed'
-META_DIR = os.path.join(DATA_DIR, 'metadata_v2')
+META_DIR = os.path.join(DATA_DIR, 'metadata_v3')
 OUTPUT = os.path.join(DATA_DIR, 'token_lengths.json')
 
 

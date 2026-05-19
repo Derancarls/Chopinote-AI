@@ -38,10 +38,10 @@ logger = logging.getLogger(__name__)
 # ── Paths ──
 DATA_DISK = '/root/autodl-tmp'
 PROCESSED_DIR = os.path.join(DATA_DISK, 'data', 'processed')
-TOKEN_DIR = os.path.join(PROCESSED_DIR, 'tokens_v2')
-META_DIR = os.path.join(PROCESSED_DIR, 'metadata_v2')
-MANIFEST_DIR = os.path.join(PROCESSED_DIR, 'manifests_v2')
-STATE_FILE = os.path.join(PROCESSED_DIR, 'conversion_state_v2.json')
+TOKEN_DIR = os.path.join(PROCESSED_DIR, 'tokens_v3')
+META_DIR = os.path.join(PROCESSED_DIR, 'metadata_v3')
+MANIFEST_DIR = os.path.join(PROCESSED_DIR, 'manifests_v3')
+STATE_FILE = os.path.join(PROCESSED_DIR, 'conversion_state_v3.json')
 PID_LOCK_PATH = os.path.join(PROCESSED_DIR, 'preprocess.lock')
 os.makedirs(TOKEN_DIR, exist_ok=True)
 os.makedirs(META_DIR, exist_ok=True)
@@ -58,13 +58,13 @@ PER_FILE_TIMEOUT = 120
 
 # ── MIDI datasets ──
 MIDI_DIRS = [
-    '/root/autodl-tmp/bread-midi-dataset',
-    '/root/autodl-tmp/lmd_full',
-    '/root/autodl-tmp/aria-midi-v1-pruned-ext',
-    '/root/autodl-tmp/maestro-v3.0.0',
-    '/root/autodl-tmp/musicnet_midis',
-    '/root/autodl-tmp/POP909',
-    '/root/autodl-tmp/giant-midi-repo',
+    '/root/autodl-tmp/data/raw/MIDI/bread-midi-dataset',
+    '/root/autodl-tmp/data/raw/MIDI/lmd_full',
+    '/root/autodl-tmp/data/raw/MIDI/aria-midi-v1-pruned-ext',
+    '/root/autodl-tmp/data/raw/MIDI/maestro-v3.0.0',
+    '/root/autodl-tmp/data/raw/MIDI/musicnet_midis',
+    '/root/autodl-tmp/data/raw/MIDI/POP909',
+    '/root/autodl-tmp/data/raw/MIDI/giant-midi-repo',
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -375,7 +375,7 @@ def regenerate_splits(token_files: list, processed_dir: str, data_disk: str) -> 
     with open(all_path, 'w', encoding='utf-8') as f:
         for fp in token_files:
             rel = os.path.relpath(fp, os.path.join(data_disk, 'data'))
-            f.write(f'data/processed/{rel}\n')
+            f.write(f'data/{rel}\n')
 
     random.seed(42)
     shuffled = list(token_files)
@@ -394,7 +394,7 @@ def regenerate_splits(token_files: list, processed_dir: str, data_disk: str) -> 
         with open(path, 'w', encoding='utf-8') as f:
             for fp in files:
                 rel = os.path.relpath(fp, os.path.join(data_disk, 'data'))
-                f.write(f'data/processed/{rel}\n')
+                f.write(f'data/{rel}\n')
 
     return {'total': n, 'train': n_train, 'val': n_val, 'test': n - n_train - n_val}
 

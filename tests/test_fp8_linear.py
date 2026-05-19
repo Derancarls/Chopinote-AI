@@ -55,34 +55,36 @@ class TestFP8LinearFn:
         bias = torch.randn(N, dtype=torch.float32, device='cuda')
         sx = compute_scale(x)
         sw = compute_scale(w)
-        return x, w, bias, sx, sw
+        w_fp8_fwd = (w.T.float() / sw).to(torch.float8_e4m3fn)
+        w_fp8_bwd = (w.T.contiguous().T.float() / sw).to(torch.float8_e4m3fn)
+        return x, w, w_fp8_fwd, w_fp8_bwd, bias, sx, sw
 
     def test_forward_shape(self):
-        x, w, bias, sx, sw = self._make_inputs(M=64, K=128, N=256)
-        out = FP8LinearFn.apply(x, w, bias, sx, sw)
+        x, w, w_fwd, w_bwd, bias, sx, sw = self._make_inputs(M=64, K=128, N=256)
+        out = FP8LinearFn.apply(x, w_fwd, w_bwd, w, bias, sx, sw)
         assert out.shape == (64, 256), f"Expected (64, 256), got {out.shape}"
         assert out.dtype == torch.bfloat16
 
     def test_forward_no_bias(self):
-        x, w, _, sx, sw = self._make_inputs(M=64, K=128, N=256)
-        out = FP8LinearFn.apply(x, w, None, sx, sw)
+        x, w, w_fwd, w_bwd, _, sx, sw = self._make_inputs(M=64, K=128, N=256)
+        out = FP8LinearFn.apply(x, w_fwd, w_bwd, w, None, sx, sw)
         assert out.shape == (64, 256)
 
     @pytest.mark.parametrize("M", [1, 16, 2048])
     @pytest.mark.parametrize("K", [128, 2048])
     @pytest.mark.parametrize("N", [128, 2048])
     def test_forward_various_shapes(self, M, K, N):
-        x, w, bias, sx, sw = self._make_inputs(M=M, K=K, N=N)
-        out = FP8LinearFn.apply(x, w, bias, sx, sw)
+        x, w, w_fwd, w_bwd, bias, sx, sw = self._make_inputs(M=M, K=K, N=N)
+        out = FP8LinearFn.apply(x, w_fwd, w_bwd, w, bias, sx, sw)
         assert out.shape == (M, N)
 
     def test_backward_gradients_exist(self):
-        x, w, bias, sx, sw = self._make_inputs(M=64, K=128, N=32)
+        x, w, w_fwd, w_bwd, bias, sx, sw = self._make_inputs(M=64, K=128, N=32)
         x.requires_grad = True
         w.requires_grad = True
         bias.requires_grad = True
 
-        out = FP8LinearFn.apply(x, w, bias, sx, sw)
+        out = FP8LinearFn.apply(x, w_fwd, w_bwd, w, bias, sx, sw)
         loss = out.sum()
         loss.backward()
 
@@ -94,11 +96,11 @@ class TestFP8LinearFn:
         assert bias.grad.shape == bias.shape
 
     def test_backward_grad_shape(self):
-        x, w, bias, sx, sw = self._make_inputs(M=16, K=64, N=32)
+        x, w, w_fwd, w_bwd, bias, sx, sw = self._make_inputs(M=16, K=64, N=32)
         x.requires_grad = True
         w.requires_grad = True
 
-        out = FP8LinearFn.apply(x, w, bias, sx, sw)
+        out = FP8LinearFn.apply(x, w_fwd, w_bwd, w, bias, sx, sw)
         loss = out.sum()
         loss.backward()
 
@@ -106,11 +108,11 @@ class TestFP8LinearFn:
         assert w.grad.shape == (32, 64), f"Expected (32,64), got {w.grad.shape}"
 
     def test_backward_bf16_dtype(self):
-        x, w, bias, sx, sw = self._make_inputs(M=16, K=64, N=32)
+        x, w, w_fwd, w_bwd, bias, sx, sw = self._make_inputs(M=16, K=64, N=32)
         x.requires_grad = True
         w.requires_grad = True
 
-        out = FP8LinearFn.apply(x, w, bias, sx, sw)
+        out = FP8LinearFn.apply(x, w_fwd, w_bwd, w, bias, sx, sw)
         loss = out.sum()
         loss.backward()
 
@@ -118,11 +120,11 @@ class TestFP8LinearFn:
         assert w.grad.dtype == torch.bfloat16
 
     def test_backward_no_bias(self):
-        x, w, _, sx, sw = self._make_inputs(M=16, K=64, N=32)
+        x, w, w_fwd, w_bwd, _, sx, sw = self._make_inputs(M=16, K=64, N=32)
         x.requires_grad = True
         w.requires_grad = True
 
-        out = FP8LinearFn.apply(x, w, None, sx, sw)
+        out = FP8LinearFn.apply(x, w_fwd, w_bwd, w, None, sx, sw)
         loss = out.sum()
         loss.backward()
 
@@ -198,9 +200,11 @@ class TestFP8LinearModule:
         for _ in range(10):
             x = torch.randn(32, 128, dtype=torch.bfloat16, device='cuda')
             layer._update_scales(x)
-            layer._scale_w = compute_scale(layer.weight)
-            out = FP8LinearFn.apply(x, layer.weight, layer.bias,
-                                     layer._scale_x, layer._scale_w)
+            sw = compute_scale(layer.weight)
+            w_fwd = (layer.weight.T.float() / sw).to(torch.float8_e4m3fn)
+            w_bwd = (layer.weight.T.contiguous().T.float() / sw).to(torch.float8_e4m3fn)
+            out = FP8LinearFn.apply(x, w_fwd, w_bwd, layer.weight, layer.bias,
+                                     layer._scale_x, sw)
             assert torch.isfinite(out).all(), f"NaN at iteration {_}"
 
     def test_backward_fp8(self):
@@ -233,10 +237,12 @@ class TestFP8LinearModule:
         x = torch.randn(64, 256, dtype=torch.bfloat16, device='cuda')
         # warmup: 用同一个 x 初始化 scales，使 FP8 路径使用正确的 scales
         layer_fp8._update_scales(x)
-        layer_fp8._scale_w = compute_scale(layer_fp8.weight)
+        sw = compute_scale(layer_fp8.weight)
+        w_fwd = (layer_fp8.weight.T.float() / sw).to(torch.float8_e4m3fn)
+        w_bwd = (layer_fp8.weight.T.contiguous().T.float() / sw).to(torch.float8_e4m3fn)
         layer_fp8.use_fp8 = True
-        out_fp8 = FP8LinearFn.apply(x, layer_fp8.weight, layer_fp8.bias,
-                                     layer_fp8._scale_x, layer_fp8._scale_w)
+        out_fp8 = FP8LinearFn.apply(x, w_fwd, w_bwd, layer_fp8.weight, layer_fp8.bias,
+                                     layer_fp8._scale_x, sw)
         out_bf16 = layer_bf16(x)
 
         sim = cosine_sim(out_fp8, out_bf16)
@@ -256,9 +262,11 @@ class TestFP8LinearModule:
 
         # FP8 forward/backward with fresh scales
         layer_fp8._update_scales(x.detach())
-        layer_fp8._scale_w = compute_scale(layer_fp8.weight)
-        out_fp8 = FP8LinearFn.apply(x, layer_fp8.weight, layer_fp8.bias,
-                                     layer_fp8._scale_x, layer_fp8._scale_w)
+        sw = compute_scale(layer_fp8.weight)
+        w_fwd = (layer_fp8.weight.T.float() / sw).to(torch.float8_e4m3fn)
+        w_bwd = (layer_fp8.weight.T.contiguous().T.float() / sw).to(torch.float8_e4m3fn)
+        out_fp8 = FP8LinearFn.apply(x, w_fwd, w_bwd, layer_fp8.weight, layer_fp8.bias,
+                                     layer_fp8._scale_x, sw)
         out_fp8.sum().backward()
         grad_x_fp8 = x.grad.clone()
         grad_w_fp8 = layer_fp8.weight.grad.clone()

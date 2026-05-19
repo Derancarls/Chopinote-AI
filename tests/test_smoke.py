@@ -25,7 +25,7 @@ class TestTokenizerSmoke:
     def test_import_and_init(self):
         from chopinote_dataset.tokenizer import REMITokenizer
         t = REMITokenizer()
-        assert t.vocab_size == 872
+        assert t.vocab_size == 886
 
     def test_tokenize_detokenize_roundtrip(self, tokenizer):
         events = [
@@ -319,9 +319,9 @@ class TestConfigSmoke:
     def test_model_config_default(self):
         from chopinote_model.config import ModelConfig
         c = ModelConfig()
-        assert c.vocab_size == 872
+        assert c.vocab_size == 886
         assert c.d_model == 2048
-        assert c.n_layers == 20
+        assert c.n_layers == 24
 
     def test_training_config_default(self):
         from chopinote_model.config import TrainingConfig

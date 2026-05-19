@@ -69,19 +69,17 @@ class FastMIDIToREMI:
         """
         if not os.path.exists(file_path):
             logger.error(f"File not found: {file_path}")
-            return ([], {}) if collect_metadata else []
+            return [], {}
 
         try:
             mid = mido.MidiFile(file_path)
         except Exception as e:
             logger.error(f"Failed to parse MIDI {file_path}: {e}")
-            return ([], {}) if collect_metadata else []
+            return [], {}
 
         events = self._mid_to_events(mid)
         if not events:
-            if collect_metadata:
-                return [], {}
-            return []
+            return [], {}
 
         full_events = [(self.BOS, None)] + events + [(self.EOS, None)]
 
@@ -478,6 +476,7 @@ class FastMIDIToREMI:
                 # Rest token: beat position with no notes from any channel
                 if not pos_notes.get(pos):
                     events.append((self.REST, None))
+                    events.append((self.DURATION, 1))
 
                 # Sustained pedal events at this position
                 for action in pedal_at_pos.get((m, pos), []):
@@ -504,6 +503,8 @@ class FastMIDIToREMI:
                     if is_grace:
                         events.append((self.GRACE_NOTE, 'grace'))
                         events.append((self.NOTE_ON, interval))
+                        events.append((self.VELOCITY, vel_level))
+                        events.append((self.DURATION, 1))  # grace note fixed 1 grid
                     else:
                         events.append((self.NOTE_ON, interval))
                         events.append((self.VELOCITY, vel_level))
@@ -643,8 +644,8 @@ def process_midi_file_fast(file_path: str, output_dir: str,
 
     # Generate file paths
     fid = generate_file_id(file_path)
-    token_path = os.path.join(output_dir, "tokens_v2", f"{fid}.tokens")
-    meta_path = os.path.join(output_dir, "metadata_v2", f"{fid}.meta.json")
+    token_path = os.path.join(output_dir, "tokens_v3", f"{fid}.tokens")
+    meta_path = os.path.join(output_dir, "metadata_v3", f"{fid}.meta.json")
     os.makedirs(os.path.dirname(token_path), exist_ok=True)
     os.makedirs(os.path.dirname(meta_path), exist_ok=True)
 

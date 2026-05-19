@@ -165,11 +165,11 @@ def extract_all_from_score(score, grid_size: int = 16,
 
     for part_idx, part in enumerate(parts):
         rest_counts[part_idx] = 0
+        measure_seq = 0  # sequential 0-based index, robust to pickup/anacrusis numbering
 
         for measure in part.getElementsByClass('Measure'):
-            mn = measure.number
-            if mn is None:
-                continue
+            mn = measure_seq
+            measure_seq += 1
 
             # Time signature
             ts = measure.timeSignature
@@ -179,8 +179,8 @@ def extract_all_from_score(score, grid_size: int = 16,
                     current_timesig = ts_str
 
             # Context snapshot
-            if mn - 1 not in contexts:
-                contexts[mn - 1] = MeasureContext(
+            if mn not in contexts:
+                contexts[mn] = MeasureContext(
                     key_name=current_key_name,
                     timesig=current_timesig,
                 )
@@ -233,7 +233,7 @@ def extract_all_from_score(score, grid_size: int = 16,
 
                 for p in pitches:
                     all_notes.append(NoteInfo(
-                        measure=mn - 1,
+                        measure=mn,
                         part_idx=part_idx,
                         midi_pitch=p,
                         position=pos,
@@ -303,18 +303,22 @@ def compare_all(orig: dict, rt: dict) -> RoundTripReport:
     report.orig_notes = len(orig_notes)
     report.rt_notes = len(rt_notes)
 
-    orig_lookup: dict = defaultdict(lambda: defaultdict(list))
+    # Compare notes by (measure, pitch) — part-order-independent.
+    # Group all parts together per measure for pitch-based matching.
+    orig_meas: dict = defaultdict(lambda: defaultdict(list))
     for ni in orig_notes:
-        orig_lookup[(ni.measure, ni.part_idx)][ni.midi_pitch].append(ni)
-    rt_lookup: dict = defaultdict(lambda: defaultdict(list))
+        orig_meas[ni.measure][ni.midi_pitch].append(ni)
+    rt_meas: dict = defaultdict(lambda: defaultdict(list))
     for ni in rt_notes:
-        rt_lookup[(ni.measure, ni.part_idx)][ni.midi_pitch].append(ni)
+        rt_meas[ni.measure][ni.midi_pitch].append(ni)
 
     jitters, dur_errs, vel_errs = [], [], []
-    for (m, p_idx), pitch_map in orig_lookup.items():
-        rt_pitch_map = rt_lookup.get((m, p_idx), {})
-        for pitch, o_list in pitch_map.items():
-            r_list = rt_pitch_map.get(pitch, [])
+    all_measures = sorted(set(list(orig_meas.keys()) + list(rt_meas.keys())))
+    for m in all_measures:
+        orig_pitches = orig_meas.get(m, {})
+        rt_pitches = rt_meas.get(m, {})
+        for pitch, o_list in orig_pitches.items():
+            r_list = rt_pitches.get(pitch, [])
             for o_note in o_list:
                 if r_list:
                     r_note = r_list.pop(0)
@@ -324,8 +328,7 @@ def compare_all(orig: dict, rt: dict) -> RoundTripReport:
                     report.note_matched += 1
                 else:
                     report.note_missed += 1
-    for (m, p_idx), pitch_map in rt_lookup.items():
-        for r_list in pitch_map.values():
+        for r_list in rt_pitches.values():
             report.note_extra += len(r_list)
 
     report.position_jitter = jitters

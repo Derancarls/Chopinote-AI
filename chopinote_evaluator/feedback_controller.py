@@ -405,12 +405,13 @@ class NarrowFeedbackController:
         profile = self.seed_profile
         block = self._b2_block_size
 
-        # 至少需要 S 节生成内容 + 排除 seed 部分
-        gen_bars = bars[1:]  # 去掉第一个空节（BOS 前的）
-        if len(gen_bars) < max(2, block):
+        # 排除 seed 小节，只评新生成内容
+        all_bars = bars[1:]  # 去掉第一个空节（BOS 前的）
+        gen_only = all_bars[profile.n_bars:]  # 去掉 seed 的 N 个小节
+        if len(gen_only) < max(2, block):
             return 0.5, {}
         # 用最近 block 节
-        window = gen_bars[-block:]
+        window = gen_only[-block:]
         flat = [t for bar in window for t in bar]
 
         window_notes = _note_on_intervals(flat, tokenizer)
