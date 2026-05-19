@@ -39,6 +39,9 @@ data/outputs/
 # 归档文件
 archives/
 
+# 测试报告产物
+roundtrip_reports/
+
 # VSCode 设置
 .vscode/
 
@@ -46,3 +49,11 @@ archives/
 __pycache__/
 *.pyc
 *.pyo
+
+# 所有 XML 文件（测试/渲染输出均不追踪）
+*.xml
+
+# 测试产物
+test_*.musicxml
+tests/output/
+*.mid

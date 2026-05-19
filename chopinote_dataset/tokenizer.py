@@ -191,15 +191,17 @@ class REMITokenizer:
 
         # ── 扩展 token 类型 ──────────────────────────────────
 
-        # <Clef treble>, <Clef bass>, <Clef alto>, <Clef tenor>
-        for clef_name in ('treble', 'bass', 'alto', 'tenor'):
+        # <Clef treble>, <Clef bass>, <Clef alto>, <Clef tenor>, <Clef soprano>,
+        # <Clef c_1>, <Clef c_2>, <Clef c_5>, <Clef percussion>
+        for clef_name in ('treble', 'bass', 'alto', 'tenor', 'soprano', 'c_1', 'c_2', 'c_5', 'percussion'):
             t = f'{self.CLEF} {clef_name}>'
             self._token_to_id[t] = idx
             self._id_to_token[idx] = t
             idx += 1
 
-        # <Dynamic ppp> .. <Dynamic fp>
-        for dyn in ('ppp', 'pp', 'p', 'mp', 'mf', 'f', 'ff', 'fff', 'sfz', 'fp'):
+        # <Dynamic pppp> .. <Dynamic sfpp>
+        for dyn in ('pppp', 'ppp', 'pp', 'p', 'mp', 'mf', 'f', 'ff', 'fff', 'ffff',
+                    'sfz', 'sfp', 'sf', 'fz', 'fp', 'rf', 'rfz', 'sffz', 'sfpp'):
             t = f'{self.DYNAMIC} {dyn}>'
             self._token_to_id[t] = idx
             self._id_to_token[idx] = t

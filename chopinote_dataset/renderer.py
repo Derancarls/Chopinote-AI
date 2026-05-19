@@ -343,9 +343,13 @@ class REMIToMusicXML:
                 (sm, sp, em, ep) for (sm, sp, em, ep, p, sb) in slur_spans
                 if (p, sb) == (prog, sub)
             ]
-            notes_for_slur: list = []  # accumulate notes for current open slur
-            slur_span_iter = iter(part_slur_spans)
-            current_slur_end: Optional[tuple] = None
+            # Position-keyed lookup for start/end
+            slur_starts: dict = defaultdict(list)
+            slur_ends: dict = defaultdict(list)
+            for sm, sp, em, ep in part_slur_spans:
+                slur_starts[(sm, sp)].append((em, ep))
+                slur_ends[(em, ep)].append((sm, sp))
+            pending_slurs: list = []  # [(end_m, end_pos, accumulated_notes), ...]
 
             for m in range(total_measures):
                 measure_obj = stream.Measure(number=m + 1)
@@ -362,7 +366,7 @@ class REMIToMusicXML:
                 key_name = parsed['key_per_measure'].get(m)
                 if key_name and key_name != last_key_name:
                     try:
-                        k = key.Key(name=key_name)
+                        k = key.Key(key_name)
                         ks = key.KeySignature(k.sharps)
                         measure_obj.append(ks)
                         last_key_name = key_name
@@ -389,6 +393,7 @@ class REMIToMusicXML:
                     notes_at_pos = [ni for ni in note_items if ni['type'] == 'note']
                     rests_at_pos = [ni for ni in note_items if ni['type'] == 'rest']
 
+                    notes_created: list = []  # note objects for slur accumulation
                     if notes_at_pos:
                         # Grace notes first
                         grace_notes = [n for n in notes_at_pos if n.get('grace_type')]
@@ -403,14 +408,9 @@ class REMIToMusicXML:
                                 ni = regular_notes[0]
                                 n = self._make_note(ni, offset)
                                 measure_obj.append(n)
+                                notes_created.append(n)
                                 if ni.get('tuplet'):
                                     _apply_tuplet(n, ni['tuplet'])
-                                # Slur tracking
-                                if current_slur_end is None and notes_for_slur:
-                                    # just accumulate
-                                    notes_for_slur.append(n)
-                                elif current_slur_end is not None:
-                                    notes_for_slur.append(n)
                             else:
                                 c = chord.Chord(
                                     [ni['pitch'] for ni in regular_notes],
@@ -433,28 +433,24 @@ class REMIToMusicXML:
                                     except Exception:
                                         pass
                                 measure_obj.append(c)
+                                notes_created.append(c)
 
-                    # Slur start/end check (independent of notes/rests)
-                    try:
-                        sm, sp, em, ep = next(slur_span_iter)
-                        if (sm, sp) == (m, pos):
-                            current_slur_end = (em, ep)
-                            notes_for_slur = []
-                        if current_slur_end == (m, pos) and (sm, sp) != (m, pos):
-                            if len(notes_for_slur) >= 2:
-                                s = spanner.Slur(notes_for_slur)
-                                measure_obj.insert(offset, s)
-                            notes_for_slur = []
-                            current_slur_end = None
-                    except StopIteration:
-                        pass
-
-                    # Track note objects for active slur
-                    if current_slur_end is not None and notes_at_pos:
-                        for el in measure_obj.flatten().notesAndRests:
-                            if isinstance(el, (note.Note, chord.Chord)):
-                                if el.offset == offset:
-                                    notes_for_slur.append(el)
+                    # Slur starts
+                    for em, ep in slur_starts.get((m, pos), []):
+                        pending_slurs.append((em, ep, []))
+                    # Accumulate note objects into all pending slurs
+                    for n_obj in notes_created:
+                        for _, _, acc in pending_slurs:
+                            acc.append(n_obj)
+                    # Slur ends
+                    for sm, sp in slur_ends.get((m, pos), []):
+                        for i, (em2, ep2, acc) in enumerate(pending_slurs):
+                            if (em2, ep2) == (m, pos):
+                                if len(acc) >= 2:
+                                    s = spanner.Slur(acc)
+                                    measure_obj.insert(offset, s)
+                                pending_slurs.pop(i)
+                                break
 
                     if rests_at_pos:
                         ri = rests_at_pos[0]

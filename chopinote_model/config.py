@@ -7,7 +7,7 @@ from typing import List, Optional, Set
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
-    vocab_size: int = 872
+    vocab_size: int = 886
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 32
@@ -76,8 +76,11 @@ class TokenLossMask:
         for attr, prefix in prefix_map.items():
             if getattr(self, attr):
                 for token_str, token_id in tokenizer._token_to_id.items():
-                    if token_str.startswith(prefix) or token_str == REMITokenizer.TUPLET_END:
+                    if token_str.startswith(prefix):
                         masked_ids.add(token_id)
+        # mask_tuplet 控制 TupletStart 和 TupletEnd 两个 token
+        if self.mask_tuplet:
+            masked_ids.add(tokenizer.encode_token(REMITokenizer.TUPLET_END))
         return masked_ids
 
 

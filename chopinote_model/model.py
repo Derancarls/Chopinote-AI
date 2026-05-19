@@ -79,16 +79,18 @@ class CausalSelfAttention(nn.Module):
 
         if kv_cache is not None and kv_cache[0] is not None:
             cache_len = kv_cache[0].size(2)
-            k = torch.cat([kv_cache[0], k], dim=2)
+            k_new = self._apply_rope(k, self._rope_cos[cache_len:cache_len + T],
+                                      self._rope_sin[cache_len:cache_len + T])
+            k = torch.cat([kv_cache[0], k_new], dim=2)
             v = torch.cat([kv_cache[1], v], dim=2)
         else:
             cache_len = 0
+            k = self._apply_rope(k, self._rope_cos[:T], self._rope_sin[:T])
 
         T_kv = k.size(2)
 
         q = self._apply_rope(q, self._rope_cos[cache_len:cache_len + T],
                              self._rope_sin[cache_len:cache_len + T])
-        k = self._apply_rope(k, self._rope_cos[:T_kv], self._rope_sin[:T_kv])
 
         if kv_cache is not None:
             kv_cache[0] = k
@@ -135,9 +137,8 @@ class TransformerBlock(nn.Module):
                 kv_cache: Optional[list] = None) -> torch.Tensor:
         need_ckpt = self.use_checkpointing and kv_cache is None and self.training
         if need_ckpt:
-            _reentrant = self.attn.qkv.use_fp8
             x = torch.utils.checkpoint.checkpoint(
-                self._forward, x, mask, None, use_reentrant=_reentrant)
+                self._forward, x, mask, None, use_reentrant=True)
         else:
             x = self._forward(x, mask, kv_cache)
         return x

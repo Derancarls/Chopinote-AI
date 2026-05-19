@@ -128,8 +128,11 @@ class FP8Linear(nn.Module):
         self._w_fp8_bwd = (self.weight.T.contiguous().T.float() / self._scale_w).to(torch.float8_e4m3fn)
         self._weight_version = wv
 
+    def _fp8_compatible(self) -> bool:
+        return self.in_features % 16 == 0 and self.out_features % 16 == 0
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.use_fp8:
+        if not self.use_fp8 or not self._fp8_compatible():
             self._update_scales(x)
             target_dtype = self.weight.dtype
             bias = self.bias.to(target_dtype) if self.bias is not None else None

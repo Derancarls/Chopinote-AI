@@ -111,7 +111,7 @@ class _BaseREMI:
                 # ──────────────────────────────────────────────
 
             if pos != cur_pos:
-                pos = min(pos, self.grid_size - 1)
+                pos = max(0, min(pos, self.grid_size - 1))
                 events.append((REMITokenizer.POSITION, pos))
                 cur_pos = pos
                 cur_program = -1
@@ -197,7 +197,7 @@ class MusicXMLToREMI(_BaseREMI):
         return self._tokenize_events(events, collect_metadata)
 
     def _clef_name(self, c) -> str:
-        """Clef 对象 → 规范名称 (treble/bass/alto/tenor)。"""
+        """Clef 对象 → 规范名称 (treble/bass/alto/tenor/soprano/c_N/percussion)。"""
         sign = c.sign.lower()
         line = c.line if c.line is not None else 2
         if sign == 'g':
@@ -208,7 +208,7 @@ class MusicXMLToREMI(_BaseREMI):
             return 'alto' if line == 3 else 'tenor' if line == 4 else f'c_{line}'
         elif sign == 'percussion':
             return 'percussion'
-        return sign
+        return 'treble'  # unknown → treble (safest default)
 
     def _score_to_events(self, score) -> List[Tuple[str, Optional[int]]]:
         """music21 Score → REMI 事件列表。"""
@@ -217,12 +217,17 @@ class MusicXMLToREMI(_BaseREMI):
             return []
 
         # ── 调号提取 ──────────────────────────────────────────
-        from music21 import key
+        from music21 import key as m21key
         key_name: Optional[str] = None
-        key_objs = score.flatten().getElementsByClass(key.Key)
+        key_objs = score.flatten().getElementsByClass(m21key.Key)
         if key_objs:
             k = key_objs[0]
             key_name = k.tonic.name + ('m' if k.mode == 'minor' else '')
+        if key_name is None:
+            ks_objs = score.flatten().getElementsByClass(m21key.KeySignature)
+            if ks_objs:
+                k = ks_objs[0].asKey()
+                key_name = k.tonic.name + ('m' if k.mode == 'minor' else '')
         tonic_midi = key_name_to_tonic_midi(key_name)
         # ──────────────────────────────────────────────────────
 
@@ -264,6 +269,90 @@ class MusicXMLToREMI(_BaseREMI):
         all_grace_notes: List[Tuple[int, int, int, str, int, int, int]] = []  # (m, pos, part, gtype, pitch, vel, dur)
         last_timesig: Optional[str] = None
 
+        # ── 收集 Spanner 类标记（不在 measure.flatten 中）───
+        def _get_measure_pos(elem, part, quarter_per_position, grid_size):
+            """Find (measure_idx, position) for a spanner anchor element."""
+            ctx = elem.getContextByClass('Measure')
+            if ctx is None:
+                return None
+            if isinstance(ctx, list):
+                ctx = ctx[0] if ctx else None
+            if ctx is None:
+                return None
+            # Find measure index
+            measures = list(part.getElementsByClass('Measure'))
+            for mi, m in enumerate(measures):
+                if m is ctx:
+                    measure_dur = m.duration.quarterLength
+                    if measure_dur <= 0:
+                        return None
+                    max_pos = grid_size - 1
+                    positions_in_measure = max(1, int(measure_dur / quarter_per_position))
+                    pos = min(max_pos, min(positions_in_measure - 1,
+                              int(round(elem.offset / quarter_per_position))))
+                    return (mi, pos)
+            return None
+
+        for part_idx, part in enumerate(parts):
+            part_flat = part.flatten()
+
+            # 连奏线 — emit both start and end
+            for sl in part_flat.getElementsByClass(spanner.Slur):
+                for anchor, sval in [(sl.getFirst(), 'start'), (sl.getLast(), 'end')]:
+                    if anchor is None:
+                        continue
+                    mp = _get_measure_pos(anchor, part, self.quarter_per_position, self.grid_size)
+                    if mp:
+                        extra.append((mp[0], mp[1], part_idx,
+                                      REMITokenizer.SLUR, sval))
+
+            # 渐强/渐弱 (hairpin)
+            for h in part_flat.getElementsByClass(dynamics.Crescendo):
+                anchor = h.getFirst()
+                if anchor is None:
+                    continue
+                mp = _get_measure_pos(anchor, part, self.quarter_per_position, self.grid_size)
+                if mp:
+                    extra.append((mp[0], mp[1], part_idx, REMITokenizer.HAIRPIN, 'cresc'))
+            for h in part_flat.getElementsByClass(dynamics.Diminuendo):
+                anchor = h.getFirst()
+                if anchor is None:
+                    continue
+                mp = _get_measure_pos(anchor, part, self.quarter_per_position, self.grid_size)
+                if mp:
+                    extra.append((mp[0], mp[1], part_idx, REMITokenizer.HAIRPIN, 'dim'))
+
+            # 八度记号
+            for o in part_flat.getElementsByClass(spanner.Ottava):
+                ott_type = o.type  # '8va', '8vb', '15ma', '15mb'
+                if ott_type not in ('8va', '8vb', '15ma', '15mb'):
+                    ott_type = '8va'  # 罕见类型 (22da/22db) fallback
+                for anchor, otype in [(o.getFirst(), ott_type),
+                                       (o.getLast(), 'end')]:
+                    if anchor is None:
+                        continue
+                    mp = _get_measure_pos(anchor, part, self.quarter_per_position, self.grid_size)
+                    if mp:
+                        extra.append((mp[0], mp[1], part_idx,
+                                      REMITokenizer.OCTAVE, otype))
+
+            # 踏板
+            for p_mark in part_flat.getElementsByClass(expressions.PedalMark):
+                ped_type = getattr(p_mark, 'type', 'start')
+                if ped_type in ('start', 0):
+                    elem = p_mark.getFirst()
+                    ped_event = 'start'
+                else:
+                    elem = p_mark.getLast()
+                    ped_event = 'end'
+                if elem is None:
+                    continue
+                mp = _get_measure_pos(elem, part, self.quarter_per_position, self.grid_size)
+                if mp:
+                    extra.append((mp[0], mp[1], part_idx,
+                                  REMITokenizer.PEDAL, ped_event))
+
+        # ── 逐小节提取 ────────────────────────────────────────
         for part_idx, part in enumerate(parts):
             for measure_idx, measure in enumerate(part.getElementsByClass('Measure')):
                 measure_dur = measure.duration.quarterLength
@@ -286,16 +375,12 @@ class MusicXMLToREMI(_BaseREMI):
 
                     # 力度记号 (pp, ff 等)
                     elif isinstance(elem, dynamics.Dynamic):
-                        extra.append((measure_idx, pos, part_idx,
-                                      REMITokenizer.DYNAMIC, elem.value))
-
-                    # 渐强/渐弱记号 (hairpin)
-                    elif isinstance(elem, dynamics.Crescendo):
-                        extra.append((measure_idx, pos, part_idx,
-                                      REMITokenizer.HAIRPIN, 'cresc'))
-                    elif isinstance(elem, dynamics.Diminuendo):
-                        extra.append((measure_idx, pos, part_idx,
-                                      REMITokenizer.HAIRPIN, 'dim'))
+                        dyn_val = elem.value if hasattr(elem, 'value') else ''
+                        if dyn_val == 'other-dynamics':
+                            dyn_val = '' if elem.otherDynamic is None else str(elem.otherDynamic)
+                        if dyn_val and dyn_val != 'r':
+                            extra.append((measure_idx, pos, part_idx,
+                                          REMITokenizer.DYNAMIC, dyn_val))
 
                     # 速度标记
                     elif isinstance(elem, tempo.MetronomeMark):
@@ -331,26 +416,6 @@ class MusicXMLToREMI(_BaseREMI):
                     elif isinstance(elem, spanner.RepeatBracket):
                         extra.append((measure_idx, 0, part_idx,
                                       REMITokenizer.REPEAT, f'volta_{elem.number}'))
-
-                    # 踏板
-                    elif isinstance(elem, expressions.PedalMark):
-                        ped_type = 'start' if getattr(elem, 'type', 0) in (0, 'start') else 'end'
-                        extra.append((measure_idx, pos, part_idx,
-                                      REMITokenizer.PEDAL, ped_type))
-
-                    # 连奏线
-                    elif isinstance(elem, spanner.Slur):
-                        slur_type = 'start' if getattr(elem, 'type', 'start') == 'start' else 'end'
-                        extra.append((measure_idx, pos, part_idx,
-                                      REMITokenizer.SLUR, slur_type))
-
-                    # 八度记号
-                    elif isinstance(elem, spanner.Ottava):
-                        shift = getattr(elem, 'shift', 8)
-                        ott_type = getattr(elem, 'type', 'alta')  # 'alta' or 'bassa'
-                        oct_val = f'{shift}vb' if ott_type == 'bassa' else f'{shift}va'
-                        extra.append((measure_idx, pos, part_idx,
-                                      REMITokenizer.OCTAVE, oct_val))
 
                     # 延长记号
                     elif isinstance(elem, expressions.Fermata):
@@ -517,14 +582,14 @@ class PDMXToREMI(_BaseREMI):
         """加载 PDMX JSON 文件并转换为 token ID 序列。"""
         if not os.path.exists(file_path):
             logger.error(f"文件不存在: {file_path}")
-            return ([], {}) if collect_metadata else []
+            return [], {}
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 pdmx_data = json.load(f)
         except Exception as e:
             logger.error(f"解析 PDMX JSON 失败 {file_path}: {e}")
-            return ([], {}) if collect_metadata else []
+            return [], {}
 
         return self._convert_pdmx(pdmx_data, file_path, collect_metadata)
 
@@ -539,7 +604,7 @@ class PDMXToREMI(_BaseREMI):
                       collect_metadata: bool = False) -> Union[List[int], Tuple[List[int], dict]]:
         events = self._pdmx_to_events(data)
         if not events:
-            return ([], {}) if collect_metadata else []
+            return [], {}
         if collect_metadata:
             md = data.get('metadata', {})
             extra_meta = {
@@ -564,6 +629,7 @@ class PDMXToREMI(_BaseREMI):
             root = first.get('root_str', 'C')
             if not isinstance(root, str):
                 root = 'C'
+            root = root.replace('-', 'b').replace('♭', 'b').replace('♯', '#')
             key_name = root + ('m' if first.get('mode') == 'minor' else '')
         tonic_midi = key_name_to_tonic_midi(key_name)
         # ──────────────────────────────────────────────────────
@@ -574,6 +640,7 @@ class PDMXToREMI(_BaseREMI):
             root = ks.get('root_str', 'C')
             if not isinstance(root, str):
                 root = 'C'
+            root = root.replace('-', 'b').replace('♭', 'b').replace('♯', '#')
             ks_key = root + ('m' if ks.get('mode') == 'minor' else '')
             ks_measure = max(0, ks.get('measure', 1) - 1)
             if not key_changes or ks_key != key_changes[-1][1]:
@@ -617,6 +684,7 @@ class PDMXToREMI(_BaseREMI):
         part_program_map: Dict[int, Tuple[int, int]] = {}
         for p_idx, trk in enumerate(data.get('tracks', [])):
             prog = trk.get('program', 0)
+            prog = min(int(prog), 127)
             sub_cnt = program_counts.get(prog, 0)
             sub = sub_cnt if sub_cnt < self.tokenizer.MAX_SUBTRACKS else 0
             part_program_map[p_idx] = (prog, sub)
@@ -669,9 +737,11 @@ class PDMXToREMI(_BaseREMI):
             'trill': 'trill',
         }
         _DYN_MAP = {
-            'ppp': 'ppp', 'pp': 'pp', 'p': 'p', 'mp': 'mp', 'mf': 'mf',
-            'f': 'f', 'ff': 'ff', 'fff': 'fff',
-            'sfz': 'sfz', 'rfz': 'sfz', 'fp': 'fp',
+            'pppp': 'pppp', 'ppp': 'ppp', 'pp': 'pp', 'p': 'p',
+            'mp': 'mp', 'mf': 'mf', 'f': 'f', 'ff': 'ff', 'fff': 'fff', 'ffff': 'ffff',
+            'sfz': 'sfz', 'sfp': 'sfp', 'sf': 'sf', 'fz': 'fz',
+            'rf': 'rf', 'rfz': 'rfz', 'sffz': 'sffz', 'sfpp': 'sfpp',
+            'fp': 'fp',
         }
 
         def _ann_end_mp(et):
@@ -816,11 +886,23 @@ class PDMXToREMI(_BaseREMI):
                                (REMITokenizer.REPEAT, 'end')))
 
         # ── 5.7 Rest 生成（拍位无音符的空位） ─────────────────
-        occupied: Dict[int, set] = {}
+        occupied_ranges: Dict[int, List[Tuple[int, int]]] = {}
         for item in merged:
             kd = item[5]
             if kd in ('n', 'g'):
-                occupied.setdefault(item[0], set()).add(item[1])
+                m_idx = item[0]
+                start = item[1]
+                data = item[6]
+                # 'n' data = (pitch, vel, dur), 'g' data = ('grace', pitch, vel, dur)
+                dur = data[-1] if data else 1
+                occupied_ranges.setdefault(m_idx, []).append((start, start + dur))
+
+        def _pos_occupied(m: int, pos: int, span: int) -> bool:
+            for s, e in occupied_ranges.get(m, []):
+                if s < pos + span and e > pos:
+                    return True
+            return False
+
         for m in range(max_measure + 1):
             ts_str = measure_ts.get(m, '4/4')
             parts_ts = ts_str.split('/')
@@ -829,8 +911,10 @@ class PDMXToREMI(_BaseREMI):
             bspace = max(1, int(round(beat_int / self.quarter_per_position)))
             for bn in range(num):
                 bp = bn * bspace
-                if bp < self.grid_size and bp not in occupied.get(m, set()):
-                    merged.append((m, bp, 0, 0, 2.5, 'r', None))
+                if bp < self.grid_size:
+                    dur = min(bspace, self.grid_size - bp)
+                    if not _pos_occupied(m, bp, dur):
+                        merged.append((m, bp, 0, 0, 2.5, 'r', (dur,)))
 
         # ── 6. 排序 ──────────────────────────────────────────
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
@@ -852,13 +936,13 @@ class MIDIToREMI(_BaseREMI):
         """解析 MIDI 文件并转换为 REMI token ID 列表。"""
         if not os.path.exists(file_path):
             logger.error(f"File not found: {file_path}")
-            return ([], {}) if collect_metadata else []
+            return [], {}
 
         try:
             score = converter.parse(file_path)
         except Exception as e:
             logger.error(f"Failed to parse MIDI {file_path}: {e}")
-            return ([], {}) if collect_metadata else []
+            return [], {}
 
         return self._convert_score(score, file_path, collect_metadata)
 

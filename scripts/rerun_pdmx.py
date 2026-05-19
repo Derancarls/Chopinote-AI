@@ -12,13 +12,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 DATA_DIR = '/root/autodl-tmp/data/processed'
-PDMX_DIR = '/root/autodl-tmp/chopinote_data/data/raw/PDMX'
+PDMX_DIR = '/root/autodl-tmp/data/raw/PDMX/data'
 
 # ── Step 1: 清空旧的 PDMX token ──────────────────────────────
 def clean_old_pdmx():
     logger.info("清空旧 PDMX token...")
-    token_dir = f'{DATA_DIR}/tokens_v2'
-    meta_dir = f'{DATA_DIR}/metadata_v2'
+    token_dir = f'{DATA_DIR}/tokens_v3'
+    meta_dir = f'{DATA_DIR}/metadata_v3'
+    os.makedirs(token_dir, exist_ok=True)
+    os.makedirs(meta_dir, exist_ok=True)
     n = 0
     for f in os.listdir(token_dir):
         if f.startswith('Qm'):
@@ -84,7 +86,7 @@ def run_pdmx():
 
     # 验证各目录
     logger.info("按目录统计...")
-    meta_dir = f'{DATA_DIR}/metadata_v2'
+    meta_dir = f'{DATA_DIR}/metadata_v3'
     dirs = {}
     for fname in os.listdir(meta_dir):
         if not fname.startswith('Qm'):

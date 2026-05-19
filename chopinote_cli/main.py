@@ -611,23 +611,11 @@ def save_to_musicxml(
     save_tokens: bool = False,
 ):
     """将 token 序列保存为 MusicXML 文件。"""
-    from chopinote_model.generate import (
-        tokens_to_notes, notes_to_score,
-        _inject_directions_in_musicxml, _cleanup_accidentals,
-    )
+    from chopinote_dataset.renderer import REMIToMusicXML
 
-    notes = tokens_to_notes(token_ids, tokenizer)
-    score = notes_to_score(notes, grid_size=tokenizer.grid_size, max_bars=max_bars)
-    score.write('musicxml', fp=output_path)
-
-    _inject_directions_in_musicxml(
-        output_path,
-        pedal_events=getattr(score, '_pedal_events', []),
-        hairpin_events=getattr(score, '_hairpin_events', []),
-        octave_events=getattr(score, '_octave_events', []),
-        all_keys=getattr(score, '_all_keys', None),
-    )
-    _cleanup_accidentals(output_path)
+    renderer = REMIToMusicXML(grid_size=tokenizer.grid_size,
+                               velocity_levels=tokenizer.velocity_levels)
+    score = renderer.render_from_tokens(token_ids, output_path)
 
     # 保存 token 序列（用于退回重写和 DPO）
     if save_tokens and token_ids:
@@ -638,8 +626,13 @@ def save_to_musicxml(
         except OSError as e:
             logger.warning('保存 token 文件失败: %s', e)
 
-    num_bars = max(n['bar'] for n in notes) if notes else 0
-    return num_bars
+    # 计算小节数
+    parts = list(score.parts)
+    if parts:
+        num_measures = len(list(parts[0].getElementsByClass('Measure')))
+    else:
+        num_measures = 0
+    return num_measures
 
 
 # -- token 文件读写 -----------------------------------------------
