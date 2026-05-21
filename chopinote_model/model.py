@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-from .config import ModelConfig
+from .config import ModelConfig, NO_SECTION_ID, NO_SECTION_TYPE_ID
 from .fp8_linear import FP8Linear
 
 _NEG_INF = float('-inf')
@@ -238,17 +238,21 @@ class MusicTransformer(nn.Module):
         for name, p in self.named_parameters():
             if p.dim() > 1:
                 nn.init.normal_(p, mean=0.0, std=0.02)
-            elif 'bias' in name:
+            elif 'bias' in name and not name.startswith('sec_bias'):
                 nn.init.zeros_(p)
-        # section_embedding id=0 为零向量（无段落）
+        # section_embedding 的 NO_SECTION_ID 为零向量（无段落）
         if self.config.use_section_attention:
             with torch.no_grad():
-                self.section_embedding.weight[0].zero_()
+                self.section_embedding.weight[NO_SECTION_ID].zero_()
 
     def _compute_sec_bias(self, section_ids: torch.Tensor,
                           section_types: torch.Tensor,
-                          bar_positions: torch.Tensor) -> Optional[torch.Tensor]:
-        """计算段落感知注意力偏置 (B, 1, T, T)。
+                          bar_positions: torch.Tensor,
+                          query_slice: int = 0) -> Optional[torch.Tensor]:
+        """计算段落感知注意力偏置。
+
+        当 query_slice > 0 时（KV cache 模式），使用全部 section_ids 计算
+        (B, 1, T_full, T_kv) 偏置矩阵，然后只返回最后 query_slice 个 query 行。
 
         sec_bias[i][j] =
           α × same_instance(i,j)
@@ -261,23 +265,23 @@ class MusicTransformer(nn.Module):
         if section_ids is None:
             return None
 
-        B, T = section_ids.shape
+        B, T_full = section_ids.shape
         device = section_ids.device
         dtype = torch.bfloat16
 
         # 对齐维度: (B, T, 1) vs (B, 1, T) → (B, T, T)
-        sid = section_ids.unsqueeze(-1)    # (B, T, 1)
-        st = section_types.unsqueeze(-1)   # (B, T, 1)
-        bar = bar_positions.unsqueeze(-1)  # (B, T, 1)
+        sid = section_ids.unsqueeze(-1)    # (B, T_full, 1)
+        st = section_types.unsqueeze(-1)   # (B, T_full, 1)
+        bar = bar_positions.unsqueeze(-1)  # (B, T_full, 1)
 
-        same_inst = (sid == sid.transpose(-2, -1)).to(dtype)      # (B, T, T)
-        same_type = (st == st.transpose(-2, -1)).to(dtype)        # (B, T, T)
-        bar_dist = (bar - bar.transpose(-2, -1)).abs().to(dtype)  # (B, T, T)
+        same_inst = (sid == sid.transpose(-2, -1)).to(dtype)      # (B, T_full, T_full)
+        same_type = (st == st.transpose(-2, -1)).to(dtype)        # (B, T_full, T_full)
+        bar_dist = (bar - bar.transpose(-2, -1)).abs().to(dtype)  # (B, T_full, T_full)
 
         # 边界区域: 检测 section_id 变化的 bar 前后 4 小节
-        boundary_mask = self._compute_boundary_mask(section_ids, bar_positions)  # (B, T, T)
+        boundary_mask = self._compute_boundary_mask(section_ids, bar_positions)  # (B, T_full, T_full)
 
-        sec_bias = torch.zeros(B, 1, T, T, device=device, dtype=dtype)
+        sec_bias = torch.zeros(B, 1, T_full, T_full, device=device, dtype=dtype)
         sec_bias += self.sec_bias_alpha * same_inst.unsqueeze(1)
         sec_bias += self.sec_bias_beta * (~same_inst.bool() & same_type.bool()).to(dtype).unsqueeze(1)
         sec_bias -= self.sec_bias_gamma * (~same_type.bool()).to(dtype).unsqueeze(1)
@@ -287,7 +291,11 @@ class MusicTransformer(nn.Module):
         decay = torch.exp(-bar_dist.unsqueeze(1) / self.sec_bias_decay_len)
         sec_bias = sec_bias * decay
 
-        return sec_bias  # (B, 1, T, T)
+        # KV cache 模式: 只返回最后 query_slice 个 query 行
+        if query_slice > 0 and query_slice < T_full:
+            sec_bias = sec_bias[:, :, -query_slice:, :]  # (B, 1, query_slice, T_full)
+
+        return sec_bias
 
     def _compute_boundary_mask(self, section_ids: torch.Tensor,
                                 bar_positions: torch.Tensor) -> torch.Tensor:
@@ -347,6 +355,7 @@ class MusicTransformer(nn.Module):
             measure_ids = torch.cumsum(bar_mask, dim=1).clamp(0, self.config.max_measures)
         elif measure_ids.ndim == 1:
             measure_ids = measure_ids.unsqueeze(0)
+        measure_ids_full = measure_ids  # 保存完整历史，用于 sec_bias 计算
         if measure_ids.size(1) > T:
             measure_ids = measure_ids[:, -T:]
         x = x + self.measure_embedding(measure_ids)
@@ -359,17 +368,28 @@ class MusicTransformer(nn.Module):
                 section_ids = section_ids.unsqueeze(0)
             if section_types.ndim == 1:
                 section_types = section_types.unsqueeze(0)
-            if section_ids.size(1) > T:
-                section_ids = section_ids[:, -T:]
-            if section_types.size(1) > T:
-                section_types = section_types[:, -T:]
 
-            x = x + self.section_embedding(section_ids)
-            x = x + self.section_type_embedding(section_types)
+            # 保留完整历史用于 sec_bias 计算（KV cache 模式下可能 > T）
+            section_ids_full = section_ids
+            section_types_full = section_types
+            # measure_ids_full 已在上方保存，用于 sec_bias 的 bar 位置计算
+
+            # 截取当前输入对应的部分用于 embedding
+            sec_ids_emb = section_ids[:, -T:]
+            sec_types_emb = section_types[:, -T:]
+            x = x + self.section_embedding(sec_ids_emb)
+            x = x + self.section_type_embedding(sec_types_emb)
 
             # 计算段落注意力偏置
-            if kv_caches is None:
-                sec_bias = self._compute_sec_bias(section_ids, section_types, measure_ids)
+            in_kv_decode = kv_caches is not None and kv_caches[0] is not None and kv_caches[0][0] is not None
+            if in_kv_decode:
+                sec_bias = self._compute_sec_bias(
+                    section_ids_full, section_types_full, measure_ids_full, query_slice=T)
+            else:
+                # Prefill: section_ids 与输入对齐
+                sec_bias = self._compute_sec_bias(
+                    section_ids_full[:, -T:], section_types_full[:, -T:],
+                    measure_ids_full[:, -T:], query_slice=0)
 
         x = self.dropout(x)
 

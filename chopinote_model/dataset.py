@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 from torch.utils.data import Dataset, DataLoader
+from .config import NO_SECTION_ID, NO_SECTION_TYPE_ID
 
 
 class TokenDataset(Dataset):
@@ -170,8 +171,8 @@ class TokenDataset(Dataset):
                 sec_types = torch.tensor(
                     sec_types_all[start:start + T + 1][:-1], dtype=torch.long)
             else:
-                sec_ids = torch.zeros(T, dtype=torch.long)
-                sec_types = torch.zeros(T, dtype=torch.long)
+                sec_ids = torch.full((T,), NO_SECTION_ID, dtype=torch.long)
+                sec_types = torch.full((T,), NO_SECTION_TYPE_ID, dtype=torch.long)
 
             # 构建段落预测目标数组（仅在 Section token 位置有效）
             sec_bars_target = torch.full((T,), -1, dtype=torch.long)
@@ -188,8 +189,8 @@ class TokenDataset(Dataset):
                     sec_keys_target[local_pos] = attr.get('key', -1)
                     sec_types_target[local_pos] = attr.get('type', -1)
         else:
-            sec_ids = torch.zeros(T, dtype=torch.long)
-            sec_types = torch.zeros(T, dtype=torch.long)
+            sec_ids = torch.full((T,), NO_SECTION_ID, dtype=torch.long)
+            sec_types = torch.full((T,), NO_SECTION_TYPE_ID, dtype=torch.long)
             sec_bars_target = torch.full((T,), -1, dtype=torch.long)
             sec_keys_target = torch.full((T,), -1, dtype=torch.long)
             sec_types_target = torch.full((T,), -1, dtype=torch.long)

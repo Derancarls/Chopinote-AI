@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import MusicTransformer
-from .config import ModelConfig
+from .config import ModelConfig, NO_SECTION_ID, NO_SECTION_TYPE_ID
 from chopinote_dataset.tokenizer import REMITokenizer, key_name_to_tonic_midi
 
 
@@ -498,6 +498,12 @@ def generate_structure_plan(model: MusicTransformer, tokenizer: REMITokenizer,
 
     structure_vocab = torch.tensor(list(section_ids_set), device=device)
 
+    # 确保 EOS 始终在结构词表中（避免永不终止）
+    if eos_id not in section_ids_set:
+        structure_vocab = torch.cat([
+            structure_vocab, torch.tensor([eos_id], device=device)
+        ])
+
     seed = torch.tensor([seed_tokens], dtype=torch.long, device=device)
     eos_id = tokenizer.eos_token_id
 
@@ -599,7 +605,7 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
     def _get_section_id(bar_idx: int) -> int:
         """返回给定 bar 位置的 section instance ID。"""
         if not section_schedule:
-            return 0
+            return NO_SECTION_ID
         for i, (start_bar, _, _) in enumerate(section_schedule):
             if i + 1 < len(section_schedule):
                 if start_bar <= bar_idx < section_schedule[i + 1][0]:
@@ -607,12 +613,12 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
             else:
                 if bar_idx >= start_bar:
                     return i + 1
-        return 0
+        return NO_SECTION_ID
 
     def _get_section_type_id(bar_idx: int) -> int:
         """返回给定 bar 位置的 section type ID。"""
         if not section_schedule:
-            return 0
+            return NO_SECTION_TYPE_ID
         for i, (start_bar, type_id, _) in enumerate(section_schedule):
             if i + 1 < len(section_schedule):
                 if start_bar <= bar_idx < section_schedule[i + 1][0]:
@@ -620,7 +626,7 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
             else:
                 if bar_idx >= start_bar:
                     return type_id
-        return 0
+        return NO_SECTION_TYPE_ID
 
     cur_params = GenerationParams()
     cur_params.temperature = temperature
@@ -629,17 +635,19 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
     next_token = seed
     ctx_len = seed.size(1)
 
-    # 构建 seed 段的 section_ids 和 section_types
+    # 构建 seed 段的 section_ids 和 section_types（完整列表）
     section_ids_list = []
     section_types_list = []
     current_bar_idx = 0
+    section_name_map = {v: k for k, v in section_token_map.items()} if section_plan else {}
+
     for tid in seed_tokens:
-        if use_sections := (section_plan is not None):
+        if section_plan is not None:
             sec_id = _get_section_id(current_bar_idx)
             sec_type_id = _get_section_type_id(current_bar_idx)
         else:
-            sec_id = 0
-            sec_type_id = 0
+            sec_id = NO_SECTION_ID
+            sec_type_id = NO_SECTION_TYPE_ID
         section_ids_list.append(sec_id)
         section_types_list.append(sec_type_id)
         if tid == bar_id:
@@ -649,13 +657,34 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
         if ctx_len > model.config.max_seq_len:
             next_token = generated[:, -1:]
 
-        # ── 构建 section 输入 ──
+        # ── 动态段落参数切换（P5） ──
+        if section_plan is not None and section_schedule:
+            current_section_idx = _get_section_id(current_bar_idx) - 1
+            if 0 <= current_section_idx < len(section_schedule):
+                sec_type_token_id = section_schedule[current_section_idx][1]
+                sec_type_str = tokenizer.decode_token(sec_type_token_id)
+                # 从 'Section <name>' 提取 name
+                sec_name = sec_type_str.split(' ')[-1].rstrip('>') if ' ' in sec_type_str else ''
+                sec_params = SECTION_PARAMS.get(sec_name)
+                if sec_params:
+                    changed = False
+                    if sec_params.get('temperature') is not None:
+                        cur_params.temperature = sec_params['temperature']
+                        changed = True
+                    if sec_params.get('key_bias_strength') is not None:
+                        cur_params.key_bias_strength = sec_params['key_bias_strength']
+                        changed = True
+                    if sec_params.get('complexity') is not None:
+                        cur_params.complexity = sec_params['complexity']
+                        changed = True
+        # ───────────────────────────────────────────────
+
+        # ── 构建 section 输入（传递完整历史，P0） ──
         sec_kwargs = {}
         if model.config.use_section_attention and section_plan is not None:
-            sec_ids_tensor = torch.tensor(
-                [section_ids_list[-next_token.size(1):]], dtype=torch.long, device=device)
-            sec_types_tensor = torch.tensor(
-                [section_types_list[-next_token.size(1):]], dtype=torch.long, device=device)
+            # 传递完整的 section_ids/types 历史，forward 内部会切片
+            sec_ids_tensor = torch.tensor([section_ids_list], dtype=torch.long, device=device)
+            sec_types_tensor = torch.tensor([section_types_list], dtype=torch.long, device=device)
             sec_kwargs['section_ids'] = sec_ids_tensor
             sec_kwargs['section_types'] = sec_types_tensor
 
@@ -692,8 +721,8 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
             section_ids_list.append(sec_id)
             section_types_list.append(sec_type_id)
         else:
-            section_ids_list.append(0)
-            section_types_list.append(0)
+            section_ids_list.append(NO_SECTION_ID)
+            section_types_list.append(NO_SECTION_TYPE_ID)
 
         if token_id == bar_id:
             bar_count += 1

@@ -3,6 +3,12 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
+# ── 段落感知常量 ────────────────────────────────────────────
+# section_id=0 / section_type=0 统一表示"无段落"
+# 所有模块必须引用此常量，禁止硬编码 0
+NO_SECTION_ID: int = 0
+NO_SECTION_TYPE_ID: int = 0
+
 
 @dataclass
 class ModelConfig:
