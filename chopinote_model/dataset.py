@@ -8,6 +8,50 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from .config import NO_SECTION_ID, NO_SECTION_TYPE_ID
 
+# ── Key token → key_id 映射（从 token 序列追踪调性，避免用 sec.json 的聚合值）──
+_KEY_TOKEN_MAP: Optional[dict[int, int]] = None
+_KEY_NAME_TO_ID = {
+    'C': 1, 'C#': 2, 'Db': 2, 'D': 3, 'D#': 4, 'Eb': 4,
+    'E': 5, 'F': 6, 'F#': 7, 'Gb': 7, 'G': 8, 'G#': 9, 'Ab': 9,
+    'A': 10, 'A#': 11, 'Bb': 11, 'B': 12, 'Cb': 12,
+    'Am': 13, 'A#m': 14, 'Bbm': 14, 'Bm': 15, 'Cm': 16,
+    'C#m': 17, 'Dm': 18, 'D#m': 19, 'Ebm': 19, 'Em': 20,
+    'Fm': 21, 'F#m': 22, 'Gbm': 22, 'Gm': 23, 'G#m': 24, 'Abm': 24,
+}
+
+
+def _get_key_token_map() -> dict[int, int]:
+    """预计算 token_id → key_id 映射（模块级缓存，只初始化一次）。"""
+    global _KEY_TOKEN_MAP
+    if _KEY_TOKEN_MAP is not None:
+        return _KEY_TOKEN_MAP
+
+    from chopinote_dataset.tokenizer import REMITokenizer
+    tk = REMITokenizer(grid_size=16, velocity_levels=8)
+    mapping = {}
+    for token_str, token_id in tk._token_to_id.items():
+        if token_str.startswith('<Key ') and token_str.endswith('>'):
+            key_name = token_str[5:-1]
+            kid = _KEY_NAME_TO_ID.get(key_name)
+            if kid is not None:
+                mapping[token_id] = kid
+    _KEY_TOKEN_MAP = mapping
+    return mapping
+
+
+def _key_ids_from_tokens(tokens: list[int]) -> list[int]:
+    """扫描 token 序列，返回每个位置对应的 key_id（-1 = 未知）。"""
+    key_map = _get_key_token_map()
+    result = [-1] * len(tokens)
+    current = -1
+    for i, tid in enumerate(tokens):
+        kid = key_map.get(tid)
+        if kid is not None:
+            current = kid
+        if current >= 0:
+            result[i] = current
+    return result
+
 
 class TokenDataset(Dataset):
     """从 token JSON 文件中流式加载序列片段。
@@ -136,6 +180,18 @@ class TokenDataset(Dataset):
         except Exception:
             return None
 
+    def _load_chord_data(self, file_idx: int) -> Optional[dict]:
+        """加载和弦标注数据。返回 None 表示无标注。"""
+        path = self._resolve_path(self.file_paths[file_idx])
+        chord_path = path.with_suffix('.chord.json')
+        if not chord_path.exists():
+            return None
+        try:
+            with open(chord_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     def __getitem__(self, idx: int) -> dict:
         file_idx = self.valid_indices[idx % len(self.valid_indices)]
         tokens = self._load_tokens(file_idx)
@@ -164,6 +220,12 @@ class TokenDataset(Dataset):
             sec_types_all = section_data.get('section_types', [])
             n_total = len(sec_ids_all)
 
+            # 校验側边文件与 token 序列长度一致（预防过期侧边文件静默错位）
+            assert n_total == len(tokens), (
+                f'.sec.json section_ids 长度 ({n_total}) 与 token 序列 ({len(tokens)}) 不匹配: '
+                f'{self.file_paths[file_idx]}'
+            )
+
             # 对齐到 token 裁剪窗口：section_data 与 tokens 等长
             if start < n_total:
                 sec_ids = torch.tensor(
@@ -173,6 +235,9 @@ class TokenDataset(Dataset):
             else:
                 sec_ids = torch.full((T,), NO_SECTION_ID, dtype=torch.long)
                 sec_types = torch.full((T,), NO_SECTION_TYPE_ID, dtype=torch.long)
+
+            # 扫描 token 序列获取每个位置的精确 key_id（取代 sec.json 的段落聚合值）
+            key_ids = _key_ids_from_tokens(tokens)
 
             # 构建段落预测目标数组（仅在 Section token 位置有效）
             sec_bars_target = torch.full((T,), -1, dtype=torch.long)
@@ -186,7 +251,7 @@ class TokenDataset(Dataset):
                 if 0 <= local_pos < T and i < len(attrs_list):
                     attr = attrs_list[i]
                     sec_bars_target[local_pos] = attr.get('bars', -1)
-                    sec_keys_target[local_pos] = attr.get('key', -1)
+                    sec_keys_target[local_pos] = key_ids[pos] if 0 <= pos < len(key_ids) else -1
                     sec_types_target[local_pos] = attr.get('type', -1)
         else:
             sec_ids = torch.full((T,), NO_SECTION_ID, dtype=torch.long)
@@ -194,6 +259,48 @@ class TokenDataset(Dataset):
             sec_bars_target = torch.full((T,), -1, dtype=torch.long)
             sec_keys_target = torch.full((T,), -1, dtype=torch.long)
             sec_types_target = torch.full((T,), -1, dtype=torch.long)
+
+        # ── 和弦数据加载 ────────────────────────────────────────
+        chord_data = self._load_chord_data(file_idx)
+        if chord_data is not None:
+            chord_func_ids_all = chord_data.get('chord_func_ids', [])
+            chord_inv_ids_all = chord_data.get('chord_inv_ids', [])
+            n_c_total = len(chord_func_ids_all)
+
+            assert n_c_total == len(tokens), (
+                f'.chord.json chord_func_ids 长度 ({n_c_total}) 与 token 序列 ({len(tokens)}) 不匹配: '
+                f'{self.file_paths[file_idx]}'
+            )
+
+            if start < n_c_total:
+                chord_func_ids = torch.tensor(
+                    chord_func_ids_all[start:start + T + 1][:-1], dtype=torch.long)
+                chord_inv_ids = torch.tensor(
+                    chord_inv_ids_all[start:start + T + 1][:-1], dtype=torch.long)
+            else:
+                chord_func_ids = torch.zeros(T, dtype=torch.long)
+                chord_inv_ids = torch.zeros(T, dtype=torch.long)
+
+            # 构建和弦预测目标（仅在 Chord/Inv token 位置有效, -1 = ignore_index）
+            chord_func_targets = torch.full((T,), -1, dtype=torch.long)
+            chord_inv_targets = torch.full((T,), -1, dtype=torch.long)
+
+            chord_positions = chord_data.get('chord_token_positions', [])
+            chord_attrs = chord_data.get('chord_attrs', [])
+            for i, pos in enumerate(chord_positions):
+                local_pos = pos - start
+                if 0 <= local_pos < T and i < len(chord_attrs):
+                    attr = chord_attrs[i]
+                    chord_func_targets[local_pos] = attr.get('func', -1)
+                    # Inv token 紧跟 Chord func (和 Chord7) 之后
+                    inv_pos = local_pos + (2 if attr.get('has_7th', False) else 1)
+                    if inv_pos < T:
+                        chord_inv_targets[inv_pos] = attr.get('inv', -1)
+        else:
+            chord_func_ids = torch.zeros(T, dtype=torch.long)
+            chord_inv_ids = torch.zeros(T, dtype=torch.long)
+            chord_func_targets = torch.full((T,), -1, dtype=torch.long)
+            chord_inv_targets = torch.full((T,), -1, dtype=torch.long)
 
         return {
             'input_ids': input_ids,
@@ -204,6 +311,10 @@ class TokenDataset(Dataset):
             'sec_bars_target': sec_bars_target,
             'sec_keys_target': sec_keys_target,
             'sec_types_target': sec_types_target,
+            'chord_func_ids': chord_func_ids,
+            'chord_inv_ids': chord_inv_ids,
+            'chord_func_targets': chord_func_targets,
+            'chord_inv_targets': chord_inv_targets,
         }
 
 
@@ -245,6 +356,22 @@ def collate_fn(batch: list[dict]) -> dict:
             sec_keys_target, batch_first=True, padding_value=-1)
         result['sec_types_target'] = torch.nn.utils.rnn.pad_sequence(
             sec_types_target, batch_first=True, padding_value=-1)
+
+    # ── 和弦字段 padding ────────────────────────────────────────
+    if 'chord_func_ids' in batch[0]:
+        chord_func_ids = [b['chord_func_ids'] for b in batch]
+        chord_inv_ids = [b['chord_inv_ids'] for b in batch]
+        chord_func_targets = [b['chord_func_targets'] for b in batch]
+        chord_inv_targets = [b['chord_inv_targets'] for b in batch]
+
+        result['chord_func_ids'] = torch.nn.utils.rnn.pad_sequence(
+            chord_func_ids, batch_first=True, padding_value=0)
+        result['chord_inv_ids'] = torch.nn.utils.rnn.pad_sequence(
+            chord_inv_ids, batch_first=True, padding_value=0)
+        result['chord_func_targets'] = torch.nn.utils.rnn.pad_sequence(
+            chord_func_targets, batch_first=True, padding_value=-1)
+        result['chord_inv_targets'] = torch.nn.utils.rnn.pad_sequence(
+            chord_inv_targets, batch_first=True, padding_value=-1)
 
     return result
 

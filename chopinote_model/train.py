@@ -328,19 +328,35 @@ class Trainer:
                     labels = self._apply_loss_mask(labels, masked_ids)
 
                 with autocast('cuda', dtype=torch.bfloat16):
-                    # ── 双任务 forward ────────────────────────────
+                    # ── 多任务 forward ────────────────────────────
                     model_kwargs = {}
                     if model.config.use_section_attention and 'section_ids' in batch:
                         model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
                         model_kwargs['section_types'] = batch['section_types'].to(self.device)
                         model_kwargs['return_sec_head'] = True
+                    if model.config.use_chord_attention and 'chord_func_ids' in batch:
+                        model_kwargs['chord_func_ids'] = batch['chord_func_ids'].to(self.device)
+                        model_kwargs['chord_inv_ids'] = batch['chord_inv_ids'].to(self.device)
+                        model_kwargs['return_chord_head'] = True
 
                     output = model(input_ids, attention_mask, **model_kwargs)
+
+                    # 解析多任务输出
+                    logits = output
+                    sec_head_logits = None
+                    chord_head_logits = None
                     if isinstance(output, tuple):
-                        logits, sec_head_logits = output
-                    else:
-                        logits = output
-                        sec_head_logits = None
+                        if len(output) == 3:
+                            logits, sec_head_logits, chord_head_logits = output
+                        elif len(output) == 2:
+                            # 可能是 (logits, sec_head) 或 (logits, chord_head)
+                            if isinstance(output[1], dict):
+                                if 'bars' in output[1]:
+                                    logits, sec_head_logits = output
+                                else:
+                                    logits, chord_head_logits = output
+                        else:
+                            logits = output[0]
 
                     # Next-token prediction loss（主任务）
                     if _LIGER_AVAILABLE:
@@ -354,6 +370,7 @@ class Trainer:
                         )
                     loss = loss / max(1, (labels != -100).sum())
                     sec_loss_val = 0.0
+                    chord_loss_val = 0.0
 
                     # Section prediction loss（辅助任务）
                     if sec_head_logits is not None:
@@ -361,7 +378,6 @@ class Trainer:
                         sec_keys_target = batch['sec_keys_target'].to(self.device)
                         sec_types_target = batch['sec_types_target'].to(self.device)
 
-                        # 检查是否有有效目标（避免 0/0 = NaN）
                         has_sec_targets = (sec_bars_target != -1).any()
                         if has_sec_targets:
                             bars_loss = nn.functional.cross_entropy(
@@ -380,6 +396,32 @@ class Trainer:
                             loss = loss + model.config.sec_loss_weight * (bars_loss + keys_loss + types_loss)
                         else:
                             sec_loss_val = 0.0
+
+                    # Chord prediction loss（辅助任务）
+                    if chord_head_logits is not None:
+                        chord_func_targets = batch['chord_func_targets'].to(self.device)
+                        chord_inv_targets = batch['chord_inv_targets'].to(self.device)
+
+                        has_chord_func = (chord_func_targets != -1).any()
+                        has_chord_inv = (chord_inv_targets != -1).any()
+
+                        chord_func_loss = torch.tensor(0.0, device=self.device)
+                        chord_inv_loss = torch.tensor(0.0, device=self.device)
+
+                        if has_chord_func:
+                            chord_func_loss = nn.functional.cross_entropy(
+                                chord_head_logits['func'].permute(0, 2, 1),
+                                chord_func_targets, ignore_index=-1, reduction='mean',
+                            )
+                        if has_chord_inv:
+                            chord_inv_loss = nn.functional.cross_entropy(
+                                chord_head_logits['inv'].permute(0, 2, 1),
+                                chord_inv_targets, ignore_index=-1, reduction='mean',
+                            )
+
+                        chord_loss_val = chord_func_loss.item() + chord_inv_loss.item()
+                        if has_chord_func or has_chord_inv:
+                            loss = loss + model.config.chord_loss_weight * (chord_func_loss + chord_inv_loss)
 
                 total_loss += loss.item()
                 loss = loss / config.grad_accum_steps
@@ -413,6 +455,8 @@ class Trainer:
                         self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
                         if sec_loss_val > 0:
                             self.writer.add_scalar('train/sec_loss', sec_loss_val, self.global_step)
+                        if chord_loss_val > 0:
+                            self.writer.add_scalar('train/chord_loss', chord_loss_val, self.global_step)
                         if _fp8_enabled:
                             from .fp8_linear import FP8Linear
                             scales_x, scales_w = [], []
@@ -494,6 +538,8 @@ class Trainer:
             ('octave', tokenizer.OCTAVE),
             ('bass', tokenizer.BASS),
             ('anticipate', tokenizer.ANTICIPATE),
+            ('chord', tokenizer.CHORD),
+            ('inv', tokenizer.INV),
         ]
 
         # 收集类型名，保持有序，unknown 放最后
@@ -501,7 +547,7 @@ class Trainer:
         for name, _ in prefixes:
             if name not in seen:
                 seen.append(name)
-        type_names = ['special', 'bar', *seen, 'rest', 'arpeggio', 'unknown']
+        type_names = ['special', 'bar', *seen, 'rest', 'arpeggio', 'chord', 'inv', 'unknown']
 
         # 构建 vocab_size 大小的 index 张量
         num_types = len(type_names)

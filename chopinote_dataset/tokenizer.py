@@ -105,6 +105,9 @@ class REMITokenizer:
     ANTICIPATE = '<Anticipate'     # 预期调性变更目标: 如 Key C, Key G
     SECTION = '<Section'           # 段落类型标记 (paragraph-aware)
     SEC_SUM = '<SecSum>'           # 段落 summary token（每段一个）
+    CHORD = '<Chord'               # 和弦功能标记 (functional harmony)
+    CHORD7 = '<Chord 7>'           # 七和弦扩展标记
+    INV = '<Inv'                   # 和弦转位标记
 
     # 段落类型名称（用于 Section token 构建）
     SECTION_NAMES = [
@@ -113,6 +116,16 @@ class REMITokenizer:
         'bridge', 'cadenza', 'transition', 'variation', 'episode',
         '0', '1', '2', '3', '4', '5', '6', '7',
     ]
+
+    # 和弦功能名称（16 个罗马数字标记）
+    CHORD_FUNCTIONS = [
+        'I', 'i', 'ii', 'ii°', 'iii', 'III',
+        'IV', 'iv', 'V', 'vi', 'VI', 'vii°',
+        'N', 'It6', 'Fr6', 'Ger6',
+    ]
+
+    # 和弦转位名称（4 个）
+    CHORD_INVERSIONS = ['Root', '1st', '2nd', '3rd']
 
     # 最多支持的拍数（与 grid_size 16 对齐）
     MAX_BEATS = 16
@@ -358,6 +371,27 @@ class REMITokenizer:
         self._id_to_token[idx] = self.SEC_SUM
         idx += 1
 
+        # ── 功能和弦 token（functional harmony）─────────────────
+
+        # <Chord I> .. <Chord Ger6>（16 个和弦功能）
+        for func_name in self.CHORD_FUNCTIONS:
+            t = f'{self.CHORD} {func_name}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
+        # <Chord 7>（七和弦扩展，自闭合）
+        self._token_to_id[self.CHORD7] = idx
+        self._id_to_token[idx] = self.CHORD7
+        idx += 1
+
+        # <Inv Root> .. <Inv 3rd>（4 个转位）
+        for inv_name in self.CHORD_INVERSIONS:
+            t = f'{self.INV} {inv_name}>'
+            self._token_to_id[t] = idx
+            self._id_to_token[idx] = t
+            idx += 1
+
     @property
     def vocab_size(self) -> int:
         return len(self._token_to_id)
@@ -493,4 +527,12 @@ class REMITokenizer:
                 events.append((self.SECTION, val))
             elif token == self.SEC_SUM:
                 events.append((self.SEC_SUM, None))
+            elif token == self.CHORD7:
+                events.append((self.CHORD7, None))
+            elif token.startswith(self.CHORD):
+                val = token[len(self.CHORD) + 1:-1]  # e.g. 'I', 'V', 'vi'
+                events.append((self.CHORD, val))
+            elif token.startswith(self.INV):
+                val = token[len(self.INV) + 1:-1]  # e.g. 'Root', '1st', '2nd', '3rd'
+                events.append((self.INV, val))
         return events

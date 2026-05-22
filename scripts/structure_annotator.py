@@ -346,10 +346,8 @@ def viterbi_segmentation(fused_signal: np.ndarray, min_bars: int = 4) -> np.ndar
 
     for i in range(1, n):
         best_score = dp[i - 1]
-        best_j = i
+        best_j = i - 1
         for j in range(max(0, i - 32), i - min_bars + 1):
-            if j < 0:
-                continue
             # 边界得分 = 边界信号强度 - 过长段落罚分
             boundary_score = fused_signal[i]
             length_penalty = 0.0 if (i - j) < 24 else 0.1 * ((i - j) - 24) / 24
@@ -365,7 +363,9 @@ def viterbi_segmentation(fused_signal: np.ndarray, min_bars: int = 4) -> np.ndar
     i = n - 1
     while i > 0:
         j = back[i]
-        if j > 0 and j < n:
+        if j >= i:
+            break
+        if j > 0:
             boundaries[j] = 1
         i = j
 
@@ -653,7 +653,7 @@ def annotate_file(token_path: str, output_dir: str) -> Optional[str]:
         n_bars_in_sec = bar_end - bar_start
         primary_key = _get_primary_key(bars, bar_start, bar_end)
         section_attrs.append({
-            'bars': min(n_bars_in_sec, 64),
+            'bars': min(n_bars_in_sec, 128),
             'key': _key_to_id(primary_key),
             'type': sec_type if s < len(section_types) else _section_fallback_id(s),
         })
@@ -723,44 +723,49 @@ def _key_to_id(key_name: Optional[str]) -> int:
     return 0  # unknown
 
 
+def _annotate_worker(args):
+    """imap_unordered worker: (token_path, output_dir) -> result."""
+    return annotate_file(args[0], args[1])
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def cmd_annotate(args):
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
-    files = list(input_dir.glob('*.json'))
-    # 排除 .sec.json 和 .meta.json
-    files = [f for f in files if not f.name.endswith('.sec.json')
-             and not f.name.endswith('.meta.json')]
-    logger.info(f'找到 {len(files)} 个 token 文件')
+    token_files = list(input_dir.glob('*.tokens'))
+    if args.max_files > 0:
+        token_files = token_files[args.start_index:args.start_index + args.max_files]
+    logger.info(f'找到 {len(token_files)} 个 token 文件 (start={args.start_index})')
 
+    total = len(token_files)
     if args.num_workers > 1:
+        annotated = 0
+        task_args = [(str(f), str(output_dir)) for f in token_files]
         with multiprocessing.Pool(args.num_workers) as pool:
-            results = []
-            for f in files:
-                r = pool.apply_async(annotate_file, (str(f), str(output_dir)))
-                results.append(r)
-            pool.close()
-            pool.join()
-            annotated = sum(1 for r in results if r.get() is not None)
+            for i, result in enumerate(pool.imap_unordered(
+                _annotate_worker, task_args, chunksize=500
+            )):
+                if result is not None:
+                    annotated += 1
+                if (i + 1) % 50000 == 0 or (i + 1) == total:
+                    logger.info(f'  [{i+1}/{total}] ✓{annotated} ({(i+1)/total*100:.0f}%)')
     else:
         annotated = 0
-        for f in files:
+        for i, f in enumerate(token_files):
             result = annotate_file(str(f), str(output_dir))
             if result is not None:
                 annotated += 1
-            if args.verbose:
-                logger.info(f'  {"✓" if result else "✗"} {f.name}')
+            if (i + 1) % 50000 == 0 or (i + 1) == total:
+                logger.info(f'  [{i+1}/{total}] ✓{annotated} ({(i+1)/total*100:.0f}%)')
 
-    logger.info(f'标注完成: {annotated}/{len(files)}')
+    logger.info(f'标注完成: {annotated}/{len(token_files)}')
 
 
 def cmd_check(args):
     """检查标注覆盖率。"""
     input_dir = Path(args.input_dir)
-    token_files = list(input_dir.glob('*.json'))
-    token_files = [f for f in token_files if not f.name.endswith('.sec.json')
-                   and not f.name.endswith('.meta.json')]
+    token_files = list(input_dir.glob('*.tokens'))
     sec_files = list(input_dir.glob('*.sec.json'))
     logger.info(f'Token 文件: {len(token_files)}')
     logger.info(f'.sec.json 文件: {len(sec_files)}')
@@ -787,6 +792,8 @@ def main():
     p_annotate.add_argument('--output-dir', default=None)
     p_annotate.add_argument('--num-workers', type=int, default=1)
     p_annotate.add_argument('--verbose', action='store_true')
+    p_annotate.add_argument('--max-files', type=int, default=0)
+    p_annotate.add_argument('--start-index', type=int, default=0)
 
     p_check = sub.add_parser('check', help='检查标注覆盖率')
     p_check.add_argument('--input-dir', required=True)

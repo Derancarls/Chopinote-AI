@@ -19,7 +19,7 @@ dataset:
     min_notes_per_file: 10
     max_notes_per_file: 50000
     min_tokens_per_sequence: 50
-    max_tokens_per_sequence: 16384
+    max_tokens_per_sequence: 131072
 
     # REMI转换配置
     remi:

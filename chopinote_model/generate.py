@@ -447,6 +447,24 @@ SECTION_PARAMS: dict[str, dict] = {
     'episode':      {'temperature': 1.2,  'key_bias_strength': 0.0, 'complexity': 6.0},
 }
 
+# ── 段落-和弦参数联动（13 种） ─────────────────────────────────
+SECTION_HARMONY_PARAMS: dict[str, dict] = {
+    'exposition':       {'complexity': 5.0, 'cadence_strength': 2.0, 'density': 0.5},
+    'development':      {'complexity': 7.0, 'cadence_strength': 0.5, 'density': 0.8},
+    'development_s':    {'complexity': 7.0, 'cadence_strength': 0.5, 'density': 0.8},
+    'recapitulation':   {'complexity': 5.0, 'cadence_strength': 2.5, 'density': 0.5},
+    'theme1':           {'complexity': 5.0, 'cadence_strength': 2.0, 'density': 0.5},
+    'theme2':           {'complexity': 4.0, 'cadence_strength': 1.5, 'density': 0.4},
+    'bridge':           {'complexity': 4.0, 'cadence_strength': 0.8, 'density': 0.3},
+    'transition':       {'complexity': 4.0, 'cadence_strength': 0.5, 'density': 0.3},
+    'intro':            {'complexity': 3.0, 'cadence_strength': 1.0, 'density': 0.3},
+    'coda':             {'complexity': 3.0, 'cadence_strength': 3.0, 'density': 0.2},
+    'cadenza':          {'complexity': 8.0, 'cadence_strength': 0.0, 'density': 0.9},
+    'variation':        {'complexity': 5.0, 'cadence_strength': 1.5, 'density': 0.5},
+    'episode':          {'complexity': 6.0, 'cadence_strength': 0.0, 'density': 0.7},
+}
+
+
 # Section 名 → token 前缀字符串（从 tokenizer SECTION_NAMES 自动生成，消除手工同步）
 def _build_section_token_map(tokenizer):
     return {name: f'Section {name}' for name in tokenizer.SECTION_NAMES}
@@ -475,6 +493,7 @@ def generate_structure_plan(model: MusicTransformer, tokenizer: REMITokenizer,
     """
     model.eval()
     device = next(model.parameters()).device
+    eos_id = tokenizer.eos_token_id
 
     # 从 tokenizer 动态构建 section token 名→字符串映射（零手工同步）
     section_token_map = _build_section_token_map(tokenizer)
@@ -505,7 +524,6 @@ def generate_structure_plan(model: MusicTransformer, tokenizer: REMITokenizer,
         ])
 
     seed = torch.tensor([seed_tokens], dtype=torch.long, device=device)
-    eos_id = tokenizer.eos_token_id
 
     kv_caches = [[None, None] for _ in range(model.config.n_layers)]
     generated = seed.clone()
@@ -542,24 +560,154 @@ def generate_structure_plan(model: MusicTransformer, tokenizer: REMITokenizer,
 
 
 @torch.no_grad()
-def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
-                            seed_tokens: list[int],
-                            section_plan: Optional[list[dict]] = None,
-                            max_bars: int = 64,
-                            max_new_tokens: int = 4096,
-                            temperature: float = 1.0,
-                            top_k: int = 20) -> list[int]:
-    """Stage 2: 段落条件生成 — 按段落规划生成完整曲谱。
+def generate_harmony_skeleton(model: MusicTransformer, tokenizer: REMITokenizer,
+                               seed_tokens: list[int],
+                               structure_plan_tokens: list[int],
+                               harmony_constraint: Optional[dict] = None,
+                               max_new_tokens: int = 512,
+                               temperature: float = 1.0,
+                               top_k: int = 20) -> list[int]:
+    """Stage 2: 和声骨架生成 — 在结构规划基础上生成和弦进行。
 
-    支持段落感知注意力：在生成过程中跟踪当前所属的 section_id / section_type，
-    并在 forward 时传入 section_ids / section_types，使 sec_bias 生效。
+    使用 Chord→Inv 状态机强制 token 配对。
 
     Args:
         model: MusicTransformer
         tokenizer: REMI tokenizer
-        seed_tokens: 种子 token 序列（前缀）
-        section_plan: 段落规划，每段含 type/bars/key 等信息。
-            如 [{"type": "exposition", "bars": 16, "key": "C"}, ...]
+        seed_tokens: 原始种子 token 序列
+        structure_plan_tokens: Stage 1 生成的结构 token
+        harmony_constraint: 可选和声约束
+        max_new_tokens: 最多生成 token 数
+        temperature: 采样温度
+        top_k: top-k 采样
+
+    Returns:
+        完整的 token 序列（seed + structure + harmony skeleton）
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    # 前缀 = seed + structure plan
+    prefix = seed_tokens + structure_plan_tokens
+    prefix_tensor = torch.tensor([prefix], dtype=torch.long, device=device)
+
+    eos_id = tokenizer.eos_token_id
+    bar_id = tokenizer.bar_token_id
+
+    # ── 构建和声词表（只允许 Chord/Inv/Chord7/Bar/Key/Section/EOS）──
+    harmony_ids_set = set()
+    # Chord func tokens
+    for func_name in tokenizer.CHORD_FUNCTIONS:
+        tid = tokenizer.encode_token(f'<Chord {func_name}>')
+        harmony_ids_set.add(tid)
+    # Chord7
+    harmony_ids_set.add(tokenizer.encode_token('<Chord 7>'))
+    # Inv tokens
+    for inv_name in tokenizer.CHORD_INVERSIONS:
+        tid = tokenizer.encode_token(f'<Inv {inv_name}>')
+        harmony_ids_set.add(tid)
+    # Bar / Key / Section
+    for tid in range(tokenizer.vocab_size):
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith(tokenizer.KEY) or ts.startswith(tokenizer.SECTION) or \
+           ts == tokenizer.BAR or ts == tokenizer.SEC_SUM:
+            harmony_ids_set.add(tid)
+    # EOS
+    harmony_ids_set.add(eos_id)
+
+    harmony_vocab = torch.tensor(list(harmony_ids_set), device=device)
+
+    # 预计算 token ID 集合用于状态机
+    inv_ids = [tokenizer.encode_token(f'<Inv {n}>') for n in tokenizer.CHORD_INVERSIONS]
+    chord7_id = tokenizer.encode_token('<Chord 7>')
+    chord_func_ids = [tokenizer.encode_token(f'<Chord {n}>') for n in tokenizer.CHORD_FUNCTIONS]
+
+    # ── KV cache 生成 ──
+    kv_caches = [[None, None] for _ in range(model.config.n_layers)]
+    generated = prefix_tensor.clone()
+    next_token = prefix_tensor
+    ctx_len = generated.size(1)
+
+    state = 'chord'  # 'chord' | 'inv_after_chord' | 'inv_after_chord7'
+
+    for _ in range(max_new_tokens):
+        if ctx_len > model.config.max_seq_len:
+            next_token = generated[:, -1:]
+
+        logits = model.forward(next_token, kv_caches=kv_caches)
+        logits = logits[:, -1, :] / temperature
+
+        # ── 状态机约束 ──
+        if state == 'chord':
+            # 不允许 Inv/Chord7 在无 Chord func 时单独出现
+            for tid in inv_ids:
+                logits[0, tid] = float('-inf')
+            logits[0, chord7_id] = float('-inf')
+        elif state == 'inv_after_chord':
+            # 只允许 Inv 或 Chord7
+            full_mask = torch.full_like(logits, float('-inf'))
+            for tid in inv_ids:
+                full_mask[0, tid] = 0.0
+            full_mask[0, chord7_id] = 0.0
+            logits = logits + full_mask
+        elif state == 'inv_after_chord7':
+            # 只允许 Inv
+            full_mask = torch.full_like(logits, float('-inf'))
+            for tid in inv_ids:
+                full_mask[0, tid] = 0.0
+            logits = logits + full_mask
+
+        # 和声词表约束
+        harmony_mask = torch.full_like(logits, float('-inf'))
+        harmony_mask[:, harmony_vocab] = 0.0
+        logits = logits + harmony_mask
+
+        # top-k
+        if top_k > 0:
+            vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < vals[:, -1:]] = float('-inf')
+
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        generated = torch.cat([generated, next_token], dim=1)
+        ctx_len = generated.size(1)
+
+        tid = next_token.item()
+
+        # 更新状态机
+        if tid in chord_func_ids:
+            state = 'inv_after_chord'
+        elif tid == chord7_id:
+            state = 'inv_after_chord7'
+        elif tid in inv_ids:
+            state = 'chord'
+        # Bar / Key / Section 不改变 state
+
+        if tid == eos_id:
+            break
+
+    return generated[0].tolist()
+
+
+@torch.no_grad()
+def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
+                            seed_tokens: list[int],
+                            section_plan: Optional[list[dict]] = None,
+                            harmony_skeleton: Optional[list[int]] = None,
+                            max_bars: int = 64,
+                            max_new_tokens: int = 4096,
+                            temperature: float = 1.0,
+                            top_k: int = 20) -> list[int]:
+    """Stage 3: 段落条件生成 — 按段落规划生成完整曲谱。
+
+    支持段落感知注意力 + 和弦偏置（如果提供 harmony_skeleton）。
+
+    Args:
+        model: MusicTransformer
+        tokenizer: REMI tokenizer
+        seed_tokens: 种子 token 序列（前缀含结构规划）
+        section_plan: 段落规划
+        harmony_skeleton: Stage 2 生成的和声骨架 token 列表
         max_bars: 最多生成多少个小节
         max_new_tokens: 最多生成多少新 token
         temperature: 采样温度
@@ -589,24 +737,26 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
     # ── 段落追踪 ──
     # 根据 section_plan 预构建段落时间线
     section_token_map = _build_section_token_map(tokenizer)
-    section_schedule = []  # [(start_bars, type_id, key_id), ...]
+    # section type name → section type index (0-based, used for section_type_embedding)
+    _sec_name_to_type_idx = {name: i for i, name in enumerate(tokenizer.SECTION_NAMES)}
+    section_schedule = []  # [(start_bars, type_idx, type_token_id, key), ...]
     if section_plan:
         planned_bars = 0
         for sec in section_plan:
             sec_type_name = sec.get('type', 'theme1')
             n_bars = sec.get('bars', 8)
             sec_key = sec.get('key', 'C')
-            # 从 tokenizer 动态获取 section token 名（回退到 section0）
-            sec_token_str = section_token_map.get(sec_type_name, 'Section section0')
-            sec_type_id = tokenizer.encode_token(f'<{sec_token_str}>')
-            section_schedule.append((planned_bars, sec_type_id, sec_key))
+            sec_type_idx = _sec_name_to_type_idx.get(sec_type_name, 0)
+            sec_token_str = section_token_map.get(sec_type_name, 'Section 0')
+            sec_type_token_id = tokenizer.encode_token(f'<{sec_token_str}>')
+            section_schedule.append((planned_bars, sec_type_idx, sec_type_token_id, sec_key))
             planned_bars += n_bars
 
     def _get_section_id(bar_idx: int) -> int:
         """返回给定 bar 位置的 section instance ID。"""
         if not section_schedule:
             return NO_SECTION_ID
-        for i, (start_bar, _, _) in enumerate(section_schedule):
+        for i, (start_bar, _, _, _) in enumerate(section_schedule):
             if i + 1 < len(section_schedule):
                 if start_bar <= bar_idx < section_schedule[i + 1][0]:
                     return i + 1
@@ -616,16 +766,16 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
         return NO_SECTION_ID
 
     def _get_section_type_id(bar_idx: int) -> int:
-        """返回给定 bar 位置的 section type ID。"""
+        """返回给定 bar 位置的 section type index (0-based, for section_type_embedding)。"""
         if not section_schedule:
             return NO_SECTION_TYPE_ID
-        for i, (start_bar, type_id, _) in enumerate(section_schedule):
+        for i, (start_bar, type_idx, _, _) in enumerate(section_schedule):
             if i + 1 < len(section_schedule):
                 if start_bar <= bar_idx < section_schedule[i + 1][0]:
-                    return type_id
+                    return type_idx
             else:
                 if bar_idx >= start_bar:
-                    return type_id
+                    return type_idx
         return NO_SECTION_TYPE_ID
 
     cur_params = GenerationParams()
@@ -635,9 +785,44 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
     next_token = seed
     ctx_len = seed.size(1)
 
+    # ── 和弦上下文追踪 ─────────────────────────────────────
+    # 从 harmony_skeleton 解析和弦上下文
+    chord_func_ids_list = []
+    current_chord_func = 0  # 0 = no chord
+    current_chord_inv = 0
+
+    chord_func_token_ids = {tokenizer.encode_token(f'<Chord {n}>'): i + 1
+                           for i, n in enumerate(tokenizer.CHORD_FUNCTIONS)}
+    chord_inv_token_ids = {tokenizer.encode_token(f'<Inv {n}>'): i + 1
+                          for i, n in enumerate(tokenizer.CHORD_INVERSIONS)}
+
+    # 解析 harmony_skeleton 中的和弦上下文
+    if harmony_skeleton:
+        for tid in harmony_skeleton:
+            if tid in chord_func_token_ids:
+                current_chord_func = chord_func_token_ids[tid]
+                current_chord_inv = 0
+            elif tid in chord_inv_token_ids:
+                current_chord_inv = chord_inv_token_ids[tid]
+
+    # 对 seed_tokens 也追溯初始和弦上下文
+    for tid in seed_tokens:
+        if tid in chord_func_token_ids:
+            current_chord_func = chord_func_token_ids[tid]
+            current_chord_inv = 0
+        elif tid in chord_inv_token_ids:
+            current_chord_inv = chord_inv_token_ids[tid]
+
     # 构建 seed 段的 section_ids 和 section_types（完整列表）
     section_ids_list = []
     section_types_list = []
+    chord_func_ids_list = []
+    # 重新遍历 seed_tokens 构建初始列表
+    chord_func = 0
+    for tid in seed_tokens:
+        if tid in chord_func_token_ids:
+            chord_func = chord_func_token_ids[tid]
+        chord_func_ids_list.append(chord_func)
     current_bar_idx = 0
     section_name_map = {v: k for k, v in section_token_map.items()} if section_plan else {}
 
@@ -661,9 +846,8 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
         if section_plan is not None and section_schedule:
             current_section_idx = _get_section_id(current_bar_idx) - 1
             if 0 <= current_section_idx < len(section_schedule):
-                sec_type_token_id = section_schedule[current_section_idx][1]
+                sec_type_token_id = section_schedule[current_section_idx][2]
                 sec_type_str = tokenizer.decode_token(sec_type_token_id)
-                # 从 'Section <name>' 提取 name
                 sec_name = sec_type_str.split(' ')[-1].rstrip('>') if ' ' in sec_type_str else ''
                 sec_params = SECTION_PARAMS.get(sec_name)
                 if sec_params:
@@ -679,14 +863,18 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
                         changed = True
         # ───────────────────────────────────────────────
 
-        # ── 构建 section 输入（传递完整历史，P0） ──
+        # ── 构建 section/chord 输入（传递完整历史，P0） ──
         sec_kwargs = {}
         if model.config.use_section_attention and section_plan is not None:
-            # 传递完整的 section_ids/types 历史，forward 内部会切片
             sec_ids_tensor = torch.tensor([section_ids_list], dtype=torch.long, device=device)
             sec_types_tensor = torch.tensor([section_types_list], dtype=torch.long, device=device)
             sec_kwargs['section_ids'] = sec_ids_tensor
             sec_kwargs['section_types'] = sec_types_tensor
+
+        # 和弦上下文（chord_bias 在 Stage 3 生效）
+        if model.config.use_chord_attention and harmony_skeleton is not None:
+            chord_ids_tensor = torch.tensor([chord_func_ids_list], dtype=torch.long, device=device)
+            sec_kwargs['chord_func_ids'] = chord_ids_tensor
 
         logits = model.forward(
             next_token, kv_caches=kv_caches,
@@ -711,6 +899,11 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
         cached_measure_ids = torch.cat(
             [cached_measure_ids, torch.tensor([new_measure], device=device)]
         )
+
+        # 更新和弦追踪
+        if token_id in chord_func_token_ids:
+            current_chord_func = chord_func_token_ids[token_id]
+        chord_func_ids_list.append(current_chord_func)
 
         # 更新段落追踪
         if section_plan is not None:

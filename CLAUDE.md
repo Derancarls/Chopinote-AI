@@ -30,6 +30,18 @@ python scripts/train/launch_control.py status         # 状态快照
 # data preprocessing (MIDI → REMI tokens)
 python scripts/preprocess/run_fast_preprocess.py
 
+# structure annotation (段落标注, 生成 .sec.json)
+python scripts/structure_annotator.py annotate \
+    --input-dir /root/autodl-tmp/data/processed/tokens_v3 \
+    --output-dir /root/autodl-tmp/data/processed/tokens_v3 \
+    --num-workers 8
+
+# chord annotation (和弦标注, 生成 .chord.json)
+python scripts/chord_annotator.py \
+    --tokens-dir /root/autodl-tmp/data/processed/tokens_v3 \
+    --file-list /root/autodl-tmp/data/processed/train.txt \
+    --output-suffix .chord.json
+
 # curriculum training (manual)
 python scripts/train/run_curriculum_training.py \
     --midi-train-list /root/autodl-tmp/data/processed/train.txt \
@@ -47,22 +59,30 @@ python scripts/train/run_curriculum_training.py \
 
 ### Packages
 
-- **`chopinote_model/`** — Decoder-only Transformer (MusicTransformer):
-  - `model.py` — MusicTransformer (GPT decoder), CausalSelfAttention (nn.Embedding rel/measure bias, SDPA sdpa_kernel, causal fused into attn_mask, weight tying, use_reentrant=True checkpointing)
-  - `config.py` — ModelConfig (vocab_size=872, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig, PhaseConfig, TokenLossMask
-  - `train.py` — Trainer class, single-phase + multi-phase curriculum training, AMP bf16 (autocast + direct backward, no GradScaler), AdamW, cosine LR, TensorBoard
-  - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), collate_fn (dynamic padding)
-  - `generate.py` — autoregressive generation (KV cache, top-k, pitch constraints), MusicXML export
+- **`chopinote_model/`** — Decoder-only Transformer:
+  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), SectionPredictionHead (bars/key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear optional
+  - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig, PhaseConfig, TokenLossMask, section/chord config fields
+  - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation
+  - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), auto-loads `.sec.json` and `.chord.json` sidecars, collate_fn (dynamic padding for all fields)
+  - `generate.py` — Three-stage generation: Stage 1 (structure plan) → Stage 2 (harmony skeleton, Chord→Inv state machine) → Stage 3 (note filling with sec_bias+chord_bias), KV cache, section-aware context tracking
 
 - **`chopinote_dataset/`** — Data processing:
-  - `tokenizer.py` — REMITokenizer (fixed vocab 872, grid_size=16, velocity_levels=8), build_vocab() is deterministic
+  - `tokenizer.py` — REMITokenizer (fixed vocab 929, grid_size=16, velocity_levels=8), 16 chord functions + Chord7 + 4 inversions, build_vocab() is deterministic
   - `converter.py` — MusicXMLToREMI, PDMXToREMI, MIDIToREMI
   - `fast_converter.py` — FastMIDIToREMI (mido-based, ~80x faster)
   - `processor.py` — batch preprocessor base classes
   - `splitter.py` — dataset train/val/test split
 
+- **`chopinote_evaluator/`** — Music evaluation:
+  - `feedback_controller.py` — A/B1/B2/C feedback loop: PreGenerationEvaluator (seed profile), NarrowFeedbackController (per-bar B1 local + B2 global drift), PostGenerationFilter (C phase scoring + rollback retry + RL reward logging)
+  - `registry.py` — Metric registry, token-level implementations for 20+ metrics including 4 chord metrics (chord_melody_alignment, progression_validity, cadence_quality, harmonic_rhythm)
+  - `score.py` — Evaluator (MusicXML-level scoring with benchmarks)
+  - `report.py` — Evaluation report generation
+  - `general/` — General metrics (statistics, legality, theory, harmony)
+  - `specific/` — Specific metrics (coherence, consistency, model_scorer)
+
 - **`chopinote_cli/`** — CLI entry (`chopin` command):
-  - `main.py` — inference CLI with preset support
+  - `main.py` — inference CLI with preset + feedback mode + interactive retry
   - `presets.py` — generation style presets (baroque, romantic, jazz, etc.)
 
 - **`scripts/`** — Utility scripts, organized by function:
@@ -70,25 +90,27 @@ python scripts/train/run_curriculum_training.py \
   - `train/` — training: `run_curriculum_training.py` (two-phase, argparse, TF32), `dpo_train.py` (DPO fine-tune), `launch_control.py` (点火控制台, preflight → launch → monitor → abort)
   - `generate/` — generation & testing: `batch_roundtrip.py`, `roundtrip_test.py`, `validate_generation.py`, seed utilities
   - `analysis/` — analysis & verification: `align_converter.py`, `verify_e2e.py`, `analyze_tokens.py`, `analyze_notations.py`
+  - `structure_annotator.py` — section boundary detection + type inference (Sonata/Theme/Fallback)
+  - `chord_annotator.py` — chord function annotation via template matching + key context + confidence > 0.8
 
 ### Hardware & Training Setup
 
 - **GPU**: RTX 5090 32GB, bf16 training
 - **Batch**: batch_size=8, grad_accum=4 (effective batch=32)
-- **Data**: `/root/autodl-tmp/data/processed/` (~1.6M token files, 13.7B tokens, 400G disk)
+- **Data**: `/root/autodl-tmp/data/processed/` (~1.37M token files, 13.7B tokens, 400G disk)
 - **Checkpoints**: `/root/autodl-tmp/chopinote/checkpoints/`
 - **Logs/TensorBoard**: `/root/autodl-tmp/chopinote/tensorboard/` (also symlinked at `/root/tf-logs`)
-- **Memory-critical**: attention bias bf16 (nn.Embedding), padding mask avoids (B,nH,T,T) broadcast, measure_bias shares first sample, SDPA sdpa_kernel restricts to flash/mem_efficient
+- **Memory-critical**: manual attention path when sec_bias present (avoids SDPA), padding mask shares first sample, SDPA sdpa_kernel restricts to flash/mem_efficient
 
 ### Memory Optimization (RTX 5090)
 
 - `torch.set_float32_matmul_precision('high')` — TF32 matmul
 - `torch.backends.cudnn.benchmark = True`
-- SDPA via `sdpa_kernel([FLASH_ATTENTION, EFFICIENT_ATTENTION])` context manager — restricts to flash/mem_efficient, prevents math backend OOM
+- SDPA via `sdpa_kernel([CUDNN, FLASH_ATTENTION, EFFICIENT_ATTENTION])` context manager — cuDNN attention preferred, fallback to flash/mem_efficient
 - Causal mask fused into `attn_mask` (not `is_causal=True`) so flash attention works with non-null mask
-- `nn.Embedding` for rel/measure bias (bf16 params, simpler than manual indexing)
 - Padding mask uses `mask[0]` only (all samples in batch have same padding pattern)
-- Measure bias uses first sample's measure structure → (1, nH, T, T) not (B, nH, T, T)
+- Measure embedding uses first sample's measure structure
+- sec_bias triggers manual attention path (no SDPA); without sec_bias, standard SDPA fast path
 - bf16 autocast + direct `loss.backward()` (no GradScaler needed)
 - Gradient checkpointing on full TransformerBlock (attn+FFN), `use_reentrant=True`
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
