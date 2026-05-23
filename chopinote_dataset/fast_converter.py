@@ -423,25 +423,30 @@ class FastMIDIToREMI:
 
             events.append((self.BAR, None))
 
-            # Key signature (after BAR)
+            # ── 每小节起始注入继承的上下文 ──────────────────────
+            # 调号（每小节必发，确保采样窗口能命中调性信息）
             if m == 0:
-                events.append((self.KEY, initial_key))
-                last_key_name = initial_key
-            elif key_at_m and key_at_m != last_key_name:
-                events.append((self.KEY, key_at_m))
-                last_key_name = key_at_m
+                current_key = initial_key
+            elif key_at_m:
+                current_key = key_at_m
+            else:
+                current_key = last_key_name or initial_key
+            events.append((self.KEY, current_key))
+            last_key_name = current_key
 
-            # Tempo
-            bpm = measure_tempos.get(m) or _get_tempo_bpm(measure_starts[m])
-            if bpm and (not events[-1][0] == self.TEMPO or events[-1][1] != bpm):
-                events.append((self.TEMPO, bpm))
-
-            # Time signature
+            # 拍号（每小节必发）
             ts = measure_ts.get(m) or _get_time_sig(measure_starts[m])
             if ts:
                 ts_str = f'{ts[0]}/{ts[1]}'
                 if ts_str in REMI_TIME_SIGS:
                     events.append((self.TIMESIG, ts_str))
+            else:
+                events.append((self.TIMESIG, '4/4'))
+
+            # 速度（每小节必发）
+            bpm = measure_tempos.get(m) or _get_tempo_bpm(measure_starts[m]) or 120
+            events.append((self.TEMPO, bpm))
+            # ─────────────────────────────────────────────────────
 
             notes_in_m = measure_notes.get(m, [])
             beats_in_m = measure_beats.get(m, [])

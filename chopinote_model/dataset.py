@@ -80,7 +80,7 @@ class TokenDataset(Dataset):
 
         # 加载 token 长度索引（由预处理生成的 token_lengths.json）
         index_path = self.data_dir / 'token_lengths.json'
-        meta_dir = self.data_dir / 'metadata_v2'
+        meta_dir = self.data_dir / 'metadata_v3'
         if index_path.exists():
             import gc
             with open(index_path, 'r') as fh:
@@ -138,13 +138,14 @@ class TokenDataset(Dataset):
             if not self.valid_indices:
                 raise ValueError('没有可用的训练文件')
 
-        # FIFO 缓存最近加载的文件（随机采样下 FIFO ≈ LRU）
-        self._cache: dict[int, list[int]] = {}
+        # LRU 缓存最近加载的文件
+        from collections import OrderedDict
+        self._cache: OrderedDict[int, list[int]] = OrderedDict()
         self._cache_max = 128
 
     def _resolve_path(self, file_path: str) -> Path:
         """将 split 文件中的路径解析为实际 token 文件路径。"""
-        path = self.data_dir / 'tokens_v2' / Path(file_path).name
+        path = self.data_dir / 'tokens_v3' / Path(file_path).name
         if not path.exists():
             fallback = Path(file_path)
             if not fallback.is_absolute():
@@ -163,9 +164,9 @@ class TokenDataset(Dataset):
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         self._cache[file_idx] = data
+        self._cache.move_to_end(file_idx)
         if len(self._cache) > self._cache_max:
-            # 移除最早未使用的
-            self._cache.pop(next(iter(self._cache)))
+            self._cache.popitem(last=False)
         return data
 
     def _load_section_data(self, file_idx: int) -> Optional[dict]:
@@ -386,6 +387,7 @@ def create_dataloader(split_file: str, data_dir: str = 'data/processed',
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=False,   # PyTorch 2.8 + CUDA 12.8 pin_memory bug
+        num_workers=2,
+        persistent_workers=True,
+        pin_memory=True,
     )

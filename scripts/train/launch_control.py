@@ -267,10 +267,11 @@ def _tail_lines(path: str, n: int = 50) -> list[str]:
 # ── 日志解析 ──────────────────────────────────────────────────
 _STEP_RE = re.compile(
     r'(?:\[.+\]\s+)?Step (\d+)/(\d+)(?:\s*\(global (\d+)\))? \| '
-    r'Loss: ([\d.]+) \| LR: ([\de.\-+]+)(?: \| GN: ([\d.]+))?'
+    r'Loss: ([\d.]+)(?: \| Sec: ([\d.]+))?(?: \| Chord: ([\d.]+))? \| '
+    r'LR: ([\de.\-+]+)(?: \| GN: ([\d.]+))?'
 )
 _PHASE_RE = re.compile(
-    r'\[(.+?)\] Step \d+/\d+'
+    r'\[(\w[\w ]+)\] Step \d+/\d+'
 )
 _VAL_LOSS_RE = re.compile(
     r'(?:\[.+\]\s+)?Val loss: ([\d.]+)'
@@ -286,6 +287,7 @@ def _parse_training_progress(log_path: str) -> dict:
     result = {
         'phase': None, 'phase_step': 0, 'phase_total': 0,
         'global_step': 0, 'loss': None, 'lr': None, 'grad_norm': None,
+        'sec_loss': None, 'chord_loss': None,
         'val_loss': None, 'val_loss_step': 0, 'val_acc': {},
         'step_time_s': None,
         'loss_history': [],  # last N losses for trend
@@ -315,8 +317,12 @@ def _parse_training_progress(log_path: str) -> dict:
             global_str = step_match.group(3)
             result['global_step'] = int(global_str) if global_str else phase_step_val
             result['loss'] = float(step_match.group(4))
-            result['lr'] = float(step_match.group(5))
-            gn_str = step_match.group(6)
+            sec_str = step_match.group(5)
+            result['sec_loss'] = float(sec_str) if sec_str else None
+            chord_str = step_match.group(6)
+            result['chord_loss'] = float(chord_str) if chord_str else None
+            result['lr'] = float(step_match.group(7))
+            gn_str = step_match.group(8)
             result['grad_norm'] = float(gn_str) if gn_str else None
 
             # Parse time from log: "... | Time: 123.4s"
@@ -553,8 +559,8 @@ class PreflightChecker:
             import random
             samples = random.sample(files, min(3, len(files)))
             for fpath in samples:
-                # 匹配 TokenDataset._resolve_path 逻辑：优先 data_dir/tokens/<basename>
-                full = os.path.join(self.config.data_dir, 'tokens', os.path.basename(fpath))
+                # 匹配 TokenDataset._resolve_path 逻辑：优先 data_dir/tokens_v3/<basename>
+                full = os.path.join(self.config.data_dir, 'tokens_v3', os.path.basename(fpath))
                 if not os.path.exists(full):
                     full = fpath if os.path.isabs(fpath) else os.path.join(self.config.data_dir, fpath)
                 if not os.path.exists(full):
@@ -595,7 +601,7 @@ class PreflightChecker:
                 missing.append(var)
         if missing:
             return CheckResult('环境变量', False,
-                               f'未设置: {", ".join(missing)}')
+                               f'未设置: {", ".join(missing)}（使用默认值）', is_warning=True)
         return CheckResult('环境变量', True, f'已设置: {", ".join(found)}')
 
     def check_disk_io(self) -> CheckResult:
@@ -697,7 +703,7 @@ print(f'CUDA cleared | GPU: {{torch.cuda.get_device_name(0)}} | '
       f'显存: {{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}}GB')
 " 2>> "$CRASH_LOG"
 
-    python3 scripts/run_curriculum_training.py \
+    python3 scripts/train/run_curriculum_training.py \
         --midi-train-list "$DATA_DIR/train.txt" \
         --musicxml-train-list "$DATA_DIR/train.txt" \
         --val-list "$DATA_DIR/val.txt" \
@@ -1092,15 +1098,20 @@ class Monitor:
         lr_str = f'{t["lr"]:.2e}' if t['lr'] is not None else '--'
         gn_str = f'{t["grad_norm"]:.2f}' if t['grad_norm'] is not None else '--'
         trend_str = d.get('loss_trend', '—')
-        lines.append(box.row(f'Loss: {loss_str} {trend_str}    LR: {lr_str}    GN: {gn_str}'))
+        sec_str = f'  Sec: {t["sec_loss"]:.4f}' if t.get("sec_loss") else ''
+        chord_str = f'  Chord: {t["chord_loss"]:.4f}' if t.get("chord_loss") else ''
+        lines.append(box.row(f'Loss: {loss_str} {trend_str}{sec_str}{chord_str}    LR: {lr_str}    GN: {gn_str}'))
 
         # ── Validation ──────────────────────────
         if t['val_loss'] is not None:
             acc_parts = []
-            for key in ('overall', 'note', 'duration', 'bar', 'dynamic', 'velocity', 'key', 'tempo'):
+            for key in ('overall', 'note', 'duration', 'bar', 'dynamic', 'velocity', 'key', 'tempo',
+                         'sec_bars', 'sec_keys', 'sec_types', 'chord_func', 'chord_inv'):
                 val = t.get('val_acc', {}).get(key)
                 if val is not None:
-                    display_key = {'overall': 'all', 'duration': 'dur', 'velocity': 'vel'}.get(key, key)
+                    display_key = {'overall': 'all', 'duration': 'dur', 'velocity': 'vel',
+                                   'sec_bars': 'secᴮ', 'sec_keys': 'secᴷ', 'sec_types': 'secᵀ',
+                                   'chord_func': 'chordᶠ', 'chord_inv': 'chordᴵ'}.get(key, key)
                     acc_parts.append(f'{display_key} {val*100:.1f}%')
             acc_str = f'  ▏{"  ".join(acc_parts)}' if acc_parts else ''
             lines.append(box.row(f'Val Loss: {t["val_loss"]:.4f}  (step {t["val_loss_step"]:,}){acc_str}'))
@@ -1291,13 +1302,18 @@ class StatusReporter:
             phase_name = train['phase'] or '?'
             print(f'  Phase:    {phase_name}  (step {train["global_step"]:,} / {train["phase_total"]:,})')
             gn_str = f'  GN: {train["grad_norm"]:.2f}' if train['grad_norm'] else ''
-            print(f'  Loss:     {train["loss"]:.4f}    LR: {train["lr"]:.2e}{gn_str}')
+            sec_str = f'  Sec: {train["sec_loss"]:.4f}' if train.get("sec_loss") else ''
+            chord_str = f'  Chord: {train["chord_loss"]:.4f}' if train.get("chord_loss") else ''
+            print(f'  Loss:     {train["loss"]:.4f}    LR: {train["lr"]:.2e}{sec_str}{chord_str}{gn_str}')
             if train['val_loss'] is not None:
                 acc_parts = []
-                for key in ('overall', 'note', 'duration', 'bar', 'dynamic', 'velocity', 'key', 'tempo'):
+                for key in ('overall', 'note', 'duration', 'bar', 'dynamic', 'velocity', 'key', 'tempo',
+                         'sec_bars', 'sec_keys', 'sec_types', 'chord_func', 'chord_inv'):
                     val = train.get('val_acc', {}).get(key)
                     if val is not None:
-                        display_key = {'overall': 'all', 'duration': 'dur', 'velocity': 'vel'}.get(key, key)
+                        display_key = {'overall': 'all', 'duration': 'dur', 'velocity': 'vel',
+                                       'sec_bars': 'secB', 'sec_keys': 'secK', 'sec_types': 'secT',
+                                       'chord_func': 'chordF', 'chord_inv': 'chordI'}.get(key, key)
                         acc_parts.append(f'{display_key}={val*100:.1f}%')
                 acc_str = f'  {"  ".join(acc_parts)}' if acc_parts else ''
                 print(f'  Val Loss: {train["val_loss"]:.4f}  (step {train["val_loss_step"]:,})')

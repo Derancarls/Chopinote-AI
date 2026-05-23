@@ -92,7 +92,8 @@ class TestModelRoPE:
     def test_model_backward(self):
         config = ModelConfig(d_model=256, n_heads=4, n_layers=2, d_ff=1024,
                              vocab_size=100, max_seq_len=64,
-                             use_section_attention=False)
+                             use_section_attention=False,
+                             use_chord_attention=False)
         model = MusicTransformer(config).cuda()
         input_ids = torch.randint(0, 100, (2, 32), device='cuda')
         logits = model(input_ids)
@@ -177,7 +178,8 @@ class TestModelFP8:
     def test_fp8_backward(self):
         config = ModelConfig(d_model=256, n_heads=4, n_layers=2, d_ff=1024,
                              vocab_size=100, max_seq_len=64,
-                             use_section_attention=False)
+                             use_section_attention=False,
+                             use_chord_attention=False)
         model = MusicTransformer(config).cuda()
         model.eval()
         model.set_fp8_mode(True)

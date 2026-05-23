@@ -95,7 +95,7 @@ SIGNAL_WEIGHTS = {
 }
 
 MIN_SECTION_BARS = 4       # 段落最小长度
-BOUNDARY_THRESHOLD = 0.4   # 边界检测置信度阈值
+BOUNDARY_THRESHOLD = 0.2   # 边界检测置信度阈值
 DECAY_WINDOW = 16          # 衰减窗口（小节）
 
 # Lazy tokenizer 单例（避免每个文件重复创建）
@@ -606,9 +606,9 @@ def annotate_file(token_path: str, output_dir: str) -> Optional[str]:
         if boundaries[i] and fused[i] < BOUNDARY_THRESHOLD:
             boundaries[i] = 0
 
-    # 如果没有高置信度边界 → 视为"无段落"
+    # 如果没有高置信度边界 → 整曲作为一个段落
     if boundaries.sum() == 0:
-        return _write_no_section(token_path, output_dir)
+        return _write_single_section(token_path, output_dir, bars)
 
     # 推断段落类型
     section_types = infer_section_types(bars, boundaries)
@@ -619,7 +619,7 @@ def annotate_file(token_path: str, output_dir: str) -> Optional[str]:
     section_boundaries = sorted(set(section_boundaries))
 
     if len(section_boundaries) < 2:
-        return _write_no_section(token_path, output_dir)
+        return _write_single_section(token_path, output_dir, bars)
 
     # 计算每个段落的属性
     n_tokens = len(token_strs)
@@ -676,22 +676,31 @@ def _get_sec_path(token_path: str, output_dir: str) -> str:
     return str(Path(output_dir) / (Path(token_path).stem + '.sec.json'))
 
 
-def _write_no_section(token_path: str, output_dir: str) -> str:
-    """写入无段落标注。"""
+def _write_single_section(token_path: str, output_dir: str, bars: List[dict]) -> str:
+    """整曲作为一个段落写入（无边界检测时使用）。"""
     sec_path = _get_sec_path(token_path, output_dir)
     try:
         with open(token_path, 'r', encoding='utf-8') as f:
             tokens = json.load(f)
     except Exception:
         return None
-    n = len(tokens)
+    n_tokens = len(tokens)
+    n_bars = len(bars)
+    primary_key = _get_primary_key(bars, 0, n_bars)
+    sec_type = _section_fallback_id(0)  # section0 (通用)
     os.makedirs(os.path.dirname(sec_path), exist_ok=True)
     with open(sec_path, 'w', encoding='utf-8') as f:
         json.dump({
-            'section_ids': [0] * n,
-            'section_types': [0] * n,
-            'section_token_positions': [],
-            'section_attrs': [],
+            'section_ids': [1] * n_tokens,
+            'section_types': [sec_type] * n_tokens,
+            'section_token_positions': [0],
+            'section_attrs': [
+                {
+                    'bars': n_bars,
+                    'key': _key_to_id(primary_key),
+                    'type': sec_type,
+                }
+            ],
         }, f, ensure_ascii=False)
     return sec_path
 

@@ -3,7 +3,7 @@ from chopinote_dataset.tokenizer import REMITokenizer
 
 class TestVocabSize:
     def test_vocab_size(self, tokenizer):
-        assert tokenizer.vocab_size == 908  # 886 + 22 section tokens
+        assert tokenizer.vocab_size == 929  # 908 + 21 chord function/section tokens
 
     def test_grid16_vel8_determines_vocab(self):
         t1 = REMITokenizer(grid_size=16, velocity_levels=8)

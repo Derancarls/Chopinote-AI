@@ -187,7 +187,7 @@ class TestForwardSection:
         assert 'bars' in sec_head
         assert 'key' in sec_head
         assert 'type' in sec_head
-        assert sec_head['bars'].shape == (B, T, 65)
+        assert sec_head['bars'].shape == (B, T, model.config.n_section_bars_classes + 1)
         assert sec_head['key'].shape == (B, T, 31)
         assert sec_head['type'].shape == (B, T, 23)
 
@@ -357,6 +357,6 @@ class TestSectionPredictionHead:
         x = torch.randn(B, T, model.config.d_model, device=device)
         out = model.section_head(x)
 
-        assert out['bars'].shape == (B, T, 65)
+        assert out['bars'].shape == (B, T, model.config.n_section_bars_classes + 1)
         assert out['key'].shape == (B, T, 31)
         assert out['type'].shape == (B, T, 23)

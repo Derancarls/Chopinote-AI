@@ -25,7 +25,7 @@ class TestTokenizerSmoke:
     def test_import_and_init(self):
         from chopinote_dataset.tokenizer import REMITokenizer
         t = REMITokenizer()
-        assert t.vocab_size == 908
+        assert t.vocab_size == 929
 
     def test_tokenize_detokenize_roundtrip(self, tokenizer):
         events = [
@@ -195,7 +195,8 @@ class TestModelSmoke:
 
     CONFIG_KWARGS = dict(d_model=128, n_heads=2, n_layers=2, d_ff=512,
                          vocab_size=100, max_seq_len=64,
-                         use_section_attention=False)
+                         use_section_attention=False,
+                         use_chord_attention=False)
 
     def _make_model(self):
         from chopinote_model.model import MusicTransformer
@@ -320,7 +321,7 @@ class TestConfigSmoke:
     def test_model_config_default(self):
         from chopinote_model.config import ModelConfig
         c = ModelConfig()
-        assert c.vocab_size == 908
+        assert c.vocab_size == 929
         assert c.d_model == 2048
         assert c.n_layers == 24
 
@@ -416,7 +417,8 @@ class TestFP8Smoke:
 
         config = ModelConfig(d_model=128, n_heads=2, n_layers=2, d_ff=512,
                              vocab_size=100, max_seq_len=64,
-                             use_section_attention=False)
+                             use_section_attention=False,
+                             use_chord_attention=False)
         model = MusicTransformer(config).cuda()
         model.eval()
         model.set_fp8_mode(True)

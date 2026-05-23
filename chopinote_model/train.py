@@ -1,8 +1,10 @@
 """训练循环。"""
 import os
+import itertools
 import shutil
 import time
 import logging
+import threading
 from pathlib import Path
 from typing import Optional, List
 
@@ -70,6 +72,7 @@ class Trainer:
         self.global_step = 0
         self.best_loss = float('inf')
         self._last_avg_loss = float('inf')
+        self._save_thread: Optional[threading.Thread] = None
 
         # TensorBoard 监控
         self.writer = SummaryWriter(log_dir=train_config.log_dir)
@@ -80,48 +83,82 @@ class Trainer:
         Path(train_config.log_dir).mkdir(parents=True, exist_ok=True)
 
     def save_checkpoint(self, loss: float):
-        """保存 checkpoint + 备份 + 自动清理旧文件。"""
+        """异步保存 checkpoint + cleanup（上个线程确保完成）。"""
+        # 等待上一个保存线程完成（避免并发写 best.pt / 旧的 step 文件）
+        self._join_save_thread()
+
         output_dir = Path(self.train_config.output_dir)
 
-        # ── step checkpoint ─────────────────────────────────
-        step_path = output_dir / f'step_{self.global_step}.pt'
-        torch.save({
-            'step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'loss': loss,
-            'config': self.model_config,
-        }, step_path)
-        logger.info(f'Checkpoint saved: {step_path}')
-
-        # 确认保存成功后再删旧的 step checkpoint（保留最新 2 个）
-        self._cleanup_old_checkpoints(keep_latest=2)
-
-        # 备份
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        backup_path = self.backup_dir / f'step_{self.global_step}.pt'
-        shutil.copy2(step_path, backup_path)
-        logger.info(f'Backup saved: {backup_path}')
-
-        # ── best checkpoint ─────────────────────────────────
-        if loss < self.best_loss:
+        # ── 将数据 copy 到 CPU，避免 GPU→CPU 迁移阻塞训练 ───
+        model_cpu = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+        opt_cpu = {k: v.detach().cpu().clone() if hasattr(v, 'detach') else v
+                   for k, v in self.optimizer.state_dict().items()}
+        sched_cpu = {k: v if not hasattr(v, 'detach') else v for k, v in self.scheduler.state_dict().items()}
+        step = self.global_step
+        is_best = loss < self.best_loss
+        if is_best:
             self.best_loss = loss
-            # 先写临时文件，确认后再原子替换，避免写一半损坏
-            tmp_path = output_dir / 'best.tmp'
-            best_path = output_dir / 'best.pt'
-            torch.save({
-                'step': self.global_step,
-                'model_state_dict': self.model.state_dict(),
+        backup_dir = str(self.backup_dir)
+
+        def _do_save():
+            _output = Path(output_dir)
+            step_path = _output / f'step_{step}.pt'
+            step_state = {
+                'step': step,
+                'model_state_dict': model_cpu,
+                'optimizer_state_dict': opt_cpu,
+                'scheduler_state_dict': sched_cpu,
                 'loss': loss,
                 'config': self.model_config,
-            }, tmp_path)
-            tmp_path.rename(best_path)  # 原子的—POSIX guarantee
-            logger.info(f'Best model saved: {best_path}')
-            # 备份 best.pt
-            best_backup = self.backup_dir / 'best.pt'
-            shutil.copy2(best_path, best_backup)
-            logger.info(f'Best model backup saved: {best_backup}')
+            }
+            torch.save(step_state, step_path)
+            logger.info(f'Checkpoint saved: {step_path}')
+
+            # 备份
+            _backup = Path(backup_dir)
+            _backup.mkdir(parents=True, exist_ok=True)
+            backup_path = _backup / f'step_{step}.pt'
+            shutil.copy2(step_path, backup_path)
+            logger.info(f'Backup saved: {backup_path}')
+
+            # 清理旧文件（保留最新 2 个）
+            step_files = sorted(
+                _output.glob('step_*.pt'),
+                key=lambda p: int(p.stem.split('_')[1]),
+            )
+            for f in step_files[:-2]:
+                f.unlink()
+                logger.info(f'Deleted old checkpoint: {f}')
+                b = _backup / f.name
+                if b.exists():
+                    b.unlink()
+                    logger.info(f'Deleted old backup: {b}')
+
+            # ── best checkpoint（原子写入）─────────────────
+            if is_best:
+                tmp_path = _output / 'best.tmp'
+                best_path = _output / 'best.pt'
+                best_state = {
+                    'step': step,
+                    'model_state_dict': model_cpu,
+                    'loss': loss,
+                    'config': self.model_config,
+                }
+                torch.save(best_state, tmp_path)
+                tmp_path.rename(best_path)
+                logger.info(f'Best model saved: {best_path}')
+                best_backup = _backup / 'best.pt'
+                shutil.copy2(best_path, best_backup)
+                logger.info(f'Best model backup saved: {best_backup}')
+
+        self._save_thread = threading.Thread(target=_do_save, daemon=True)
+        self._save_thread.start()
+
+    def _join_save_thread(self):
+        """等待上一个异步保存完成。"""
+        if self._save_thread is not None:
+            self._save_thread.join()
+            self._save_thread = None
 
     def _cleanup_old_checkpoints(self, keep_latest: int = 2):
         """保留最新的 keep_latest 个 step checkpoint，删除更早的（含备份）。"""
@@ -204,6 +241,7 @@ class Trainer:
             eval_steps=config.eval_steps, save_steps=config.save_steps,
             val_dataloader=val_dataloader,
         )
+        self._join_save_thread()  # 等待最后的异步保存完成
         self.writer.close()
         logger.info('训练完成')
 
@@ -229,8 +267,9 @@ class Trainer:
                 dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
-                num_workers=0,
-                pin_memory=False,
+                num_workers=2,
+                persistent_workers=True,
+                pin_memory=True,
                 collate_fn=collate_fn,
                 drop_last=True,
             )
@@ -300,6 +339,7 @@ class Trainer:
         start_time = time.time()
         local_step = 0
         accum = 0
+        epoch = 0
         _vocab_checked = False
 
         while local_step < total_steps:
@@ -382,15 +422,15 @@ class Trainer:
                         if has_sec_targets:
                             bars_loss = nn.functional.cross_entropy(
                                 sec_head_logits['bars'].permute(0, 2, 1),
-                                sec_bars_target, ignore_index=-1, reduction='sum',
+                                sec_bars_target, ignore_index=-1, reduction='mean',
                             )
                             keys_loss = nn.functional.cross_entropy(
                                 sec_head_logits['key'].permute(0, 2, 1),
-                                sec_keys_target, ignore_index=-1, reduction='sum',
+                                sec_keys_target, ignore_index=-1, reduction='mean',
                             )
                             types_loss = nn.functional.cross_entropy(
                                 sec_head_logits['type'].permute(0, 2, 1),
-                                sec_types_target, ignore_index=-1, reduction='sum',
+                                sec_types_target, ignore_index=-1, reduction='mean',
                             )
                             sec_loss_val = bars_loss.item() + keys_loss.item() + types_loss.item()
                             loss = loss + model.config.sec_loss_weight * (bars_loss + keys_loss + types_loss)
@@ -468,12 +508,14 @@ class Trainer:
                                 self.writer.add_scalar('train/fp8_scale_x', sum(scales_x) / len(scales_x), self.global_step)
                                 self.writer.add_scalar('train/fp8_scale_w', sum(scales_w) / len(scales_w), self.global_step)
                         elapsed = time.time() - start_time
+                        sec_str = f' | Sec: {sec_loss_val:.4f}' if sec_loss_val > 0 else ''
+                        chord_str = f' | Chord: {chord_loss_val:.4f}' if chord_loss_val > 0 else ''
                         logger.info(
                             f'{prefix}Step {local_step}/{total_steps}'
                             f'{f" (global {self.global_step})" if phase_name else ""} | '
                             f'Loss: {avg_loss:.4f} | '
                             f'LR: {self.scheduler.get_last_lr()[0]:.2e} | '
-                            f'GN: {total_norm:.2f} | '
+                            f'GN: {total_norm:.2f}{sec_str}{chord_str} | '
                             f'Time: {elapsed:.1f}s'
                         )
                         total_loss = 0.0
@@ -494,8 +536,12 @@ class Trainer:
 
                     if save_steps and local_step % save_steps == 0:
                         self.save_checkpoint(self._last_avg_loss)
+            else:  # DataLoader 自然耗尽 → 新 epoch
+                epoch += 1
+                logger.info(f'{prefix}DataLoader epoch {epoch} 完成 (step {local_step}/{total_steps}), 启动新 epoch')
 
         self.save_checkpoint(self._last_avg_loss)
+        self._join_save_thread()  # 等待最后的异步保存完成
 
     def _build_token_type_map(self):
         """构建 token ID → 类型名映射，用于 per-token-type accuracy 统计。"""
@@ -579,12 +625,14 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader, max_batches: int = 0) -> dict:
-        """评估验证集。返回 dict，含 'loss' 和每个 token 类型的 'acc/<type>'。
-        max_batches: 限制最大批次数，0=不限制（全量验证集）。
-        """
+        """评估验证集。返回 dict，含 'loss'、per-type acc、section/chord acc。"""
         self.model.eval()
         total_sum = 0.0
         total_tokens = 0
+        sec_correct_bars = sec_correct_keys = sec_correct_types = 0
+        sec_total = 0
+        chord_correct_func = chord_correct_inv = 0
+        chord_total_func = chord_total_inv = 0
 
         num_types = len(self._type_names)
         type_total = torch.zeros(num_types, dtype=torch.float, device=self.device)
@@ -598,8 +646,28 @@ class Trainer:
             labels = batch['labels'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
 
+            # 传递 section / chord 数据（与训练一致）
+            model_kwargs = {}
+            if self.model_config.use_section_attention and 'section_ids' in batch:
+                model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
+                model_kwargs['section_types'] = batch['section_types'].to(self.device)
+                model_kwargs['return_sec_head'] = True
+            if self.model_config.use_chord_attention and 'chord_func_ids' in batch:
+                model_kwargs['chord_func_ids'] = batch['chord_func_ids'].to(self.device)
+                model_kwargs['chord_inv_ids'] = batch['chord_inv_ids'].to(self.device)
+                model_kwargs['return_chord_head'] = True
+
             with autocast('cuda', dtype=torch.bfloat16):
-                logits = self.model(input_ids, attention_mask)
+                output = self.model(input_ids, attention_mask, **model_kwargs)
+
+            # 解析输出
+            logits = output
+            sec_head = chord_head = None
+            if isinstance(output, tuple):
+                if len(output) == 3:
+                    logits, sec_head, chord_head = output
+                elif len(output) == 2:
+                    logits, sec_head = output
 
             # ── Loss ──────────────────────────────────────
             if _LIGER_AVAILABLE:
@@ -626,14 +694,45 @@ class Trainer:
             type_total.scatter_add_(0, types_v, ones)
             type_correct.scatter_add_(0, types_v, correct_v.float())
 
+            # ── Section accuracy ──────────────────────────
+            if sec_head is not None and 'sec_bars_target' in batch:
+                sec_bars = batch['sec_bars_target'].to(self.device)
+                sec_keys = batch['sec_keys_target'].to(self.device)
+                sec_types = batch['sec_types_target'].to(self.device)
+                sec_mask = sec_bars != -1
+                if sec_mask.any():
+                    sec_total += sec_mask.sum().item()
+                    sec_correct_bars += (sec_head['bars'].argmax(-1)[sec_mask] == sec_bars[sec_mask]).sum().item()
+                    sec_correct_keys += (sec_head['key'].argmax(-1)[sec_mask] == sec_keys[sec_mask]).sum().item()
+                    sec_correct_types += (sec_head['type'].argmax(-1)[sec_mask] == sec_types[sec_mask]).sum().item()
+
+            # ── Chord accuracy ────────────────────────────
+            if chord_head is not None and 'chord_func_targets' in batch:
+                chord_func = batch['chord_func_targets'].to(self.device)
+                chord_inv = batch['chord_inv_targets'].to(self.device)
+                f_mask = chord_func != -1
+                i_mask = chord_inv != -1
+                if f_mask.any():
+                    chord_total_func += f_mask.sum().item()
+                    chord_correct_func += (chord_head['func'].argmax(-1)[f_mask] == chord_func[f_mask]).sum().item()
+                if i_mask.any():
+                    chord_total_inv += i_mask.sum().item()
+                    chord_correct_inv += (chord_head['inv'].argmax(-1)[i_mask] == chord_inv[i_mask]).sum().item()
+
         results = {'loss': total_sum / max(1, total_tokens)}
         for i, name in enumerate(self._type_names):
             if type_total[i] > 0:
                 results[f'acc/{name}'] = (type_correct[i] / type_total[i]).item()
-
-        # Overall accuracy
         overall_total = type_total.sum().item()
         if overall_total > 0:
             results['acc/overall'] = (type_correct.sum() / overall_total).item()
+        if sec_total > 0:
+            results['acc/sec_bars'] = sec_correct_bars / sec_total
+            results['acc/sec_keys'] = sec_correct_keys / sec_total
+            results['acc/sec_types'] = sec_correct_types / sec_total
+        if chord_total_func > 0:
+            results['acc/chord_func'] = chord_correct_func / chord_total_func
+        if chord_total_inv > 0:
+            results['acc/chord_inv'] = chord_correct_inv / chord_total_inv
 
         return results

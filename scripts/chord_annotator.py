@@ -299,6 +299,9 @@ def annotate_chords(token_ids: list[int], sec_data: Optional[dict] = None,
 def _key_coverage_stats(token_ids: list[int]) -> dict:
     """统计调性覆盖：扫描 token 序列，统计缺少 <Key> 的小节。
 
+    在每个 <Bar> 边界处检查前一小节内是否有 <Key> token（而非累积标记），
+    避免首小节 <Bar> 先于 <Key> 导致的误报。最后一个小节在循环结束后检查。
+
     Returns: {'total_bars': int, 'keyless_bars': int, 'keyless_bar_indices': list[int]}
     """
     from chopinote_dataset.tokenizer import REMITokenizer
@@ -308,17 +311,23 @@ def _key_coverage_stats(token_ids: list[int]) -> dict:
     total_bars = 0
     keyless_bars = 0
     keyless_bar_indices = []
-    has_key = False
+    found_key_in_measure = False
 
     for tid in token_ids:
         if tid == bar_id:
-            total_bars += 1
-            if not has_key:
+            # 检查前一小节（跳过首个 <Bar>，因为它无前一小节）
+            if total_bars > 0 and not found_key_in_measure:
                 keyless_bars += 1
                 keyless_bar_indices.append(total_bars)
-            # 跨小节不重置 has_key（key 持续有效直到被新 key 覆盖）
+            total_bars += 1
+            found_key_in_measure = False  # 重置，开始检查新小节
         elif tid in _key_token_ids(tk):
-            has_key = True
+            found_key_in_measure = True
+
+    # 最后一个小节收尾检查
+    if total_bars > 0 and not found_key_in_measure:
+        keyless_bars += 1
+        keyless_bar_indices.append(total_bars)
 
     return {
         'total_bars': total_bars,

@@ -12,12 +12,14 @@ from .fp8_linear import FP8Linear
 
 _NEG_INF = float('-inf')
 
-# cuDNN attention (Blackwell 优化) 优先于 flash/efficient
+# flash/efficient attention (SDPA 4D mask 只需这两个)
 _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 try:
     _SDPA_BACKENDS.insert(0, SDPBackend.CUDNN_ATTENTION)
 except AttributeError:
     pass
+# 4D mask + cuDNN 会回退到 math backend → OOM
+_SDPA_BACKENDS_4D = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 
 
 class CausalSelfAttention(nn.Module):
@@ -98,29 +100,25 @@ class CausalSelfAttention(nn.Module):
 
         # ── 段落偏置（段落感知注意力）───────────────────────────
         if sec_bias is not None:
-            # 手动 attention（融合 causal mask + padding mask + sec_bias）
-            scale = self.head_dim ** -0.5
-            attn = (q @ k.transpose(-2, -1)) * scale  # (B, nH, T, T_kv)
-            attn = attn + sec_bias
-
-            # Causal mask
+            # 编码为 4D attn_mask → SDPA flash/mem-efficient 分块计算
+            # sec_bias (B,1,T,T_kv) 广播到所有头，不展开即无 (B,nH,T,T) 完整矩阵
+            attn_mask = sec_bias.to(dtype=q.dtype)
             if use_causal:
                 causal = torch.triu(
-                    torch.full((T, T_kv), _NEG_INF, device=x.device, dtype=attn.dtype),
+                    torch.full((T, T_kv), _NEG_INF, device=x.device, dtype=q.dtype),
                     diagonal=T_kv - T + 1)
-                attn = attn + causal[None, None, :, :]
-
-            # Padding mask
+                attn_mask = attn_mask + causal[None, None, :, :]
             if mask is not None:
                 m = mask[0] if mask.dim() == 2 else mask
-                pad = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=attn.dtype)
+                pad = torch.where(m.bool(), 0.0, _NEG_INF).to(dtype=q.dtype)
                 if pad.size(0) < T_kv:
                     pad = F.pad(pad, (0, T_kv - pad.size(0)), value=_NEG_INF)
-                attn = attn + pad.view(1, 1, 1, -1)
-
-            attn = F.softmax(attn, dim=-1)
-            attn = F.dropout(attn, p=self.dropout.p if self.training else 0.0)
-            y = attn @ v
+                attn_mask = attn_mask + pad.view(1, 1, 1, -1)
+            with sdpa_kernel(_SDPA_BACKENDS_4D):
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=False)
         else:
             # 标准 SDPA 快速路径
             if mask is not None and use_causal:
@@ -522,7 +520,8 @@ class MusicTransformer(nn.Module):
 
         # ── Section embedding ────────────────────────────────────
         sec_bias = None
-        use_sec = self.config.use_section_attention and section_ids is not None
+        use_sec = (self.config.use_section_attention and section_ids is not None
+                   and section_ids.ne(NO_SECTION_ID).any())
         if use_sec:
             if section_ids.ndim == 1:
                 section_ids = section_ids.unsqueeze(0)
@@ -562,8 +561,11 @@ class MusicTransformer(nn.Module):
                 inv_emb_idx = torch.where(input_ids == tid, inv_idx, inv_emb_idx)
             x = x + self.chord_inv_embedding(inv_emb_idx)
 
-            # 计算和弦偏置
-            if chord_func_ids is not None:
+            # 计算和弦偏置（仅当有真实和弦标注时）
+            has_chord_data = (chord_func_ids is not None
+                              and chord_func_ids.ndim >= 1
+                              and chord_func_ids.ne(0).any())
+            if has_chord_data:
                 if chord_func_ids.ndim == 1:
                     chord_func_ids = chord_func_ids.unsqueeze(0)
                 chord_ids_full = chord_func_ids
