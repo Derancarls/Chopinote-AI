@@ -399,11 +399,23 @@ class Trainer:
                             logits = output[0]
 
                     # Next-token prediction loss（主任务）
+                    # NaN 诊断: 检查 logits 是否包含 NaN/Inf
+                    _logits_flat = logits.view(-1, logits.size(-1))
+                    if torch.isnan(_logits_flat).any() or torch.isinf(_logits_flat).any():
+                        logger.error(
+                            f'{prefix}NaN/Inf in logits before CE! '
+                            f'logits range=[{_logits_flat.min().item():.4f}, {_logits_flat.max().item():.4f}] '
+                            f'nan={torch.isnan(_logits_flat).any().item()} inf={torch.isinf(_logits_flat).any().item()} '
+                            f'Resetting gradient accumulation.')
+                        self.optimizer.zero_grad()
+                        accum = 0
+                        continue
+                    # CE 转为 fp32 防止 bf16 log_softmax 下溢 NaN
                     if _LIGER_AVAILABLE:
-                        loss = _ce_loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+                        loss = _ce_loss(logits.view(-1, logits.size(-1)).float(), labels.view(-1))
                     else:
                         loss = nn.functional.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
+                            logits.view(-1, logits.size(-1)).float(),
                             labels.view(-1),
                             ignore_index=-100,
                             reduction='sum',
@@ -671,10 +683,10 @@ class Trainer:
 
             # ── Loss ──────────────────────────────────────
             if _LIGER_AVAILABLE:
-                loss = _ce_loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+                loss = _ce_loss(logits.view(-1, logits.size(-1)).float(), labels.view(-1))
             else:
                 loss = nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
+                    logits.view(-1, logits.size(-1)).float(),
                     labels.view(-1),
                     ignore_index=-100,
                     reduction='sum',
