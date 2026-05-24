@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""MusicXML 全量预处理 — 使用 MusicXMLToREMI 转换器。
+"""MusicXML 全量预处理 v3。
 
 Usage: python scripts/rerun_musicxml.py
 """
-import sys, os, time, logging, json
+import sys, os, time, logging, json, pickle
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
@@ -12,6 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 DATA_DIR = '/root/autodl-tmp/data/processed'
+CACHE_DIR = '/root/Chopinote-AI/data/cache'
 MUSICXML_DIRS = [
     '/root/autodl-tmp/data/raw/MusicXML/asap',
     '/root/autodl-tmp/data/raw/MusicXML/ATEPP-1.2',
@@ -20,39 +21,55 @@ MUSICXML_DIRS = [
     '/root/autodl-tmp/data/raw/MusicXML/music21_corpus',
 ]
 
-# ── Step 1: 清空旧的 MusicXML token ────────────────────────────
+# ── Step 1: 清空旧 MusicXML token + stale cache ────────────────────
 
 def clean_old_musicxml():
-    """删除旧 MusicXML token（仅删除 source_format 为 musicxml 的文件，保护 MIDI/PDMX）。"""
-    import json as _json
-    logger.info("清空旧 MusicXML token...")
+    logger.info("清空旧 MusicXML token 和缓存...")
     token_dir = f'{DATA_DIR}/tokens_v3'
     meta_dir = f'{DATA_DIR}/metadata_v3'
     os.makedirs(token_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
-    n = 0
-    m = 0
+
+    # 删除旧 MusicXML token（通过 metadata 中 file_path 含 /MusicXML/ 判断）
+    n_tok = 0
+    n_meta = 0
     for f in os.listdir(meta_dir):
         if not f.endswith('.meta.json'):
             continue
-        meta_path = os.path.join(meta_dir, f)
+        mp = os.path.join(meta_dir, f)
         try:
-            with open(meta_path) as mf:
-                md = _json.load(mf)
+            with open(mp) as fh:
+                md = json.load(fh)
         except Exception:
             continue
-        if md.get('source_format') != 'musicxml':
+        if '/MusicXML/' not in md.get('file_path', ''):
             continue
-        token_name = f.replace('.meta.json', '.tokens')
-        token_path = os.path.join(token_dir, token_name)
-        if os.path.exists(token_path):
-            os.remove(token_path)
-            n += 1
-        os.remove(meta_path)
-        m += 1
-    logger.info(f"  删除 {n} tokens, {m} metadata")
+        os.remove(mp)
+        n_meta += 1
+        tok_name = f.replace('.meta.json', '.tokens')
+        tp = os.path.join(token_dir, tok_name)
+        if os.path.exists(tp):
+            os.remove(tp)
+            n_tok += 1
 
-# ── Step 2: 并行处理 MusicXML ──────────────────────────────────
+    logger.info(f"  删除 {n_tok} 个旧 token, {n_meta} 个旧 metadata")
+
+    # 删除 MusicXML 缓存
+    n_cache = 0
+    if os.path.isdir(CACHE_DIR):
+        for f in os.listdir(CACHE_DIR):
+            fpath = os.path.join(CACHE_DIR, f)
+            try:
+                with open(fpath, 'rb') as fh:
+                    d = pickle.load(fh)
+            except Exception:
+                continue
+            if '/MusicXML/' in d.get('original_path', ''):
+                os.remove(fpath)
+                n_cache += 1
+    logger.info(f"  删除 {n_cache} 个 MusicXML 缓存")
+
+# ── Step 2: 并行处理 ──────────────────────────────────────────────
 
 def find_musicxml_files(dirs):
     files = []
@@ -75,49 +92,59 @@ def process_one(fpath):
     try:
         r = _proc.process_file(fpath, DATA_DIR)
         if r:
-            return (fpath, 'ok', r.get('num_tokens', 0))
+            return (fpath, 'converted', r.get('num_tokens', 0))
         else:
-            return (fpath, 'skip', None)
+            return (fpath, 'skipped', None)
     except Exception as e:
-        return (fpath, 'error', str(e))
+        return (fpath, 'failed', str(e)[:200])
 
 
 def run_musicxml():
     files = find_musicxml_files(MUSICXML_DIRS)
-    logger.info(f"找到 {len(files)} 个 MusicXML 文件")
+    total = len(files)
+    logger.info(f"MusicXML 源文件总数: {total}")
     if not files:
         logger.warning("无 MusicXML 文件可处理")
         return
 
     n_workers = min(cpu_count(), 8)
-    logger.info(f"并行 workers: {n_workers}")
+    logger.info(f"Worker: {n_workers}")
 
-    ok, skip, fail = 0, 0, 0
-    total_tokens = 0
+    converted = 0
+    skipped = 0
+    failed = 0
     t0 = time.time()
 
     with Pool(processes=n_workers, initializer=init_worker) as pool:
-        for fpath, status, info in pool.imap_unordered(process_one, files, chunksize=4):
-            if status == 'ok':
-                ok += 1
-                total_tokens += info or 0
-            elif status == 'skip':
-                skip += 1
+        for i, (fpath, status, info) in enumerate(pool.imap_unordered(process_one, files, chunksize=4)):
+            if status == 'converted':
+                converted += 1
+            elif status == 'skipped':
+                skipped += 1
             else:
-                fail += 1
-                if fail <= 10:
+                failed += 1
+                if failed <= 10:
                     logger.warning(f"  FAIL: {fpath}: {info}")
 
-            elapsed = time.time() - t0
-            done = ok + skip + fail
-            if done % 500 == 0 or done == len(files):
+            done = i + 1
+            if done % 500 == 0 or done == total:
+                elapsed = time.time() - t0
+                assert converted + skipped + failed == done
                 rate = done / elapsed if elapsed > 0 else 0
-                eta = (len(files) - done) / rate if rate > 0 else 0
-                logger.info(f"  进度: {done}/{len(files)} ok={ok} skip={skip} fail={fail} "
-                          f"rate={rate:.1f}/s eta={eta/60:.0f}min")
+                eta = (total - done) / rate if rate > 0 else 0
+                logger.info(
+                    f"  [{done}/{total}] "
+                    f"✓{converted} skipped↓{skipped} ✗{failed} "
+                    f"({rate:.1f}/s ETA {eta/60:.0f}min)"
+                )
 
-    logger.info(f"MusicXML 完成: ok={ok} skip={skip} fail={fail} "
-                f"tokens={total_tokens} time={time.time()-t0:.0f}s")
+    elapsed = time.time() - t0
+    assert converted + skipped + failed == total, \
+        f"计数不一致: {converted}+{skipped}+{failed} != {total}"
+    logger.info(
+        f"MusicXML 完成: 总共 {total} → ✓{converted} skipped↓{skipped} ✗{failed} "
+        f"({elapsed:.0f}s)"
+    )
 
 
 if __name__ == '__main__':

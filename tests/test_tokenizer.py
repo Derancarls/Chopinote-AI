@@ -3,7 +3,7 @@ from chopinote_dataset.tokenizer import REMITokenizer
 
 class TestVocabSize:
     def test_vocab_size(self, tokenizer):
-        assert tokenizer.vocab_size == 886
+        assert tokenizer.vocab_size == 929  # 908 + 21 chord function/section tokens
 
     def test_grid16_vel8_determines_vocab(self):
         t1 = REMITokenizer(grid_size=16, velocity_levels=8)
@@ -78,6 +78,12 @@ class TestEncodeDecodeRoundtrip:
         for ts in ['4/4', '3/4', '6/8']:
             t = f'<TimeSig {ts}>'
             assert tokenizer.decode_token(tokenizer.encode_token(t)) == t
+
+    def test_section_tokens(self, tokenizer):
+        for name in REMITokenizer.SECTION_NAMES:
+            t = f'<Section {name}>'
+            assert tokenizer.decode_token(tokenizer.encode_token(t)) == t
+        assert tokenizer.decode_token(tokenizer.encode_token('<SecSum>')) == '<SecSum>'
 
 
 class TestTokenizeDetokenizeRoundtrip:

@@ -385,6 +385,163 @@ def _pitch_range_tokens(tokens: list[int], tokenizer,
     return 1.0
 
 
+# ── 和弦评价指标 ────────────────────────────────────────
+
+# 和弦音级组成（音级偏移量）：大/小/减/增 三和弦 + 七和弦
+_CHORD_TONES: dict[str, list[int]] = {
+    'I': [0, 4, 7],       'i': [0, 3, 7],
+    'ii': [2, 5, 9],      'ii°': [2, 5, 8],
+    'iii': [4, 7, 11],    'III': [4, 8, 11],
+    'IV': [5, 9, 12],     'iv': [5, 8, 12],
+    'V': [7, 11, 14],     'vi': [9, 12, 16],
+    'VI': [8, 12, 15],    'vii°': [11, 14, 17],
+    'N': [1, 5, 8],       'It6': [8, 12, 18],
+    'Fr6': [8, 12, 14, 18], 'Ger6': [8, 12, 15, 18],
+}
+
+# 和弦进行合理性转移矩阵 (18×18, 简化为 key-indexed 评分)
+# 1.0 = 强进行, 0.7 = 允许, 0.4 = 弱, 0.0 = 无效
+def _get_progression_score(prev_func: str, curr_func: str) -> float:
+    """基于功能和声规则评估相邻和弦的进行合理性。"""
+    # 强进行
+    strong = {
+        ('V', 'I'), ('V', 'i'), ('V', 'vi'), ('IV', 'I'), ('IV', 'i'),
+        ('ii', 'V'), ('ii°', 'V'), ('vii°', 'I'), ('vii°', 'i'),
+        ('I', 'IV'), ('i', 'iv'), ('I', 'V'), ('i', 'V'),
+    }
+    if (prev_func, curr_func) in strong:
+        return 1.0
+    # 弱进行
+    weak = {('I', 'ii'), ('I', 'vi'), ('i', 'VI'), ('VI', 'V')}
+    if (prev_func, curr_func) in weak:
+        return 0.5
+    # 相同和弦延续
+    if prev_func == curr_func:
+        return 0.8
+    return 0.3
+
+
+def _extract_chord_sequence(tokens: list[int], tokenizer) -> list[str]:
+    """从 token 序列中提取和弦功能序列。"""
+    chords = []
+    for t in tokens:
+        s = tokenizer.decode_token(t)
+        if s.startswith('<Chord ') and not s.startswith('<Chord 7>'):
+            func = s[len('<Chord ') + 1:-1]
+            chords.append(func)
+    return chords
+
+
+def chord_melody_alignment_tokens(tokens: list[int], tokenizer,
+                                   tonic_midi: int = 60) -> float:
+    """E: 和弦-旋律一致性 — 检查旋律音是否落在当前和弦音内。"""
+    chords = _extract_chord_sequence(tokens, tokenizer)
+    if len(chords) < 2:
+        return 0.5
+
+    # 提取旋律音序列
+    melody_intervals = []
+    for t in tokens:
+        s = tokenizer.decode_token(t)
+        if s.startswith('<Note_ON'):
+            melody_intervals.append(int(s[len('<Note_ON') + 1:-1]))
+
+    if len(melody_intervals) < 3:
+        return 0.5
+
+    # 按和弦分配旋律音并检查匹配
+    notes_per_chord = max(1, len(melody_intervals) // len(chords))
+    aligned = 0
+    total = 0
+    for i, chord_func in enumerate(chords):
+        chord_tones = _CHORD_TONES.get(chord_func)
+        if chord_tones is None:
+            continue
+        start = i * notes_per_chord
+        end = start + notes_per_chord if i < len(chords) - 1 else len(melody_intervals)
+        for j in range(start, min(end, len(melody_intervals))):
+            interval = melody_intervals[j]
+            pc = (tonic_midi + interval) % 12
+            if pc in {t % 12 for t in chord_tones}:
+                aligned += 1
+            total += 1
+
+    if total == 0:
+        return 0.5
+    return aligned / total
+
+
+def progression_validity_tokens(tokens: list[int], tokenizer) -> float:
+    """F: 和声进行合理性 — 相邻和弦进行是否符合功能和声规则。"""
+    chords = _extract_chord_sequence(tokens, tokenizer)
+    if len(chords) < 2:
+        return 0.5
+
+    scores = []
+    for i in range(len(chords) - 1):
+        scores.append(_get_progression_score(chords[i], chords[i + 1]))
+
+    return sum(scores) / len(scores)
+
+
+def cadence_quality_tokens(tokens: list[int], tokenizer) -> float:
+    """G: 终止式质量 — 检查段落结尾是否有合理终止式。"""
+    chords = _extract_chord_sequence(tokens, tokenizer)
+    if len(chords) < 3:
+        return 0.5
+
+    # 查找最后几个和弦的终止式模式
+    # 完全终止: V→I, V7→I
+    # 变格终止: IV→I
+    # 半终止: →V
+    # 阻碍终止: V→vi
+
+    last_two = (chords[-2], chords[-1]) if len(chords) >= 2 else None
+    last_three = (chords[-3], chords[-2], chords[-1]) if len(chords) >= 3 else None
+
+    cadence_score = 0.0
+
+    if last_two in [('V', 'I'), ('V', 'i')]:
+        cadence_score = 1.0  # Authentic
+    elif last_two in [('IV', 'I'), ('iv', 'i')]:
+        cadence_score = 0.8  # Plagal
+    elif chords[-1] == 'V':
+        cadence_score = 0.6  # Half
+    elif last_two in [('V', 'vi'), ('V', 'VI')]:
+        cadence_score = 0.5  # Deceptive
+    elif last_three and last_three[0] in ('ii', 'ii°') and last_three[1] == 'V' and last_three[2] in ('I', 'i'):
+        cadence_score = 1.0  # Perfect: ii-V-I
+    else:
+        cadence_score = 0.1
+
+    return cadence_score
+
+
+def harmonic_rhythm_score_tokens(tokens: list[int], tokenizer) -> float:
+    """H: 和声节奏 — 检查和弦变化频率是否合理。"""
+    chords = _extract_chord_sequence(tokens, tokenizer)
+    if len(chords) < 2:
+        return 0.5
+
+    # 统计和弦变化次数 vs 总长度
+    changes = sum(1 for i in range(1, len(chords)) if chords[i] != chords[i - 1])
+    total = len(tokens)
+    if total == 0:
+        return 0.5
+
+    # 理想: 每 8-32 token 换一次和弦 (约 2-8 拍)
+    change_rate = total / max(1, changes + 1)
+
+    if 8 <= change_rate <= 32:
+        return 1.0
+    elif change_rate < 4:  # 每 4 token 换一次 — 太密
+        return max(0.0, change_rate / 4.0)
+    elif change_rate > 64:  # >64 token 不换 — 太单调
+        return max(0.0, 1.0 - (change_rate - 64) / 64.0)
+    else:
+        return 0.7
+
+
 # ── 注册表 ────────────────────────────────────────────
 # 每个指标注册其阶段归属 + 实现函数
 
@@ -448,7 +605,14 @@ def _register_all() -> dict[str, MetricDef]:
     reg("self_similarity", "自相似性", "C", weight=0.08)
     reg("pitch_entropy", "音高熵", "C", weight=0.05)
     reg("chromaticism_index", "半音化程度", "C", weight=0.05)
-    reg("harmonic_rhythm", "和声节奏", "C", weight=0.04)
+    reg("harmonic_rhythm", "和声节奏", "C",
+        fn_tokens=harmonic_rhythm_score_tokens, weight=0.04)
+    reg("chord_melody_alignment", "和弦-旋律一致性", "C",
+        fn_tokens=chord_melody_alignment_tokens, weight=0.06)
+    reg("progression_validity", "和声进行合理性", "B2,C",
+        fn_tokens=progression_validity_tokens, weight=0.06)
+    reg("cadence_quality", "终止式质量", "C",
+        fn_tokens=cadence_quality_tokens, weight=0.04)
     reg("polyphony_mean", "平均复音数", "C", weight=0.03)
     reg("texture_variance", "织体变化", "C", weight=0.03)
     reg("contour_arc", "拱形结构", "C", weight=0.03)

@@ -3,11 +3,17 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
+# ── 段落感知常量 ────────────────────────────────────────────
+# section_id=0 / section_type=0 统一表示"无段落"
+# 所有模块必须引用此常量，禁止硬编码 0
+NO_SECTION_ID: int = 0
+NO_SECTION_TYPE_ID: int = 0
+
 
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
-    vocab_size: int = 886
+    vocab_size: int = 929
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 32
@@ -19,6 +25,29 @@ class ModelConfig:
     max_measures: int = 256
     rope_theta: float = 10000.0
     gradient_checkpointing: bool = True
+
+    # --- 段落感知（paragraph-aware） ---
+    use_section_attention: bool = True
+    n_section_types: int = 22          # 21 section types + padding
+    n_section_bars_classes: int = 128  # 段落持续小节数分类数 (0~128 + 1)
+    max_sections: int = 64             # 每曲最多 64 个段落实例
+    sec_bias_decay_len: int = 16       # 偏置距离衰减半衰期（小节）
+    sec_bias_alpha_init: float = 0.5   # 同实例偏置
+    sec_bias_beta_init: float = 0.15   # 同类型跨实例偏置
+    sec_bias_gamma_init: float = 0.05  # 跨类型偏置
+    sec_bias_delta_init: float = 0.2   # 边界桥接偏置
+    sec_loss_weight: float = 0.1       # 段落预测 loss 权重
+
+    # --- 和弦感知（chord-aware / functional harmony） ---
+    use_chord_attention: bool = True
+    n_chord_funcs: int = 17            # 16 功能 + 1 padding
+    n_chord_inversions: int = 5        # 4 转位 (Root/1st/2nd/3rd) + 1 padding
+    chord_gamma_init: float = 0.3      # 同和弦凝聚
+    chord_epsilon_init: float = 0.1    # 切换桥接
+    chord_zeta_init: float = 0.08      # 同功能组弱正偏置
+    chord_decay_len: int = 8           # γ/ζ 衰减半衰期（小节）
+    chord_epsilon_bar_window: int = 2  # ε 作用窗口（小节）
+    chord_loss_weight: float = 0.15    # 和弦预测 loss 权重
 
     @property
     def head_dim(self) -> int:
@@ -95,7 +124,7 @@ class PhaseConfig:
     loss_mask: Optional[TokenLossMask] = None        # None = 不屏蔽，全量 loss
     save_steps: int = 1000
     eval_steps: int = 1000
-    max_eval_batches: int = 500
+    max_eval_batches: int = 200
 
 
 @dataclass
@@ -115,7 +144,7 @@ class TrainingConfig:
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000
-    max_eval_batches: int = 500  # 限制验证批次数，0=不限制（全量）
+    max_eval_batches: int = 200  # 限制验证批次数，0=不限制（全量）
     output_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_OUTPUT_DIR', '/root/autodl-tmp/chopinote/checkpoints'))
     log_dir: str = field(default_factory=lambda: os.environ.get(

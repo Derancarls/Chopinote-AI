@@ -222,12 +222,12 @@ class MusicXMLToREMI(_BaseREMI):
         key_objs = score.flatten().getElementsByClass(m21key.Key)
         if key_objs:
             k = key_objs[0]
-            key_name = k.tonic.name + ('m' if k.mode == 'minor' else '')
+            key_name = k.tonic.name.replace('-', 'b') + ('m' if k.mode == 'minor' else '')
         if key_name is None:
             ks_objs = score.flatten().getElementsByClass(m21key.KeySignature)
             if ks_objs:
                 k = ks_objs[0].asKey()
-                key_name = k.tonic.name + ('m' if k.mode == 'minor' else '')
+                key_name = k.tonic.name.replace('-', 'b') + ('m' if k.mode == 'minor' else '')
         tonic_midi = key_name_to_tonic_midi(key_name)
         # ──────────────────────────────────────────────────────
 
@@ -240,7 +240,7 @@ class MusicXMLToREMI(_BaseREMI):
                 end = min(start + 3, len(measure_map))
                 segment = score.measures(start + 1, end + 1)
                 k_obj = key_analyzer.analyze(segment)
-                seg_key = k_obj.tonic.name + ('m' if k_obj.mode == 'minor' else '')
+                seg_key = k_obj.tonic.name.replace('-', 'b') + ('m' if k_obj.mode == 'minor' else '')
                 if not key_changes or seg_key != key_changes[-1][1]:
                     key_changes.append((start, seg_key))
         except Exception:
@@ -377,7 +377,8 @@ class MusicXMLToREMI(_BaseREMI):
                     elif isinstance(elem, dynamics.Dynamic):
                         dyn_val = elem.value if hasattr(elem, 'value') else ''
                         if dyn_val == 'other-dynamics':
-                            dyn_val = '' if elem.otherDynamic is None else str(elem.otherDynamic)
+                            other = getattr(elem, 'otherDynamic', None)
+                            dyn_val = '' if other is None else str(other)
                         if dyn_val and dyn_val != 'r':
                             extra.append((measure_idx, pos, part_idx,
                                           REMITokenizer.DYNAMIC, dyn_val))
@@ -978,7 +979,7 @@ class MIDIToREMI(_BaseREMI):
         key_objs = score.flatten().getElementsByClass(key.Key)
         if key_objs:
             k = key_objs[0]
-            key_name = k.tonic.name + ('m' if k.mode == 'minor' else '')
+            key_name = k.tonic.name.replace('-', 'b') + ('m' if k.mode == 'minor' else '')
         tonic_midi = key_name_to_tonic_midi(key_name)
         # ──────────────────────────────────────────────────────
 
@@ -991,7 +992,7 @@ class MIDIToREMI(_BaseREMI):
                 end = min(start + 3, len(measure_map))
                 segment = score.measures(start + 1, end + 1)
                 k_obj = key_analyzer.analyze(segment)
-                seg_key = k_obj.tonic.name + ('m' if k_obj.mode == 'minor' else '')
+                seg_key = k_obj.tonic.name.replace('-', 'b') + ('m' if k_obj.mode == 'minor' else '')
                 if not key_changes or seg_key != key_changes[-1][1]:
                     key_changes.append((start, seg_key))
         except Exception:

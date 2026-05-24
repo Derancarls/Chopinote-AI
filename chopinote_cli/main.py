@@ -821,6 +821,13 @@ def generate_once(model, tokenizer, seed_tensor, device,
         if device.type == 'cuda':
             torch.cuda.manual_seed_all(seed + generation_idx)
 
+    # ── 段落感知两阶段生成 ──
+    if params.get('section_aware'):
+        return generate_section_aware_once(
+            model, tokenizer, seed_tensor[0].tolist(), device,
+            params, model_vocab_size,
+        )
+
     full_ids, stats = generate_with_progress(
         model, seed_tensor, tokenizer,
         max_bars=params['max_bars'],
@@ -1002,6 +1009,123 @@ def _run_evaluate(args):
     print()
 
 
+# -- 段落感知生成入口 ----------------------------------------------------
+
+def _parse_structure_tokens(structure_tokens: list[int], tokenizer) -> list[dict]:
+    """将结构规划的输出 token 解析为 section_plan。"""
+    section_token_map = {
+        name: f'<Section {name}>' for name in tokenizer.SECTION_NAMES
+    }
+
+    plan = []
+    current_section = None
+    current_bars = 8
+    current_key = 'C'
+
+    for tid in structure_tokens:
+        ts = tokenizer.decode_token(tid)
+
+        # 检测 Section token
+        for sec_name, sec_str in section_token_map.items():
+            if ts == sec_str:
+                if current_section is not None:
+                    plan.append({
+                        'type': current_section,
+                        'bars': current_bars,
+                        'key': current_key,
+                    })
+                current_section = sec_name
+                current_bars = 8  # reset to default
+                break
+
+        if ts.startswith('<Key '):
+            current_key = ts[len('<Key') + 1:-1]
+        elif ts.startswith('<Bar_'):
+            try:
+                current_bars = int(ts[len('<Bar_') + 1:-1])
+            except ValueError:
+                pass
+
+    # 最后一个 section
+    if current_section is not None:
+        plan.append({
+            'type': current_section,
+            'bars': current_bars,
+            'key': current_key,
+        })
+
+    return plan
+
+
+@torch.no_grad()
+def generate_section_aware_once(
+    model, tokenizer, seed_tokens, device,
+    params: dict, model_vocab_size: int,
+) -> tuple[list[int], dict]:
+    """段落感知两阶段生成，返回 (token_id_list, stats)。"""
+    import time
+    from chopinote_model.generate import generate_structure_plan, section_aware_generate
+
+    start_time = time.time()
+
+    # Stage 1: 结构规划
+    print('  [Stage 1/2] 结构规划...')
+    form_constraint = {
+        'form': params.get('section_form', 'sonata'),
+        'total_bars': params.get('section_total_bars', 64),
+    }
+
+    structure_tokens = generate_structure_plan(
+        model, tokenizer, list(seed_tokens),
+        form_constraint=form_constraint,
+        max_new_tokens=params.get('structure_max_tokens', 32),
+        temperature=params.get('temperature', 1.0),
+        top_k=params.get('top_k', 20),
+    )
+
+    # Parse structure tokens into section plan
+    section_plan = _parse_structure_tokens(structure_tokens, tokenizer)
+    if not section_plan:
+        print('  [!] 结构规划为空，使用默认奏鸣曲式')
+        section_plan = [
+            {'type': 'exposition', 'bars': 16, 'key': 'C'},
+            {'type': 'development', 'bars': 16, 'key': 'G'},
+            {'type': 'recapitulation', 'bars': 16, 'key': 'C'},
+            {'type': 'coda', 'bars': 8, 'key': 'C'},
+        ]
+
+    print(f'  结构规划: {len(section_plan)} 段')
+    for i, sec in enumerate(section_plan):
+        print(f'    段{i+1}: {sec["type"]} x {sec["bars"]}bars key={sec.get("key", "?")}')
+
+    # Stage 2: 段落条件生成
+    print('  [Stage 2/2] 段落条件生成...')
+    full_tokens = section_aware_generate(
+        model, tokenizer, list(seed_tokens),
+        section_plan=section_plan,
+        max_bars=params.get('max_bars', 64),
+        max_new_tokens=params.get('max_new_tokens', 4096),
+        temperature=params.get('temperature', 1.0),
+        top_k=params.get('top_k', 20),
+    )
+
+    elapsed = time.time() - start_time
+    bar_id = tokenizer.bar_token_id
+    seed_bars = sum(1 for t in seed_tokens if t == bar_id)
+    total_bars = sum(1 for t in full_tokens if t == bar_id)
+    new_tokens = len(full_tokens) - len(seed_tokens)
+
+    stats = {
+        'bars': total_bars - seed_bars,
+        'new_tokens': max(0, new_tokens),
+        'total_tokens': len(full_tokens),
+        'time_seconds': elapsed,
+        'tokens_per_sec': max(0, new_tokens) / elapsed if elapsed > 0 else 0,
+    }
+
+    return full_tokens, stats
+
+
 # -- 主入口 ----------------------------------------------------
 
 def main():
@@ -1080,6 +1204,14 @@ def main():
                         help='乐器切换偏置强度 (0~5, 越大切换越频繁, 默认 1.0)')
     parser.add_argument('--prog-switch-interval', type=int, default=None,
                         help='触发切换偏置的最少连续音符数 (1~128, 默认 12)')
+    # ── 段落感知生成 ─────────────────────────────────────
+    parser.add_argument('--section-aware', action='store_true',
+                        help='启用段落感知两阶段生成（结构规划 → 细节填充）')
+    parser.add_argument('--section-form', type=str, default='sonata',
+                        choices=['sonata', 'rondo', 'aba', 'theme-variations', 'binary'],
+                        help='曲式约束 (默认: sonata)')
+    parser.add_argument('--section-total-bars', type=int, default=64,
+                        help='结构规划目标总小节数 (默认: 64)')
 
     # ── 评价模式 ─────────────────────────────────────────
     parser.add_argument('--evaluate', action='store_true',
@@ -1184,6 +1316,7 @@ def main():
         args.rest_penalty is not None, args.max_polyphony is not None,
         args.key_bias is not None, args.prog_switch_strength is not None,
         args.prog_switch_interval is not None,
+        args.section_aware,
     ])
     if preset is None and not has_cli_params:
         preset = _select_preset_interactive()
@@ -1233,6 +1366,11 @@ def main():
     params['key_bias_strength'] = args.key_bias if args.key_bias is not None else 2.0
     params['prog_switch_strength'] = args.prog_switch_strength if args.prog_switch_strength is not None else 1.0
     params['prog_switch_interval'] = args.prog_switch_interval if args.prog_switch_interval is not None else 12
+    # ── 段落感知生成参数 ──────────────────────────────────
+    params['section_aware'] = args.section_aware
+    params['section_form'] = args.section_form
+    params['section_total_bars'] = args.section_total_bars
+    params['structure_max_tokens'] = 64  # 结构规划最多 64 tokens
     # ─────────────────────────────────────────────────────
 
     print()
@@ -1287,6 +1425,10 @@ def main():
             print(f'  [!] 无效目标调性: {args.target_key}，忽略')
     # ────────────────────────────────────────────────────
 
+    # ── 段落感知模式提示 ──────────────────────────────────
+    if args.section_aware:
+        print(f'      [段落感知] 两阶段生成 | 曲式: {args.section_form} | '
+              f'目标: {args.section_total_bars} 小节')
     print()
 
     # ── 反馈模式：A 阶段（生成前评估） ─────────────────
