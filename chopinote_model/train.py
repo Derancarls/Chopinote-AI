@@ -269,7 +269,7 @@ class Trainer:
                 shuffle=True,
                 num_workers=2,
                 persistent_workers=True,
-                pin_memory=True,
+                pin_memory=False,   # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
                 collate_fn=collate_fn,
                 drop_last=True,
             )
