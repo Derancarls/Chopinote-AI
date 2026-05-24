@@ -102,18 +102,19 @@ python scripts/train/run_curriculum_training.py \
 - **Logs/TensorBoard**: `/root/autodl-tmp/chopinote/tensorboard/` (also symlinked at `/root/tf-logs`)
 - **Memory-critical**: manual attention path when sec_bias present (avoids SDPA), padding mask shares first sample, SDPA sdpa_kernel restricts to flash/mem_efficient
 
-### Memory Optimization (RTX 5090)
+### Memory Optimization (RTX 4080 32GB)
 
 - `torch.set_float32_matmul_precision('high')` — TF32 matmul
 - `torch.backends.cudnn.benchmark = True`
-- SDPA via `sdpa_kernel([CUDNN, FLASH_ATTENTION, EFFICIENT_ATTENTION])` context manager — cuDNN attention preferred, fallback to flash/mem_efficient
+- SDPA via `sdpa_kernel([CUDNN, FLASH_ATTENTION, EFFICIENT_ATTENTION])` context manager
 - Causal mask fused into `attn_mask` (not `is_causal=True`) so flash attention works with non-null mask
 - Padding mask uses `mask[0]` only (all samples in batch have same padding pattern)
 - Measure embedding uses first sample's measure structure
-- sec_bias triggers manual attention path (no SDPA); without sec_bias, standard SDPA fast path
+- **sec_bias/chord_bias: recomputed inside checkpoint from raw (B,T) data (~1 MiB) instead of storing (B,1,T,T)=256 MiB → 24 layers save 6 GiB. Combined bias detached before SDPA to avoid 8 GiB attention matrix materialization during backward (PyTorch built-in efficient attention materializes full (B,nH,T,T) when computing dL/d(attn_mask)).**
 - bf16 autocast + direct `loss.backward()` (no GradScaler needed)
 - Gradient checkpointing on full TransformerBlock (attn+FFN), `use_reentrant=True`
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+- `weakref.ref(self)` per block to enable bias recomputation without nn.Module registration cycle
 
 ### Key Constraints
 
