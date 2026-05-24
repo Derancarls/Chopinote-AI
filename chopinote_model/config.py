@@ -124,7 +124,7 @@ class PhaseConfig:
     loss_mask: Optional[TokenLossMask] = None        # None = 不屏蔽，全量 loss
     save_steps: int = 1000
     eval_steps: int = 1000
-    max_eval_batches: int = 500
+    max_eval_batches: int = 200
 
 
 @dataclass
@@ -144,7 +144,7 @@ class TrainingConfig:
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000
-    max_eval_batches: int = 500  # 限制验证批次数，0=不限制（全量）
+    max_eval_batches: int = 200  # 限制验证批次数，0=不限制（全量）
     output_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_OUTPUT_DIR', '/root/autodl-tmp/chopinote/checkpoints'))
     log_dir: str = field(default_factory=lambda: os.environ.get(

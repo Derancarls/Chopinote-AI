@@ -651,85 +651,86 @@ class Trainer:
         type_correct = torch.zeros(num_types, dtype=torch.float, device=self.device)
         type_idx_map = self._token_id_to_type.to(self.device)
 
-        for i, batch in enumerate(dataloader):
-            if max_batches > 0 and i >= max_batches:
-                break
-            input_ids = batch['input_ids'].to(self.device)
-            labels = batch['labels'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if max_batches > 0 and i >= max_batches:
+                    break
+                input_ids = batch['input_ids'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
 
-            # 传递 section / chord 数据（与训练一致）
-            model_kwargs = {}
-            if self.model_config.use_section_attention and 'section_ids' in batch:
-                model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
-                model_kwargs['section_types'] = batch['section_types'].to(self.device)
-                model_kwargs['return_sec_head'] = True
-            if self.model_config.use_chord_attention and 'chord_func_ids' in batch:
-                model_kwargs['chord_func_ids'] = batch['chord_func_ids'].to(self.device)
-                model_kwargs['chord_inv_ids'] = batch['chord_inv_ids'].to(self.device)
-                model_kwargs['return_chord_head'] = True
+                # 传递 section / chord 数据（与训练一致）
+                model_kwargs = {}
+                if self.model_config.use_section_attention and 'section_ids' in batch:
+                    model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
+                    model_kwargs['section_types'] = batch['section_types'].to(self.device)
+                    model_kwargs['return_sec_head'] = True
+                if self.model_config.use_chord_attention and 'chord_func_ids' in batch:
+                    model_kwargs['chord_func_ids'] = batch['chord_func_ids'].to(self.device)
+                    model_kwargs['chord_inv_ids'] = batch['chord_inv_ids'].to(self.device)
+                    model_kwargs['return_chord_head'] = True
 
-            with autocast('cuda', dtype=torch.bfloat16):
-                output = self.model(input_ids, attention_mask, **model_kwargs)
+                with autocast('cuda', dtype=torch.bfloat16):
+                    output = self.model(input_ids, attention_mask, **model_kwargs)
 
-            # 解析输出
-            logits = output
-            sec_head = chord_head = None
-            if isinstance(output, tuple):
-                if len(output) == 3:
-                    logits, sec_head, chord_head = output
-                elif len(output) == 2:
-                    logits, sec_head = output
+                # 解析输出
+                logits = output
+                sec_head = chord_head = None
+                if isinstance(output, tuple):
+                    if len(output) == 3:
+                        logits, sec_head, chord_head = output
+                    elif len(output) == 2:
+                        logits, sec_head = output
 
-            # ── Loss ──────────────────────────────────────
-            if _LIGER_AVAILABLE:
-                loss = _ce_loss(logits.view(-1, logits.size(-1)).float(), labels.view(-1))
-            else:
-                loss = nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)).float(),
-                    labels.view(-1),
-                    ignore_index=-100,
-                    reduction='sum',
-                )
-            n_valid = max(1, (labels != -100).sum().item())
-            total_sum += loss.item()
-            total_tokens += n_valid
+                # ── Loss ──────────────────────────────────────
+                if _LIGER_AVAILABLE:
+                    loss = _ce_loss(logits.view(-1, logits.size(-1)).float(), labels.view(-1))
+                else:
+                    loss = nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)).float(),
+                        labels.view(-1),
+                        ignore_index=-100,
+                        reduction='sum',
+                    )
+                n_valid = max(1, (labels != -100).sum().item())
+                total_sum += loss.item()
+                total_tokens += n_valid
 
-            # ── Per-type accuracy (fully vectorized) ──────
-            preds = logits.argmax(dim=-1)
-            valid = labels != -100
-            labels_v = labels[valid]
-            types_v = type_idx_map[labels_v]
-            correct_v = (preds[valid] == labels_v)
+                # ── Per-type accuracy (fully vectorized) ──────
+                preds = logits.argmax(dim=-1)
+                valid = labels != -100
+                labels_v = labels[valid]
+                types_v = type_idx_map[labels_v]
+                correct_v = (preds[valid] == labels_v)
 
-            ones = torch.ones_like(types_v, dtype=torch.float)
-            type_total.scatter_add_(0, types_v, ones)
-            type_correct.scatter_add_(0, types_v, correct_v.float())
+                ones = torch.ones_like(types_v, dtype=torch.float)
+                type_total.scatter_add_(0, types_v, ones)
+                type_correct.scatter_add_(0, types_v, correct_v.float())
 
-            # ── Section accuracy ──────────────────────────
-            if sec_head is not None and 'sec_bars_target' in batch:
-                sec_bars = batch['sec_bars_target'].to(self.device)
-                sec_keys = batch['sec_keys_target'].to(self.device)
-                sec_types = batch['sec_types_target'].to(self.device)
-                sec_mask = sec_bars != -1
-                if sec_mask.any():
-                    sec_total += sec_mask.sum().item()
-                    sec_correct_bars += (sec_head['bars'].argmax(-1)[sec_mask] == sec_bars[sec_mask]).sum().item()
-                    sec_correct_keys += (sec_head['key'].argmax(-1)[sec_mask] == sec_keys[sec_mask]).sum().item()
-                    sec_correct_types += (sec_head['type'].argmax(-1)[sec_mask] == sec_types[sec_mask]).sum().item()
+                # ── Section accuracy ──────────────────────────
+                if sec_head is not None and 'sec_bars_target' in batch:
+                    sec_bars = batch['sec_bars_target'].to(self.device)
+                    sec_keys = batch['sec_keys_target'].to(self.device)
+                    sec_types = batch['sec_types_target'].to(self.device)
+                    sec_mask = sec_bars != -1
+                    if sec_mask.any():
+                        sec_total += sec_mask.sum().item()
+                        sec_correct_bars += (sec_head['bars'].argmax(-1)[sec_mask] == sec_bars[sec_mask]).sum().item()
+                        sec_correct_keys += (sec_head['key'].argmax(-1)[sec_mask] == sec_keys[sec_mask]).sum().item()
+                        sec_correct_types += (sec_head['type'].argmax(-1)[sec_mask] == sec_types[sec_mask]).sum().item()
 
-            # ── Chord accuracy ────────────────────────────
-            if chord_head is not None and 'chord_func_targets' in batch:
-                chord_func = batch['chord_func_targets'].to(self.device)
-                chord_inv = batch['chord_inv_targets'].to(self.device)
-                f_mask = chord_func != -1
-                i_mask = chord_inv != -1
-                if f_mask.any():
-                    chord_total_func += f_mask.sum().item()
-                    chord_correct_func += (chord_head['func'].argmax(-1)[f_mask] == chord_func[f_mask]).sum().item()
-                if i_mask.any():
-                    chord_total_inv += i_mask.sum().item()
-                    chord_correct_inv += (chord_head['inv'].argmax(-1)[i_mask] == chord_inv[i_mask]).sum().item()
+                # ── Chord accuracy ────────────────────────────
+                if chord_head is not None and 'chord_func_targets' in batch:
+                    chord_func = batch['chord_func_targets'].to(self.device)
+                    chord_inv = batch['chord_inv_targets'].to(self.device)
+                    f_mask = chord_func != -1
+                    i_mask = chord_inv != -1
+                    if f_mask.any():
+                        chord_total_func += f_mask.sum().item()
+                        chord_correct_func += (chord_head['func'].argmax(-1)[f_mask] == chord_func[f_mask]).sum().item()
+                    if i_mask.any():
+                        chord_total_inv += i_mask.sum().item()
+                        chord_correct_inv += (chord_head['inv'].argmax(-1)[i_mask] == chord_inv[i_mask]).sum().item()
 
         results = {'loss': total_sum / max(1, total_tokens)}
         for i, name in enumerate(self._type_names):
