@@ -1,5 +1,6 @@
 """Decoder-only Transformer (GPT 风格) 用于音乐生成，RoPE 位置编码 + 段落感知注意力。"""
 import math
+import weakref
 from typing import Optional
 
 import torch
@@ -142,7 +143,12 @@ class CausalSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN Transformer block: Attn → FFN 各带残差。(支持段落偏置)"""
+    """Pre-LN Transformer block: Attn → FFN 各带残差。(支持段落偏置)
+
+    显存优化: sec_bias (B,1,T,T)=256MiB 改为传入原始数据 (B,T) 级张量
+    (~1MiB), 在 _forward 内从头计算 bias. checkpoint 只存 1MiB 而非 256MiB
+    → 24 层省 6 GiB. bias 计算量仅为模型的 0.14%, 可忽略.
+    """
 
     def __init__(self, config: ModelConfig, layer_idx: int = 0):
         super().__init__()
@@ -161,6 +167,8 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 kv_cache: Optional[list] = None,
                 sec_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # sec_bias: inference 时是 (B,1,T,T) tensor, 训练时是 tuple of small tensors
+        # 训练时 checkpoint 只存 ~1 MiB 的原始数据而非 256 MiB 的成品 bias
         need_ckpt = self.use_checkpointing and kv_cache is None and self.training
         if need_ckpt:
             x = torch.utils.checkpoint.checkpoint(
@@ -172,6 +180,20 @@ class TransformerBlock(nn.Module):
     def _forward(self, x: torch.Tensor, mask: Optional[torch.Tensor],
                  kv_cache: Optional[list] = None,
                  sec_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # ── 训练路径: 从 raw 数据重建 bias ──────────────
+        # checkpoint 保存的 tuple ~1 MiB, 重建的中间张量在 forward 后释放
+        if isinstance(sec_bias, tuple):
+            sec_ids, sec_types, chord_fids, bar_pos, qslice = sec_bias
+            m = self._model_ref()
+            sec_b = m._compute_sec_bias(sec_ids, sec_types, bar_pos, qslice)
+            chord_b = m._compute_chord_bias(
+                chord_fids, bar_pos, sec_b.detach() if sec_b is not None else None, qslice)
+            if sec_b is not None and chord_b is not None:
+                sec_bias = (sec_b + chord_b).detach()
+            elif sec_b is not None:
+                sec_bias = sec_b.detach()
+            else:
+                sec_bias = chord_b.detach()
         x = x + self.attn(self.ln1(x), mask, kv_cache, sec_bias)
         x = x + self.ffn(self.ln2(x))
         return x
@@ -259,6 +281,8 @@ class MusicTransformer(nn.Module):
         self.blocks = nn.ModuleList([
             TransformerBlock(config, i) for i in range(config.n_layers)
         ])
+        for block in self.blocks:
+            block._model_ref = weakref.ref(self)  # 用于 bias 重建 (省显存)
         self.ln_f = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -584,10 +608,34 @@ class MusicTransformer(nn.Module):
 
         x = self.dropout(x)
 
+        # ── 构建 bias 原始数据 tuple（训练时替代 256 MiB 成品 bias）──
+        # checkpoint 存 ~1 MiB raw tensors 而非 256 MiB → 24 层省 6 GiB
+        in_kv_decode = (kv_caches is not None and len(kv_caches) > 0
+                       and kv_caches[0] is not None and kv_caches[0][0] is not None)
+        bias_data = None
+        if use_sec or (use_chord and has_chord_data):
+            zeros2d = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+            if in_kv_decode:
+                bias_data = (
+                    section_ids_full if use_sec else zeros2d,
+                    section_types_full if use_sec else zeros2d,
+                    chord_ids_full if (use_chord and has_chord_data) else zeros2d,
+                    measure_ids_full,
+                    T,  # query_slice: 只取最后 T 个 query 行
+                )
+            else:
+                bias_data = (
+                    section_ids_full[:, -T:] if use_sec else zeros2d,
+                    section_types_full[:, -T:] if use_sec else zeros2d,
+                    chord_ids_full[:, -T:] if (use_chord and has_chord_data) else zeros2d,
+                    measure_ids_full[:, -T:],
+                    0,   # query_slice: 取全部 query 行
+                )
+
         # ── Transformer blocks ───────────────────────────────────
         for i, block in enumerate(self.blocks):
             cache = None if kv_caches is None else kv_caches[i]
-            x = block(x, attention_mask, cache, sec_bias)
+            x = block(x, attention_mask, cache, bias_data)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
