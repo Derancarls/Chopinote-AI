@@ -47,7 +47,7 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer('_rope_sin', None, persistent=False)
 
     def _ensure_rope_cache(self, device: torch.device, dtype: torch.dtype):
-        if self._rope_cos is not None and self._rope_cos.device == device:
+        if self._rope_cos is not None and self._rope_cos.device == device and self._rope_cos.dtype == dtype:
             return
         theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, device=device).float() / self.head_dim))
         pos = torch.arange(self.max_len, device=device).float()
@@ -590,7 +590,7 @@ class MusicTransformer(nn.Module):
             x = x + self.section_embedding(sec_ids_emb)
             x = x + self.section_type_embedding(sec_types_emb)
 
-            in_kv_decode = kv_caches is not None and kv_caches[0] is not None and kv_caches[0][0] is not None
+            in_kv_decode = kv_caches is not None and len(kv_caches) > 0 and kv_caches[0] is not None and kv_caches[0][0] is not None
             if in_kv_decode:
                 sec_bias = self._compute_sec_bias(
                     section_ids_full, section_types_full, measure_ids_full, query_slice=T)
@@ -623,7 +623,7 @@ class MusicTransformer(nn.Module):
                 if chord_func_ids.ndim == 1:
                     chord_func_ids = chord_func_ids.unsqueeze(0)
                 chord_ids_full = chord_func_ids
-                in_kv_decode = kv_caches is not None and kv_caches[0] is not None and kv_caches[0][0] is not None
+                in_kv_decode = kv_caches is not None and len(kv_caches) > 0 and kv_caches[0] is not None and kv_caches[0][0] is not None
                 if in_kv_decode:
                     chord_bias = self._compute_chord_bias(
                         chord_ids_full, measure_ids_full, sec_bias, query_slice=T)

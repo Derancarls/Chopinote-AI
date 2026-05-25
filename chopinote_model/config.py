@@ -59,6 +59,32 @@ class ModelConfig:
         assert self.d_model % self.n_heads == 0, \
             f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
 
+    @classmethod
+    def from_gpu(cls, profile=None) -> 'ModelConfig':
+        """根据 GPU 能力返回调优后的 ModelConfig（适用于训练场景）。
+
+        Args:
+            profile: SystemProfile，为 None 时自动检测。
+
+        Returns:
+            ModelConfig 实例，架构字段保持默认值（1.21B），
+            仅调优 gradient_checkpointing / use_fp8 等训练相关字段。
+        """
+        from chopinote_model.auto_config import detect_system, suggest_training
+
+        if profile is None:
+            profile = detect_system()
+        hints = suggest_training(profile)
+
+        cfg = cls(
+            gradient_checkpointing=hints.suggested_gradient_checkpointing,
+        )
+        # 注入额外 hint 供 TrainingConfig 参考
+        cfg._suggested_batch_size = hints.suggested_batch_size
+        cfg._suggested_fp8 = hints.suggested_fp8
+        cfg._suggested_memory_fraction = hints.suggested_memory_fraction
+        return cfg
+
 
 @dataclass
 class TokenLossMask:

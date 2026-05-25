@@ -144,10 +144,11 @@ Input Token IDs (B, T)
 | d_model | 2048 |
 | d_ff | 8192 |
 | Vocab size | 929 |
-| Context length | 2048 tokens |
+| Context length | 4096 tokens |
 | Position encoding | RoPE |
-| Precision | BF16 training & inference |
-| Peak VRAM (training, bs=8) | 21.7 GiB |
+| Precision | BF16 training, FP8/BF16 inference (auto-detected) |
+| Peak VRAM (training, bs=8) | 22.3 GiB |
+| Checkpoint size | ~4.5 GB |
 
 ### Tokenization (REMI)
 
@@ -205,10 +206,10 @@ This compositionally decomposes the generation task, ensuring structural and har
 
 ```bash
 # Continue a piece
-chopin checkpoints/step_9000.pt input.musicxml -o output.musicxml
+chopin checkpoints/step_N.pt input.musicxml -o output.musicxml
 
 # With feedback loop (recommended)
-chopin checkpoints/step_9000.pt input.musicxml --feedback
+chopin checkpoints/step_N.pt input.musicxml --feedback
 
 # Generate multiple variants, pick the best
 chopin checkpoints/step_N.pt input.musicxml -n 5 --feedback
@@ -217,6 +218,38 @@ chopin checkpoints/step_N.pt input.musicxml -n 5 --feedback
 chopin checkpoints/step_N.pt input.musicxml --preset romantic
 chopin checkpoints/step_N.pt input.musicxml --preset baroque
 chopin checkpoints/step_N.pt input.musicxml --preset jazz
+
+# Custom config file
+chopin checkpoints/step_N.pt input.musicxml --config my_cfg.yaml
+
+# CLI overrides config defaults
+chopin checkpoints/step_N.pt input.musicxml --temp 1.2 --max-bars 64
+```
+
+### GPU Auto-Configuration
+
+On first run, Chopinote-AI automatically detects your hardware and selects the optimal inference settings:
+
+| Hardware | Auto-Selected |
+|----------|---------------|
+| **RTX 5090 / Blackwell+** (≥24 GB) | FP8 precision, torch.compile, TF32 on |
+| **RTX 4080 / Ampere+** (≥24 GB) | BF16 precision, torch.compile, TF32 on |
+| **RTX 3080 / Ampere** (≥8 GB) | BF16 precision, torch.compile off |
+| **CPU only** | FP32 precision, 16 threads |
+
+No manual tuning needed — the model handles precision, thread count, memory fraction, and compilation automatically.
+
+### Configuration File
+
+Parameters follow a priority chain: **CLI args > --preset > config file > defaults**.
+
+```bash
+# Auto-detected config locations (first found wins):
+#   1. ./chopinote_config.yaml
+#   2. ~/.chopinote/config.yaml
+#   3. Built-in chopinote_cli/generation_config.yaml
+
+# All 20 generation parameters are configurable — see the built-in YAML for details.
 ```
 
 ### Available Presets
@@ -227,7 +260,8 @@ chopin checkpoints/step_N.pt input.musicxml --preset jazz
 | `baroque` | Bach, Handel — contrapuntal, dance rhythms, terraced dynamics |
 | `classical` | Mozart, Haydn — balanced phrases, clear cadences, Alberti bass |
 | `jazz` | Gershwin, Brubeck — extended chords, swung rhythms, ii-V-I progressions |
-| `impressionist` | Debussy, Ravel — whole-tone scales, parallel chords, atmospheric |
+| `church` | Pipe organ — solemn, sustained, liturgical |
+| `minimal` | Reich, Glass — sparse texture, slow tempo, hypnotic repetition |
 
 ---
 
@@ -242,23 +276,18 @@ chopin checkpoints/step_N.pt input.musicxml --preset jazz
 
 ### Hardware
 
-- **GPU**: RTX 4080 / RTX 5090 — 32 GB VRAM
+- **GPU**: RTX 5090 — 32 GB VRAM
 - **Batch**: bs=8, grad_accum=4 (effective bs=32)
-- **Data**: ~13.7B tokens, ~400 GB on disk
-- **Time**: ~13 s/step on RTX 4080 (bf16), projected ~5-6 s/step on RTX 5090
+- **Data**: ~1.62M files, ~13.7B tokens, ~400 GB on disk
+- **Speed**: ~5-6 s/step on RTX 5090 (bf16)
 
 ### Training Data
 
 | Type | Source | Size |
 |------|--------|------|
-| MIDI | MAESTRO v3.0.0 | 200+ hours aligned piano recordings |
-| MIDI | Lakh MIDI Dataset | ~45,000 MIDI files |
-| MIDI | GiantMIDI-Piano | 10,854 classical piano pieces |
-| MIDI | POP909, MusicNet, EMOPIA | Pop, classical, emotion-annotated |
-| MusicXML | ASAP, ATEPP | Classical with performance markings |
-| MusicXML | Openscore | Community open-score collection |
-| MusicXML | Internal corpus | Complete Chopin, Bach chorales, Beethoven sonatas, etc. |
-| PDMX | Pop music scores | Performance markings, dynamics, pedal, ornaments |
+| MIDI | MAESTRO, Lakh, GiantMIDI, POP909, MusicNet, EMOPIA | ~1.37M files |
+| MusicXML | ASAP, ATEPP, Openscore, internal corpus | ~4.1K files |
+| PDMX | Pop music scores | ~250K files |
 
 ---
 
@@ -267,10 +296,12 @@ chopin checkpoints/step_N.pt input.musicxml --preset jazz
 ```
 chopinote_model/        Core model and training
 ├── model.py            MusicTransformer (24 layers, RoPE, sec/chord bias)
-├── config.py           ModelConfig, TrainingConfig, PhaseConfig
+├── config.py           ModelConfig, TrainingConfig, PhaseConfig, TokenLossMask
 ├── train.py            Trainer, multi-task loss, curriculum learning
 ├── dataset.py          TokenDataset with LRU cache, sidecar auto-loading
 ├── generate.py         Three-stage generation with KV cache
+├── fp8_linear.py       FP8 mixed-precision linear layer (Blackwell _scaled_mm)
+├── auto_config.py      Hardware detection + optimal inference/training config
 
 chopinote_dataset/      Data processing pipeline
 ├── tokenizer.py        REMITokenizer (vocab 929, grid_size=16)
@@ -285,11 +316,13 @@ chopinote_evaluator/    Music quality evaluation
 └── specific/           Specific metrics (coherence, consistency)
 
 chopinote_cli/          CLI entry point
-├── main.py             Inference CLI with feedback + presets
-└── presets.py          Style presets
+├── main.py             Inference CLI with feedback + presets + config
+├── config.py           Config loading, validation, auto-discovery
+├── presets.py          Style presets (romantic, baroque, classical, etc.)
+└── generation_config.yaml  Built-in defaults (20 parameters)
 
 scripts/                Utility scripts
-├── train/              Training: launch, resume, monitor, DPO
+├── train/              Training: curriculum, DPO, launch control
 ├── preprocess/         Data preprocessing pipeline
 ├── generate/           Batch generation, roundtrip testing
 └── analysis/           Token analysis, verification
@@ -461,10 +494,11 @@ RoPE 捕捉细碎的装饰音、颤音等，小节嵌入追踪更大的乐句和
 | d_model | 2048 |
 | d_ff | 8192 |
 | 词表大小 | 929 |
-| 上下文长度 | 2048 tokens |
+| 上下文长度 | 4096 tokens |
 | 位置编码 | RoPE |
-| 精度 | BF16 推理和训练 |
-| 峰值显存（训练，bs=8） | 21.7 GiB |
+| 精度 | BF16 训练，FP8/BF16 推理（自动检测） |
+| 峰值显存（训练，bs=8） | 22.3 GiB |
+| 模型大小 | ~4.5 GB |
 
 ### Token 化（REMI）
 
@@ -506,6 +540,34 @@ chopin checkpoints/step_N.pt input.musicxml -n 5 --feedback
 chopin checkpoints/step_N.pt input.musicxml --preset romantic
 chopin checkpoints/step_N.pt input.musicxml --preset baroque
 chopin checkpoints/step_N.pt input.musicxml --preset jazz
+
+# 自定义配置文件
+chopin checkpoints/step_N.pt input.musicxml --config my_cfg.yaml
+
+# CLI 覆盖配置默认值
+chopin checkpoints/step_N.pt input.musicxml --temp 1.2 --max-bars 64
+```
+
+### GPU 自动适配
+
+首次运行自动检测硬件并选择最优推理配置：
+
+| 硬件 | 自动选择 |
+|------|----------|
+| **RTX 5090 / Blackwell+** (≥24 GB) | FP8 精度、torch.compile、TF32 开 |
+| **RTX 4080 / Ampere+** (≥24 GB) | BF16 精度、torch.compile、TF32 开 |
+| **RTX 3080 / Ampere** (≥8 GB) | BF16 精度、torch.compile 关 |
+| **纯 CPU** | FP32 精度、16 线程 |
+
+### 配置文件
+
+优先级：**CLI 参数 > --preset > 配置文件 > 内置默认值**。
+
+```bash
+# 自动检测顺序（先找到的生效）：
+#   1. ./chopinote_config.yaml
+#   2. ~/.chopinote/config.yaml
+#   3. 内置 chopinote_cli/generation_config.yaml
 ```
 
 ### 风格预设
@@ -516,7 +578,8 @@ chopin checkpoints/step_N.pt input.musicxml --preset jazz
 | `baroque` | 巴赫、亨德尔 — 对位、舞曲节奏、阶梯式力度 |
 | `classical` | 莫扎特、海顿 — 平衡乐句、清晰终止、阿尔贝蒂低音 |
 | `jazz` | 格什温、Brubeck — 扩展和弦、摇摆节奏、ii-V-I |
-| `impressionist` | 德彪西、拉威尔 — 全音阶、平行和弦、氛围 |
+| `church` | 管风琴 — 庄严、持续、礼仪性 |
+| `minimal` | Reich、Glass — 稀疏织体、慢速、催眠重复 |
 
 ---
 
@@ -531,23 +594,18 @@ chopin checkpoints/step_N.pt input.musicxml --preset jazz
 
 ### 硬件
 
-- **GPU**: RTX 4080 / RTX 5090 — 32 GB 显存
+- **GPU**: RTX 5090 — 32 GB 显存
 - **Batch**: bs=8, grad_accum=4（有效 bs=32）
-- **数据**: ~13.7B tokens，~400 GB
-- **速度**: RTX 4080 约 13 秒/步，RTX 5090 预估 5-6 秒/步
+- **数据**: ~1.62M 文件，~13.7B tokens，~400 GB
+- **速度**: RTX 5090 约 5-6 秒/步 (bf16)
 
 ### 训练数据
 
 | 类型 | 来源 | 规模 |
 |------|------|------|
-| MIDI | MAESTRO v3.0.0 | 200+ 小时钢琴录音对齐 |
-| MIDI | Lakh MIDI Dataset | ~45,000 首 MIDI |
-| MIDI | GiantMIDI-Piano | 10,854 首古典钢琴曲 |
-| MIDI | POP909, MusicNet, EMOPIA | 流行、古典、情感标注 |
-| MusicXML | ASAP, ATEPP | 含演奏法标注的古典钢琴曲 |
-| MusicXML | Openscore | 社区开放乐谱 |
-| MusicXML | 内建语料库 | 肖邦全集、巴赫众赞歌、贝多芬奏鸣曲等 |
-| PDMX | 流行乐谱 | 含演奏法、力度、踏板标注 |
+| MIDI | MAESTRO, Lakh, GiantMIDI, POP909, MusicNet, EMOPIA | ~1.37M 文件 |
+| MusicXML | ASAP, ATEPP, Openscore, 内建语料库 | ~4.1K 文件 |
+| PDMX | 流行乐谱 | ~250K 文件 |
 
 ---
 

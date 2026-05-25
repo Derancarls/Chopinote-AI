@@ -10,6 +10,8 @@ from dataclasses import dataclass, fields, asdict
 from pathlib import Path
 from typing import Optional
 
+import types
+import typing
 import yaml
 
 
@@ -84,9 +86,9 @@ class Config:
 
             # ── 类型校验 ──
             expected_type = field.type
-            # 解 Optional[X] → X
+            # 解 Optional[X] / Union[X, None] → X
             origin = getattr(expected_type, '__origin__', None)
-            if origin is Optional:
+            if origin is typing.Union or origin is types.UnionType:
                 inner_types = expected_type.__args__
                 if not any(isinstance(val, t) for t in inner_types if t is not type(None)):
                     type_names = ' / '.join(
@@ -168,7 +170,7 @@ def load_config(path: str | None = None) -> Config:
     if resolved is None:
         return Config()
 
-    with open(resolved) as f:
+    with open(resolved, encoding='utf-8') as f:
         content = f.read()
 
     data = yaml.safe_load(content) or {}

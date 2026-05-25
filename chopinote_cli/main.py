@@ -30,15 +30,19 @@ from chopinote_dataset.tokenizer import REMITokenizer
 from chopinote_dataset.converter import MusicXMLToREMI
 from chopinote_cli.presets import Preset, get_preset, list_presets as _list_presets
 from chopinote_cli.config import load_config, find_config
+from chopinote_model.auto_config import (
+    detect_system, suggest_inference, print_hardware_report,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # -- 模型加载 --------------------------------------------------
 
-def load_model(checkpoint_path: str, device: torch.device):
+def load_model(checkpoint_path: str, device: torch.device, infer_cfg=None):
     """从 checkpoint 加载模型，返回 (model, config, step, loss).
     自动适应 checkpoint 的 vocab_size，无需手动对齐 ModelConfig。
+    infer_cfg: InferenceConfig | None，自动应用最优推理设置。
     """
     if not os.path.isfile(checkpoint_path):
         print(f'  [X] checkpoint 文件不存在: {checkpoint_path}')
@@ -82,7 +86,41 @@ def load_model(checkpoint_path: str, device: torch.device):
             print(f'         - ... 还有 {len(skipped) - 5} 个')
 
     model.to(device)
+
+    # ── 硬件自适应优化 ──
+    if infer_cfg:
+        # TF32 matmul
+        if infer_cfg.use_tf32:
+            torch.set_float32_matmul_precision('high')
+        # 显存上限
+        if device.type == 'cuda' and infer_cfg.memory_fraction < 1.0:
+            try:
+                torch.cuda.set_per_process_memory_fraction(infer_cfg.memory_fraction)
+            except Exception:
+                pass
+        # 精度转换
+        if infer_cfg.dtype == 'bf16':
+            model = model.bfloat16()
+        elif infer_cfg.dtype == 'fp16':
+            model = model.half()
+        # fp8: 不转 weights，由 FP8Linear 内部量化
+    # ────────────────────────────────────────
+
     model.eval()
+
+    # FP8 模式（需在 eval 后激活）
+    if infer_cfg and infer_cfg.dtype == 'fp8':
+        try:
+            model.set_fp8_mode(True)
+        except Exception:
+            pass
+
+    # torch.compile（最后一步，包裹模型）
+    if infer_cfg and infer_cfg.torch_compile:
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+        except Exception:
+            pass
 
     step = ckpt.get('step', 0)
     loss = ckpt.get('loss', None)
@@ -622,7 +660,7 @@ def save_to_musicxml(
     if save_tokens and token_ids:
         tok_path = output_path.rsplit('.musicxml', 1)[0] + '.tokens'
         try:
-            with open(tok_path, 'w') as f:
+            with open(tok_path, 'w', encoding='utf-8') as f:
                 f.write(' '.join(str(t) for t in token_ids))
         except OSError as e:
             logger.warning('保存 token 文件失败: %s', e)
@@ -641,7 +679,7 @@ def save_to_musicxml(
 def load_tokens_file(tokens_path: str) -> list[int] | None:
     """从 .tokens 文件加载 token ID 列表。"""
     try:
-        with open(tokens_path) as f:
+        with open(tokens_path, encoding='utf-8') as f:
             return [int(x) for x in f.read().strip().split()]
     except (OSError, ValueError) as e:
         logger.warning('加载 token 文件失败: %s', e)
@@ -878,7 +916,7 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
             print(f'\n--- 变体 {i + 1}/{num_samples} ---')
             params = dict(base_params)
             if variant_seed is not None:
-                params['seed'] = variant_seed + i
+                params['seed'] = variant_seed
             path = str(Path(base_output_path).with_name(
                 f'{Path(base_output_path).stem}_{i + 1}.musicxml'
             ))
@@ -1043,7 +1081,7 @@ def _parse_structure_tokens(structure_tokens: list[int], tokenizer) -> list[dict
             current_key = ts[len('<Key') + 1:-1]
         elif ts.startswith('<Bar_'):
             try:
-                current_bars = int(ts[len('<Bar_') + 1:-1])
+                current_bars = int(ts[len('<Bar_'):-1])
             except ValueError:
                 pass
 
@@ -1162,9 +1200,10 @@ def main():
                         help='输出 MusicXML 文件路径')
     parser.add_argument('--seed-bars', type=int, default=None,
                         help='从输入曲谱末尾截取的小节数作为种子（默认: 16）')
-    parser.add_argument('--seed', type=int, default=None,
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument('--seed', type=int, default=None,
                         help='固定随机种子（与 --random-seed 互斥）')
-    parser.add_argument('--random-seed', action='store_true', default=None,
+    seed_group.add_argument('--random-seed', action='store_true', default=None,
                         help='自动生成随机种子实现可复现')
     parser.add_argument('-n', '--num-samples', type=int, default=None,
                         help='一次生成 N 个变体（默认: 1）')
@@ -1240,6 +1279,18 @@ def main():
                         help='对比基准组名（all, timesig_4_4, source_musescore 等）')
     args = parser.parse_args()
 
+    # 判断用户是否主动传了 CLI 参数（config 覆盖前计算，避免被配置默认值误判）
+    has_cli_params = any([
+        args.max_bars is not None, args.temp is not None,
+        args.top_k is not None, args.complexity is not None,
+        args.key_mode is not None, args.time_mode is not None,
+        args.tempo_mode is not None, args.lock_program is not None,
+        args.rest_penalty is not None, args.max_polyphony is not None,
+        args.key_bias is not None, args.prog_switch_strength is not None,
+        args.prog_switch_interval is not None,
+        args.section_aware,
+    ])
+
     # ── 加载配置文件 ─────────────────────────────────────
     cfg = load_config(args.config)
     cfg_path = find_config(args.config)
@@ -1276,14 +1327,21 @@ def main():
         print(f'  配置文件: {cfg_path}')
         print()
 
-    # -- 设备 ---------------------------------------------
+    # -- 设备与硬件检测 -----------------------------------
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'  设备: {device}')
+
+    sys_profile = detect_system()
+    infer_cfg = suggest_inference(sys_profile)
+    print_hardware_report(sys_profile, infer_cfg)
+    # 在 PyTorch 初始化线程池前设置线程数
+    if infer_cfg.num_threads:
+        torch.set_num_threads(infer_cfg.num_threads)
     print()
 
     # -- 第 1 步：加载模型 --------------------------------
     print('[1/4] 加载模型...')
-    model, config, step, loss = load_model(args.checkpoint, device)
+    model, config, step, loss = load_model(args.checkpoint, device, infer_cfg=infer_cfg)
 
     # 使用 checkpoint 的 vocab_size（可能不同于当前 ModelConfig 默认值）
     model_vocab_size = config.vocab_size
@@ -1335,16 +1393,6 @@ def main():
             sys.exit(1)
         print(f'      [预设] {preset.label} — {preset.description}')
 
-    has_cli_params = any([
-        args.max_bars is not None, args.temp is not None,
-        args.top_k is not None, args.complexity is not None,
-        args.key_mode is not None, args.time_mode is not None,
-        args.tempo_mode is not None, args.lock_program is not None,
-        args.rest_penalty is not None, args.max_polyphony is not None,
-        args.key_bias is not None, args.prog_switch_strength is not None,
-        args.prog_switch_interval is not None,
-        args.section_aware,
-    ])
     if preset is None and not has_cli_params:
         preset = _select_preset_interactive()
     # ────────────────────────────────────────────────────
@@ -1397,11 +1445,8 @@ def main():
         params['seed'] = random.randint(0, 2**31 - 1)
         print(f'      [Seed] 自动随机种子: {params["seed"]}')
 
-    # ── 新增参数注入（config 做默认值） ─────────────────────
-    def _prog_mode_bool(v: str | None) -> bool | None:
-        return {'lock': True, 'free': False}.get(v)
     params['lock_program'] = (
-        _prog_mode_bool(args.lock_program)
+        _mode_bool(args.lock_program)
         if args.lock_program is not None else cfg.lock_program
     )
     params['rest_penalty'] = args.rest_penalty if args.rest_penalty is not None else cfg.rest_penalty
