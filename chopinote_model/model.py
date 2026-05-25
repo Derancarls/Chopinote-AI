@@ -343,11 +343,17 @@ class MusicTransformer(nn.Module):
         # 边界区域: 检测 section_id 变化的 bar 前后 4 小节
         boundary_mask = self._compute_boundary_mask(section_ids, bar_positions)  # (B, T_full, T_full)
 
+        # clamp 标量偏置参数，防止训练过程中梯度爆炸
+        _a = self.sec_bias_alpha.clamp(0.0, self.config.sec_bias_param_max)
+        _b = self.sec_bias_beta.clamp(0.0, self.config.sec_bias_param_max)
+        _g = self.sec_bias_gamma.clamp(0.0, self.config.sec_bias_param_max)
+        _d = self.sec_bias_delta.clamp(0.0, self.config.sec_bias_param_max)
+
         sec_bias = torch.zeros(B, 1, T_full, T_full, device=device, dtype=dtype)
-        sec_bias += self.sec_bias_alpha * same_inst.unsqueeze(1)
-        sec_bias += self.sec_bias_beta * (~same_inst.bool() & same_type.bool()).to(dtype).unsqueeze(1)
-        sec_bias -= self.sec_bias_gamma * (~same_type.bool()).to(dtype).unsqueeze(1)
-        sec_bias += self.sec_bias_delta * boundary_mask.unsqueeze(1)
+        sec_bias += _a * same_inst.unsqueeze(1)
+        sec_bias += _b * (~same_inst.bool() & same_type.bool()).to(dtype).unsqueeze(1)
+        sec_bias -= _g * (~same_type.bool()).to(dtype).unsqueeze(1)
+        sec_bias += _d * boundary_mask.unsqueeze(1)
 
         # 距离衰减（适用于同类型跨实例和边界区域）
         decay = torch.exp(-bar_dist.unsqueeze(1) / self.sec_bias_decay_len)
@@ -478,16 +484,20 @@ class MusicTransformer(nn.Module):
         decay_full = torch.exp(-bar_dist / self.chord_decay_len)
         decay_epsilon = (bar_dist <= self.chord_epsilon_bar_window).to(dtype)
 
+        _cg = self.chord_bias_gamma.clamp(0.0, self.config.chord_bias_param_max)
+        _ce = self.chord_bias_epsilon.clamp(0.0, self.config.chord_bias_param_max)
+        _cz = self.chord_bias_zeta.clamp(0.0, self.config.chord_bias_param_max)
+
         chord_bias = torch.zeros(B, 1, T_full, T_full, device=device, dtype=dtype)
 
         # γ: 同和弦凝聚 × 距离衰减
-        chord_bias += self.chord_bias_gamma * same_chord.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
+        chord_bias += _cg * same_chord.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
 
         # ε: 和弦切换桥接 × 窄窗口
-        chord_bias += self.chord_bias_epsilon * chord_change.to(dtype).unsqueeze(1) * decay_epsilon.unsqueeze(1)
+        chord_bias += _ce * chord_change.to(dtype).unsqueeze(1) * decay_epsilon.unsqueeze(1)
 
         # ζ: 同功能组弱正偏置 × 距离衰减
-        chord_bias += self.chord_bias_zeta * same_group.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
+        chord_bias += _cz * same_group.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
 
         # ── 与 sec_bias δ 去重 ──
         if sec_bias is not None:

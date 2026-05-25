@@ -151,9 +151,8 @@ def main():
             val_dataset,
             batch_size=32,  # eval 无 backward，大 batch 安全，从 ~2.5h 缩到 ~8min
             shuffle=False,
-            num_workers=2,
-            persistent_workers=True,
-            pin_memory=False,  # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
+            num_workers=0,          # 0: 禁用 multiprocessing，避免 worker 连接丢失崩溃
+            pin_memory=False,       # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
             collate_fn=collate_fn,
             drop_last=False,
         )

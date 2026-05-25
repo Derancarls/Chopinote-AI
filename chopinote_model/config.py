@@ -36,7 +36,8 @@ class ModelConfig:
     sec_bias_beta_init: float = 0.15   # 同类型跨实例偏置
     sec_bias_gamma_init: float = 0.05  # 跨类型偏置
     sec_bias_delta_init: float = 0.2   # 边界桥接偏置
-    sec_loss_weight: float = 0.1       # 段落预测 loss 权重
+    sec_loss_weight: float = 0.03
+    sec_bias_param_max: float = 2.0   # sec_bias 标量参数上限，防止梯度爆炸
 
     # --- 和弦感知（chord-aware / functional harmony） ---
     use_chord_attention: bool = True
@@ -47,7 +48,8 @@ class ModelConfig:
     chord_zeta_init: float = 0.08      # 同功能组弱正偏置
     chord_decay_len: int = 8           # γ/ζ 衰减半衰期（小节）
     chord_epsilon_bar_window: int = 2  # ε 作用窗口（小节）
-    chord_loss_weight: float = 0.15    # 和弦预测 loss 权重
+    chord_loss_weight: float = 0.05
+    chord_bias_param_max: float = 2.0  # chord_bias 标量参数上限，防止梯度爆炸
 
     @property
     def head_dim(self) -> int:
@@ -124,7 +126,7 @@ class PhaseConfig:
     loss_mask: Optional[TokenLossMask] = None        # None = 不屏蔽，全量 loss
     save_steps: int = 1000
     eval_steps: int = 1000
-    max_eval_batches: int = 200
+    max_eval_batches: int = 50
 
 
 @dataclass
@@ -141,10 +143,12 @@ class TrainingConfig:
     use_fp8: bool = False
     fp8_warmup_steps: int = 100  # BF16 warmup 步数后切换 FP8
     gradient_checkpointing: bool = True  # False = 关闭 checkpointing 提速（耗更多 VRAM）
+    aux_head_lr_mult: float = 0.5        # section_head / chord_head LR 乘数
+    attn_bias_lr_mult: float = 0.1       # sec_bias_* / chord_bias_* 标量参数 LR 乘数
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000
-    max_eval_batches: int = 200  # 限制验证批次数，0=不限制（全量）
+    max_eval_batches: int = 50   # 限制验证批次数，50 batch × 32 = 1600 样本，~3min
     output_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_OUTPUT_DIR', '/root/autodl-tmp/chopinote/checkpoints'))
     log_dir: str = field(default_factory=lambda: os.environ.get(

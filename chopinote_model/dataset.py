@@ -387,7 +387,7 @@ def create_dataloader(split_file: str, data_dir: str = 'data/processed',
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=2,
-        persistent_workers=True,
-        pin_memory=True,
+        num_workers=0,          # 0: 禁用 multiprocessing，避免 worker 连接丢失崩溃
+        persistent_workers=False,
+        pin_memory=False,       # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
     )

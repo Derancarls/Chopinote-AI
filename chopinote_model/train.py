@@ -54,15 +54,15 @@ class Trainer:
         self._token_id_to_type, self._type_names = self._build_token_type_map()
 
         # 去重参数（weight tying 会导致同一 tensor 作为多个 Parameter 被 yield）
-        params = list(dict.fromkeys(model.parameters()))
+        param_groups = self._build_param_groups(model, train_config.lr, train_config)
         try:
             self.optimizer = AdamW(
-                params, lr=train_config.lr, weight_decay=0.1,
+                param_groups, lr=train_config.lr, weight_decay=0.1,
                 betas=(0.9, 0.95), fused=True,
             )
         except (RuntimeError, TypeError):
             self.optimizer = AdamW(
-                params, lr=train_config.lr, weight_decay=0.1,
+                param_groups, lr=train_config.lr, weight_decay=0.1,
                 betas=(0.9, 0.95),
             )
         self.scheduler = _get_scheduler(
@@ -267,9 +267,8 @@ class Trainer:
                 dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
-                num_workers=2,
-                persistent_workers=True,
-                pin_memory=False,   # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
+                num_workers=0,          # 0: 禁用 multiprocessing，避免 worker 连接丢失崩溃
+                pin_memory=False,       # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
                 collate_fn=collate_fn,
                 drop_last=True,
             )
@@ -302,12 +301,12 @@ class Trainer:
         config = self.train_config
         model = self.model
 
-        params = list(dict.fromkeys(model.parameters()))
+        param_groups = self._build_param_groups(model, lr, config)
         try:
-            self.optimizer = AdamW(params, lr=lr, weight_decay=0.1,
+            self.optimizer = AdamW(param_groups, lr=lr, weight_decay=0.1,
                                    betas=(0.9, 0.95), fused=True)
         except (RuntimeError, TypeError):
-            self.optimizer = AdamW(params, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+            self.optimizer = AdamW(param_groups, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
         self.scheduler = _get_scheduler(self.optimizer, warmup_steps, total_steps)
 
         prefix = f'[{phase_name}] ' if phase_name else ''
@@ -316,6 +315,9 @@ class Trainer:
         if getattr(self, '_resume_opt_state', None) is not None:
             try:
                 self.optimizer.load_state_dict(self._resume_opt_state)
+                # 重建正确的参数组结构（旧 checkpoint 可能只有 1 个 flat group）
+                fixed = self._build_param_groups(model, lr, config)
+                self.optimizer.param_groups = fixed
                 if self._resume_sched_state is not None:
                     self.scheduler.load_state_dict(self._resume_sched_state)
                 logger.info(f'{prefix}从 checkpoint 恢复 optimizer/scheduler 状态 (step {self.global_step})')
@@ -625,6 +627,37 @@ class Trainer:
         return type_index, type_names
 
     @staticmethod
+    def _build_param_groups(model: nn.Module, lr: float,
+                            train_config: TrainingConfig) -> list[dict]:
+        """按模块分组设不同 LR，防止 aux heads / bias scalars 梯度爆炸。
+
+        - backbone (全部非 aux): lr
+        - aux_head (section_head, chord_head): lr * aux_head_lr_mult
+        - attn_bias (sec_bias_*, chord_bias_*): lr * attn_bias_lr_mult
+        """
+        backbone, aux_head, attn_bias = [], [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if 'section_head' in name or 'chord_head' in name:
+                aux_head.append(p)
+            elif 'sec_bias_' in name or 'chord_bias_' in name:
+                attn_bias.append(p)
+            else:
+                backbone.append(p)
+        groups = [
+            {'params': backbone, 'lr': lr},
+            {'params': aux_head, 'lr': lr * train_config.aux_head_lr_mult},
+            {'params': attn_bias, 'lr': lr * train_config.attn_bias_lr_mult},
+        ]
+        logger.info(
+            f'Param groups: backbone={len(backbone)} aux_head={len(aux_head)}'
+            f' attn_bias={len(attn_bias)}'
+            f' (aux_lr={lr * train_config.aux_head_lr_mult:.2e}'
+            f' bias_lr={lr * train_config.attn_bias_lr_mult:.2e})')
+        return groups
+
+    @staticmethod
     def _apply_loss_mask(labels: torch.Tensor, masked_ids: set) -> torch.Tensor:
         """向量化 loss 屏蔽：将 labels 中属于 masked_ids 的 token 设为 -100。"""
         if not masked_ids:
@@ -673,14 +706,20 @@ class Trainer:
                 with autocast('cuda', dtype=torch.bfloat16):
                     output = self.model(input_ids, attention_mask, **model_kwargs)
 
-                # 解析输出
+                # 解析输出（与训练路径一致，按 dict keys 区分 sec/chord head）
                 logits = output
                 sec_head = chord_head = None
                 if isinstance(output, tuple):
                     if len(output) == 3:
                         logits, sec_head, chord_head = output
                     elif len(output) == 2:
-                        logits, sec_head = output
+                        if isinstance(output[1], dict):
+                            if 'bars' in output[1]:
+                                logits, sec_head = output
+                            else:
+                                logits, chord_head = output
+                        else:
+                            logits, sec_head = output
 
                 # ── Loss ──────────────────────────────────────
                 if _LIGER_AVAILABLE:

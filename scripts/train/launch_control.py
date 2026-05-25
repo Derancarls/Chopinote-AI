@@ -854,6 +854,10 @@ class LaunchController:
             'NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1; '
             'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; '
             'export TORCH_CUDNN_V8_API_ENABLED=1 TOKENIZERS_PARALLELISM=false; '
+            f'export CHOPINOTE_DATA_DIR={self.config.data_dir} '
+            f'export CHOPINOTE_OUTPUT_DIR={self.config.checkpoint_dir} '
+            f'export CHOPINOTE_LOG_DIR={self.config.log_dir} '
+            f'export CHOPINOTE_TB_DIR={self.config.tb_dir}; '
             f'cd {self.config.project_dir}'
         )
         _run(['tmux', 'send-keys', '-t', 'chopinote:0', env_cmds, 'Enter'])
