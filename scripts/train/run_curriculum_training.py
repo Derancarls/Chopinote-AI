@@ -12,14 +12,31 @@ Phase 2: MusicXML 数据微调（全量 token，学习完整表达）
         --phase1-steps 50000 --phase2-steps 50000
 """
 import argparse
+import gc
 import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# ── CUDA 分配器配置（必须在 torch import 前设置）───────────────
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = (
+    'expandable_segments:True,'
+    'roundup_power2_divisions:16,'
+    'garbage_collection_threshold:0.6'
+)
+# ─────────────────────────────────────────────────────────────
+
 import torch
 from torch.utils.data import DataLoader
+
+# 限制 PyTorch CUDA 分配器上限为 85%，避免缓存分配器膨胀至 OOM
+if torch.cuda.is_available():
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    torch.cuda.set_per_process_memory_fraction(0.85)
+    print(f'[Memory] GPU 显存上限: 85% ({total_gb * 0.85:.1f} GiB / {total_gb:.1f} GiB)')
+
 torch.set_float32_matmul_precision('high')   # TF32: 免费加速，不增加显存
 torch.backends.cudnn.benchmark = True        # cuDNN autotune
 
@@ -83,11 +100,15 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f'设备: {device}')
 
-    # Model
+    # Model — 直接在 GPU bf16 创建，避免 fp32→bf16 中间态翻倍
     model_config = ModelConfig(gradient_checkpointing=not args.no_checkpointing)
-    model = MusicTransformer(model_config).to(dtype=torch.bfloat16)
+    model = MusicTransformer(model_config).bfloat16().to(device)
+    mem = torch.cuda.memory_allocated(device) / 1024**3
     total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f'模型参数量: {total_params:,}')
+    logger.info(f'模型参数量: {total_params:,} | 显存: {mem:.2f} GiB')
+    # 释放模型创建过程中的缓存碎片
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Phase 1: MIDI 预训练，屏蔽所有表现力 token
     phase1_mask = TokenLossMask()
@@ -149,7 +170,7 @@ def main():
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=32,  # eval 无 backward，大 batch 安全，从 ~2.5h 缩到 ~8min
+            batch_size=8,  # 降低 val batch 减少大张量分配，避免缓存分配器膨胀
             shuffle=False,
             num_workers=0,          # 0: 禁用 multiprocessing，避免 worker 连接丢失崩溃
             pin_memory=False,       # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
@@ -157,6 +178,12 @@ def main():
             drop_last=False,
         )
         logger.info(f'验证集: {len(val_dataset)} 个样本，来自 {args.val_list}')
+
+    # 进入训练前整理显存
+    gc.collect()
+    torch.cuda.empty_cache()
+    mem_info = torch.cuda.mem_get_info(device)
+    logger.info(f'训练前显存: 已用 {(mem_info[1] - mem_info[0]) / 1024**3:.2f} GiB / {mem_info[1] / 1024**3:.2f} GiB')
 
     trainer.train(val_dataloader=val_loader)
 

@@ -29,6 +29,7 @@ from chopinote_model.generate import GenerationParams
 from chopinote_dataset.tokenizer import REMITokenizer
 from chopinote_dataset.converter import MusicXMLToREMI
 from chopinote_cli.presets import Preset, get_preset, list_presets as _list_presets
+from chopinote_cli.config import load_config, find_config
 
 logger = logging.getLogger(__name__)
 
@@ -1149,8 +1150,9 @@ def main():
         epilog=(
             '示例:\n'
             '  chopin best.pt input.musicxml\n'
+            '  chopin best.pt input.musicxml --config my_cfg.yaml\n'
             '  chopin best.pt input.musicxml --temp 1.2 --top-k 40\n'
-            '  chopin best.pt input.musicxml --seed 42 -n 3\n'
+            '  chopin best.pt input.musicxml --random-seed -n 3\n'
         ),
     )
     parser.add_argument('checkpoint', nargs='?', default=None,
@@ -1158,11 +1160,13 @@ def main():
     parser.add_argument('input', help='输入 MusicXML 乐谱文件路径')
     parser.add_argument('-o', '--output', default=None,
                         help='输出 MusicXML 文件路径')
-    parser.add_argument('--seed-bars', type=int, default=16,
+    parser.add_argument('--seed-bars', type=int, default=None,
                         help='从输入曲谱末尾截取的小节数作为种子（默认: 16）')
     parser.add_argument('--seed', type=int, default=None,
-                        help='随机种子，固定后可复现生成结果')
-    parser.add_argument('-n', '--num-samples', type=int, default=1,
+                        help='固定随机种子（与 --random-seed 互斥）')
+    parser.add_argument('--random-seed', action='store_true', default=None,
+                        help='自动生成随机种子实现可复现')
+    parser.add_argument('-n', '--num-samples', type=int, default=None,
                         help='一次生成 N 个变体（默认: 1）')
     parser.add_argument('--temp', type=float, default=None,
                         help='采样温度 (0.1~2.0)，指定后跳过交互式输入')
@@ -1192,6 +1196,8 @@ def main():
                         help='指定速度 BPM，如 60, 120, 180 等')
     parser.add_argument('--list-presets', action='store_true',
                         help='列出所有可用预设并退出')
+    parser.add_argument('--config', type=str, default=None,
+                        help='配置文件路径（默认自动搜索 ./chopinote_config.yaml / ~/.chopinote/config.yaml）')
     parser.add_argument('--lock-program', choices=['lock', 'free'], default=None,
                         help='乐器锁定: lock=只保留 seed 已有的乐器, free=允许自由切换')
     parser.add_argument('--rest-penalty', type=float, default=None,
@@ -1205,12 +1211,12 @@ def main():
     parser.add_argument('--prog-switch-interval', type=int, default=None,
                         help='触发切换偏置的最少连续音符数 (1~128, 默认 12)')
     # ── 段落感知生成 ─────────────────────────────────────
-    parser.add_argument('--section-aware', action='store_true',
+    parser.add_argument('--section-aware', action='store_true', default=None,
                         help='启用段落感知两阶段生成（结构规划 → 细节填充）')
-    parser.add_argument('--section-form', type=str, default='sonata',
+    parser.add_argument('--section-form', type=str, default=None,
                         choices=['sonata', 'rondo', 'aba', 'theme-variations', 'binary'],
                         help='曲式约束 (默认: sonata)')
-    parser.add_argument('--section-total-bars', type=int, default=64,
+    parser.add_argument('--section-total-bars', type=int, default=None,
                         help='结构规划目标总小节数 (默认: 64)')
 
     # ── 评价模式 ─────────────────────────────────────────
@@ -1234,6 +1240,24 @@ def main():
                         help='对比基准组名（all, timesig_4_4, source_musescore 等）')
     args = parser.parse_args()
 
+    # ── 加载配置文件 ─────────────────────────────────────
+    cfg = load_config(args.config)
+    cfg_path = find_config(args.config)
+    # 配置文件覆盖 argparse 默认值（不影响 has_cli_params 判断）
+    if args.seed_bars is None:
+        args.seed_bars = cfg.seed_bars
+    if args.num_samples is None:
+        args.num_samples = cfg.num_samples
+    if args.section_form is None:
+        args.section_form = cfg.section_form
+    if args.section_total_bars is None:
+        args.section_total_bars = cfg.section_total_bars
+    # max_bars 仅当实际配置文件存在时才覆盖（无配置文件时保持交互式询问）
+    if args.max_bars is None and cfg_path:
+        args.max_bars = cfg.max_bars
+    # 注意: section_aware 属于 has_cli_params，不从 config 覆盖 args
+    # ─────────────────────────────────────────────────────
+
     # ── 评价模式 ─────────────────────────────────────────
     if args.evaluate:
         _run_evaluate(args)
@@ -1248,6 +1272,9 @@ def main():
 
     print('=== Chopinote-AI - 钢琴谱续写工具 ===')
     print()
+    if cfg_path:
+        print(f'  配置文件: {cfg_path}')
+        print()
 
     # -- 设备 ---------------------------------------------
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1332,12 +1359,22 @@ def main():
         _time_mode = time_mode_bool if time_mode_bool is not None else pa.get('lock_time')
         _tempo_mode = tempo_mode_bool if tempo_mode_bool is not None else pa.get('lock_tempo')
     else:
-        _temp = args.temp
-        _top_k = args.top_k
-        _complexity = args.complexity
-        _key_mode = key_mode_bool
-        _time_mode = time_mode_bool
-        _tempo_mode = tempo_mode_bool
+        if cfg_path:
+            # 配置文件存在 → 使用配置值（跳过交互式询问）
+            _temp = args.temp if args.temp is not None else cfg.temperature
+            _top_k = args.top_k if args.top_k is not None else cfg.top_k
+            _complexity = args.complexity if args.complexity is not None else cfg.complexity
+            _key_mode = key_mode_bool if key_mode_bool is not None else cfg.lock_key
+            _time_mode = time_mode_bool if time_mode_bool is not None else cfg.lock_time
+            _tempo_mode = tempo_mode_bool if tempo_mode_bool is not None else cfg.lock_tempo
+        else:
+            # 无配置文件 → 保留原始交互行为
+            _temp = args.temp
+            _top_k = args.top_k
+            _complexity = args.complexity
+            _key_mode = key_mode_bool
+            _time_mode = time_mode_bool
+            _tempo_mode = tempo_mode_bool
 
     # -- 第 3 步：参数设置 --------------------------------
     print('[3/4] 设置续写参数...')
@@ -1352,24 +1389,30 @@ def main():
         seed_bars=seed_bars_count,
         model_vocab_size=model_vocab_size,
     )
-    params['seed'] = args.seed  # seed 仅从 CLI 设置
+    # ── 随机种子（优先级: --seed > --random-seed > config.random_seed > 无） ──
+    if args.seed is not None:
+        params['seed'] = args.seed
+    elif args.random_seed if args.random_seed is not None else cfg.random_seed:
+        import random
+        params['seed'] = random.randint(0, 2**31 - 1)
+        print(f'      [Seed] 自动随机种子: {params["seed"]}')
 
-    # ── 新增参数注入 ──────────────────────────────────────
+    # ── 新增参数注入（config 做默认值） ─────────────────────
     def _prog_mode_bool(v: str | None) -> bool | None:
         return {'lock': True, 'free': False}.get(v)
     params['lock_program'] = (
         _prog_mode_bool(args.lock_program)
-        if args.lock_program is not None else True
+        if args.lock_program is not None else cfg.lock_program
     )
-    params['rest_penalty'] = args.rest_penalty if args.rest_penalty is not None else 0.0
-    params['max_polyphony'] = args.max_polyphony if args.max_polyphony is not None else 10
-    params['key_bias_strength'] = args.key_bias if args.key_bias is not None else 2.0
-    params['prog_switch_strength'] = args.prog_switch_strength if args.prog_switch_strength is not None else 1.0
-    params['prog_switch_interval'] = args.prog_switch_interval if args.prog_switch_interval is not None else 12
+    params['rest_penalty'] = args.rest_penalty if args.rest_penalty is not None else cfg.rest_penalty
+    params['max_polyphony'] = args.max_polyphony if args.max_polyphony is not None else cfg.max_polyphony
+    params['key_bias_strength'] = args.key_bias if args.key_bias is not None else cfg.key_bias_strength
+    params['prog_switch_strength'] = args.prog_switch_strength if args.prog_switch_strength is not None else cfg.prog_switch_strength
+    params['prog_switch_interval'] = args.prog_switch_interval if args.prog_switch_interval is not None else cfg.prog_switch_interval
     # ── 段落感知生成参数 ──────────────────────────────────
-    params['section_aware'] = args.section_aware
-    params['section_form'] = args.section_form
-    params['section_total_bars'] = args.section_total_bars
+    params['section_aware'] = cfg.section_aware if args.section_aware is None else args.section_aware
+    params['section_form'] = args.section_form if args.section_form is not None else cfg.section_form
+    params['section_total_bars'] = args.section_total_bars if args.section_total_bars is not None else cfg.section_total_bars
     params['structure_max_tokens'] = 64  # 结构规划最多 64 tokens
     # ─────────────────────────────────────────────────────
 
@@ -1426,9 +1469,9 @@ def main():
     # ────────────────────────────────────────────────────
 
     # ── 段落感知模式提示 ──────────────────────────────────
-    if args.section_aware:
-        print(f'      [段落感知] 两阶段生成 | 曲式: {args.section_form} | '
-              f'目标: {args.section_total_bars} 小节')
+    if params.get('section_aware'):
+        print(f'      [段落感知] 两阶段生成 | 曲式: {params.get("section_form")} | '
+              f'目标: {params.get("section_total_bars")} 小节')
     print()
 
     # ── 反馈模式：A 阶段（生成前评估） ─────────────────

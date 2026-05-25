@@ -21,6 +21,8 @@ except AttributeError:
     pass
 # 4D mask + cuDNN 会回退到 math backend → OOM
 _SDPA_BACKENDS_4D = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+# 推理时只用 Flash + Efficient（Blackwell 5120 CuDNN 特定长度无可用内核）
+_SDPA_BACKENDS_INFER = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 
 
 class CausalSelfAttention(nn.Module):
@@ -97,7 +99,9 @@ class CausalSelfAttention(nn.Module):
             kv_cache[0] = k
             kv_cache[1] = v
 
-        use_causal = kv_cache is None or kv_cache[0] is None or cache_len == 0
+        # 推理时始终 is_causal=True（单 token 生成等价且 SDPA 内核更稳定）
+        use_causal = True if not self.training else (
+            kv_cache is None or kv_cache[0] is None or cache_len == 0)
 
         # ── 段落偏置（段落感知注意力）───────────────────────────
         if sec_bias is not None:
@@ -115,7 +119,8 @@ class CausalSelfAttention(nn.Module):
                 if pad.size(0) < T_kv:
                     pad = F.pad(pad, (0, T_kv - pad.size(0)), value=_NEG_INF)
                 attn_mask = attn_mask + pad.view(1, 1, 1, -1)
-            with sdpa_kernel(_SDPA_BACKENDS_4D):
+            sdpa_backends_4d = _SDPA_BACKENDS_INFER if not self.training else _SDPA_BACKENDS_4D
+            with sdpa_kernel(sdpa_backends_4d):
                 y = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_mask,
                     dropout_p=self.dropout.p if self.training else 0.0,
@@ -131,12 +136,27 @@ class CausalSelfAttention(nn.Module):
             else:
                 attn_mask = None
 
-            with sdpa_kernel(_SDPA_BACKENDS):
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    is_causal=use_causal,
-                )
+            sdpa_backends = _SDPA_BACKENDS_INFER if not self.training else _SDPA_BACKENDS
+            try:
+                with sdpa_kernel(sdpa_backends):
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        is_causal=use_causal,
+                    )
+            except RuntimeError:
+                # Fallback: 手动 attention（Blackwell 某些长度下 SDPA 无可用内核）
+                scale = self.head_dim ** -0.5
+                attn = (q @ k.transpose(-2, -1)) * scale
+                if attn_mask is not None:
+                    attn = attn + attn_mask
+                if use_causal:
+                    causal = torch.triu(
+                        torch.full((T, T_kv), _NEG_INF, device=x.device, dtype=q.dtype),
+                        diagonal=T_kv - T + 1)
+                    attn = attn + causal[None, None, :, :]
+                attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+                y = torch.einsum('bhts,bshd->bhtd', attn, v)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)

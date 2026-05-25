@@ -96,8 +96,9 @@ def _match_chord(pitch_classes: set[int]) -> Chord | None:
     if len(pitch_classes) < 2:
         return None
 
-    pcs = sorted(pitch_classes)
-    bass_pc = pcs[0]  # 最低音
+    pcs_set = pitch_classes
+    pcs_sorted = sorted(pcs_set)
+    bass_pc = pcs_sorted[0]  # 最低音
     best_quality = 'M'
     best_root = 0
     best_score = 0.0
@@ -108,12 +109,12 @@ def _match_chord(pitch_classes: set[int]) -> Chord | None:
             expected = {(root + t) % 12 for t in template}
 
             # 计算匹配度
-            matched = len(pcs & expected)
-            extra = len(pcs - expected)
-            missing = len(expected - pcs)
+            matched = len(pcs_set & expected)
+            extra = len(pcs_set - expected)
+            missing = len(expected - pcs_set)
 
             score = matched - extra * 0.5 - missing * 0.3
-            if score > best_score and matched >= len(pcs) - 1:
+            if score > best_score and matched >= len(pcs_set) - 1:
                 best_score = score
                 best_quality = quality
                 best_root = root
@@ -138,5 +139,5 @@ def _match_chord(pitch_classes: set[int]) -> Chord | None:
         inversion=inversion,
         onset_beat=0.0,
         duration=0.0,
-        notes=list(pcs),
+        notes=pcs_sorted,
     )

@@ -158,7 +158,7 @@ def _convert_score(m21_score: music21.stream.Score) -> Score:
         # 遍历小节
         for m21_measure in part.getElementsByClass(music21.stream.Measure):
             mn = m21_measure.number or 0
-            if mn <= 0 and m21_measure.getDuration() == 0:
+            if mn <= 0 and m21_measure.duration.quarterLength == 0:
                 continue  # 跳过隐式小节
 
             # 更新拍号和调号

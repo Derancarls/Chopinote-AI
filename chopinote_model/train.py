@@ -317,6 +317,15 @@ class Trainer:
                 self.optimizer.load_state_dict(self._resume_opt_state)
                 # 重建正确的参数组结构（旧 checkpoint 可能只有 1 个 flat group）
                 fixed = self._build_param_groups(model, lr, config)
+                # 保留已恢复的超参（betas/eps/weight_decay），避免 KeyError
+                restored_hparams = {}
+                for g in self.optimizer.param_groups:
+                    for k, v in g.items():
+                        if k != 'params':
+                            restored_hparams[k] = v
+                for g in fixed:
+                    for k, v in restored_hparams.items():
+                        g.setdefault(k, v)
                 self.optimizer.param_groups = fixed
                 if self._resume_sched_state is not None:
                     self.scheduler.load_state_dict(self._resume_sched_state)
@@ -325,6 +334,10 @@ class Trainer:
                 logger.warning(f'{prefix}无法恢复 optimizer 状态: {e}，使用新初始化')
             self._resume_opt_state = None
             self._resume_sched_state = None
+
+        # 恢复训练时，用 global_step 偏移 phase 内计数器，让显示从真实进度开始
+        resume_offset = self.global_step if phase_name else 0
+        adjusted_total = total_steps + resume_offset
 
         model.train()
         model.set_gradient_checkpointing(config.gradient_checkpointing)
@@ -493,10 +506,10 @@ class Trainer:
                     self.global_step += 1
 
                     if not _fp8_enabled and config.use_fp8 and \
-                       local_step >= config.fp8_warmup_steps:
+                       (local_step >= config.fp8_warmup_steps or self.global_step >= config.fp8_warmup_steps):
                         model.set_fp8_mode(True)
                         _fp8_enabled = True
-                        logger.info(f'{prefix}Step {local_step}: FP8 模式已启用')
+                        logger.info(f'{prefix}Step {local_step + resume_offset}: FP8 模式已启用')
 
                     self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
 
@@ -525,9 +538,8 @@ class Trainer:
                         sec_str = f' | Sec: {sec_loss_val:.4f}' if sec_loss_val > 0 else ''
                         chord_str = f' | Chord: {chord_loss_val:.4f}' if chord_loss_val > 0 else ''
                         logger.info(
-                            f'{prefix}Step {local_step}/{total_steps}'
-                            f'{f" (global {self.global_step})" if phase_name else ""} | '
-                            f'Loss: {avg_loss:.4f} | '
+                            f'{prefix}Step {local_step + resume_offset}/{adjusted_total}'
+                            f' | Loss: {avg_loss:.4f} | '
                             f'LR: {self.scheduler.get_last_lr()[0]:.2e} | '
                             f'GN: {total_norm:.2f}{sec_str}{chord_str} | '
                             f'Time: {elapsed:.1f}s'
@@ -547,6 +559,8 @@ class Trainer:
                         acc_log = '  '.join(acc_strs) if acc_strs else ''
                         logger.info(f'{prefix}Val loss: {val_metrics["loss"]:.4f}  {acc_log}')
                         model.train()
+                        # 释放验证阶段缓存，防止 PyTorch 分配器占用显存不还
+                        torch.cuda.empty_cache()
 
                     if save_steps and local_step % save_steps == 0:
                         self.save_checkpoint(self._last_avg_loss)

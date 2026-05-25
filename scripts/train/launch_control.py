@@ -76,6 +76,9 @@ class TrainingConfig:
     max_restarts: int = 5
     restart_delay: int = 30
 
+    # 恢复训练
+    resume_checkpoint: Optional[str] = None
+
     # 数据文件
     train_list: str = 'train.txt'
     val_list: str = 'val.txt'
@@ -122,6 +125,10 @@ class TrainingConfig:
             val = getattr(args, key, None)
             if val is not None:
                 setattr(self, key, val)
+        # 恢复训练
+        val = getattr(args, 'resume', None)
+        if val is not None:
+            self.resume_checkpoint = val
         return self
 
 
@@ -813,7 +820,10 @@ class LaunchController:
 
     def generate_watchdog(self) -> str:
         """生成看门狗脚本。"""
-        latest_ckpt = _find_latest_checkpoint(self.config.checkpoint_dir)
+        if self.config.resume_checkpoint:
+            latest_ckpt = self.config.resume_checkpoint
+        else:
+            latest_ckpt = _find_latest_checkpoint(self.config.checkpoint_dir)
         resume_arg = f'--resume {latest_ckpt}' if latest_ckpt else ''
 
         script = _WATCHDOG_TEMPLATE.format(
@@ -852,7 +862,7 @@ class LaunchController:
         env_cmds = (
             'export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 '
             'NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1; '
-            'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; '
+            'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,roundup_power2_divisions:16,garbage_collection_threshold:0.6; '
             'export TORCH_CUDNN_V8_API_ENABLED=1 TOKENIZERS_PARALLELISM=false; '
             f'export CHOPINOTE_DATA_DIR={self.config.data_dir} '
             f'export CHOPINOTE_OUTPUT_DIR={self.config.checkpoint_dir} '
@@ -1389,6 +1399,8 @@ def main():
     p_launch.add_argument('--phase2-warmup', type=int)
     p_launch.add_argument('--batch-size', type=int)
     p_launch.add_argument('--grad_accum', type=int)
+    p_launch.add_argument('--resume', type=str, default=None,
+                          help='从指定 checkpoint 恢复（默认自动检测最新）')
 
     # monitor
     sub.add_parser('monitor', help='实时训练仪表盘')
