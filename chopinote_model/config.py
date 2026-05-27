@@ -29,7 +29,7 @@ class ModelConfig:
     # --- 段落感知（paragraph-aware） ---
     use_section_attention: bool = True
     n_section_types: int = 22          # 21 section types + padding
-    n_section_bars_classes: int = 128  # 段落持续小节数分类数 (0~128 + 1)
+    n_section_bars_classes: int = 128  # 段落持续小节数分类数 (0~128, 90.3%数据≤128)
     max_sections: int = 64             # 每曲最多 64 个段落实例
     sec_bias_decay_len: int = 16       # 偏置距离衰减半衰期（小节）
     sec_bias_alpha_init: float = 0.5   # 同实例偏置

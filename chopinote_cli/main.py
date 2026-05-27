@@ -460,8 +460,8 @@ def generate_with_progress(
     pbar = tqdm(total=max_bars, desc='生成中', unit='bar', ncols=80)
 
     for step in range(max_new_tokens):
-        # 滑窗回退：首轮后只喂最后一个 token（依靠 KV cache）
-        if generated.size(1) > max_len:
+        # 首轮预填充所有 seed token，后续单 token 解码（依靠 KV cache）
+        if step > 0:
             next_token = generated[:, -1:]
 
         logits = model.forward(next_token, kv_caches=kv_caches, measure_ids=cached_measure_ids)

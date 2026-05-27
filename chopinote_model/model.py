@@ -46,11 +46,12 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer('_rope_cos', None, persistent=False)
         self.register_buffer('_rope_sin', None, persistent=False)
 
-    def _ensure_rope_cache(self, device: torch.device, dtype: torch.dtype):
-        if self._rope_cos is not None and self._rope_cos.device == device and self._rope_cos.dtype == dtype:
+    def _ensure_rope_cache(self, device: torch.device, dtype: torch.dtype, min_len: int = 0):
+        need_len = max(self.max_len, min_len) if not self.training else self.max_len
+        if self._rope_cos is not None and self._rope_cos.device == device and self._rope_cos.dtype == dtype and self._rope_cos.size(0) >= need_len:
             return
         theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, device=device).float() / self.head_dim))
-        pos = torch.arange(self.max_len, device=device).float()
+        pos = torch.arange(need_len, device=device).float()
         freqs = torch.outer(pos, theta)
         self._rope_cos = freqs.cos().to(dtype)
         self._rope_sin = freqs.sin().to(dtype)
@@ -78,10 +79,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        self._ensure_rope_cache(x.device, q.dtype)
-
         if kv_cache is not None and kv_cache[0] is not None:
             cache_len = kv_cache[0].size(2)
+        else:
+            cache_len = 0
+
+        self._ensure_rope_cache(x.device, q.dtype, min_len=cache_len + T)
+
+        if kv_cache is not None and kv_cache[0] is not None:
             k_new = self._apply_rope(k, self._rope_cos[cache_len:cache_len + T],
                                       self._rope_sin[cache_len:cache_len + T])
             k = torch.cat([kv_cache[0], k_new], dim=2)
@@ -100,7 +105,7 @@ class CausalSelfAttention(nn.Module):
             kv_cache[1] = v
 
         # 推理时始终 is_causal=True（单 token 生成等价且 SDPA 内核更稳定）
-        use_causal = True if not self.training else (
+        use_causal = (kv_cache is None or kv_cache[0] is None) if not self.training else (
             kv_cache is None or kv_cache[0] is None or cache_len == 0)
 
         # ── 段落偏置（段落感知注意力）───────────────────────────
@@ -156,7 +161,7 @@ class CausalSelfAttention(nn.Module):
                         diagonal=T_kv - T + 1)
                     attn = attn + causal[None, None, :, :]
                 attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
-                y = torch.einsum('bhts,bshd->bhtd', attn, v)
+                y = attn @ v  # attn: (B,H,T,S) @ v: (B,H,S,D) → (B,H,T,D)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -220,14 +225,11 @@ class TransformerBlock(nn.Module):
 
 
 class SectionPredictionHead(nn.Module):
-    """段落属性预测头（双任务训练的辅助任务）。"""
+    """段落属性预测头（双任务训练的辅助任务）。不预测段落长度（causal 架构下无法看到未来）。"""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_model = config.d_model
-        # 段落持续小节数预测（0 ~ n_section_bars_classes + padding）
-        self.bars_head = nn.Linear(config.d_model,
-                                   config.n_section_bars_classes + 1)
         # 段落主调预测（30 keys + padding）
         self.key_head = nn.Linear(config.d_model, 31)
         # 段落类型预测（22 types + padding）
@@ -235,7 +237,6 @@ class SectionPredictionHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> dict:
         return {
-            'bars': self.bars_head(x),
             'key': self.key_head(x),
             'type': self.type_head(x),
         }

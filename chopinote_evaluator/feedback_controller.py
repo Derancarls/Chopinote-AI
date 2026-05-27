@@ -215,6 +215,7 @@ B1_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
     'syncopation_ratio': {'temperature': -0.08},
     'melodic_direction': {'temperature': -0.08},
     'interval_shift': {'temperature': -0.05},
+    'empty_measure': {'rest_penalty': 2.0, 'temperature': 0.15},
 }
 
 # B2（全局漂移）
@@ -227,6 +228,7 @@ B2_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
     'velocity_consistency': {'temperature': -0.08},
     'key_consistency': {'key_bias_strength': 0.8},
     'token_type_kl': {'temperature': -0.10, 'rest_penalty': 0.2},
+    'empty_measure': {'rest_penalty': 2.5, 'temperature': 0.2, 'complexity': 1.5},
 }
 
 B1_DEFAULT_THRESHOLD = 0.55
@@ -343,10 +345,20 @@ class NarrowFeedbackController:
         window = bars[-n:]  # 最近 n 节
         flat = [t for bar in window for t in bar]
         window_notes = _note_on_intervals(flat, tokenizer)
-        if len(window_notes) < 3:
-            return 0.5, {}
 
         scores: dict[str, float] = {}
+
+        # 空小节检测：即使音符极少也必须运行
+        try:
+            scores['empty_measure'] = _empty_measure_tokens(flat, tokenizer)
+        except Exception:
+            pass
+
+        if len(window_notes) < 3:
+            if scores:
+                avg = sum(scores.values()) / len(scores)
+                return avg, scores
+            return 0.5, {}
 
         try:
             scores['pitch_class_kl'] = _pitch_class_kl_tokens(
@@ -415,10 +427,20 @@ class NarrowFeedbackController:
         flat = [t for bar in window for t in bar]
 
         window_notes = _note_on_intervals(flat, tokenizer)
-        if len(window_notes) < 3:
-            return 0.5, {}
 
         scores: dict[str, float] = {}
+
+        # 空小节检测：即使音符极少也必须运行（empty_measure 不需要音符）
+        try:
+            scores['empty_measure'] = _empty_measure_tokens(flat, tokenizer)
+        except Exception:
+            pass
+
+        if len(window_notes) < 3:
+            if scores:
+                avg = sum(scores.values()) / len(scores)
+                return avg, scores
+            return 0.5, {}
 
         # 与 seed 对比的指标
         try:
@@ -463,10 +485,9 @@ class NarrowFeedbackController:
         except Exception:
             pass
 
-        # 不与 seed 对比的指标
+        # 不与 seed 对比的指标（empty_measure 已在上面处理）
         for name, fn in [
             ('key_consistency', _key_consistency_tokens),
-            ('empty_measure', _empty_measure_tokens),
             ('pitch_range', _pitch_range_tokens),
             ('duration_entropy', _duration_entropy_tokens),
             ('interval_shift', _interval_shift_tokens),

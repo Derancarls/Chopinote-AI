@@ -199,6 +199,7 @@ class Trainer:
                     copy_rows = min(old_emb.shape[0], new_emb.shape[0])
                     new_emb[:copy_rows] = old_emb[:copy_rows]
                     logger.info(f'Embedding {key}: 复用 {copy_rows}/{new_emb.shape[0]} 行来自 checkpoint')
+
         # ─────────────────────────────────────────────────────
 
         self.model.load_state_dict(model_state)
@@ -332,8 +333,15 @@ class Trainer:
                 logger.info(f'{prefix}从 checkpoint 恢复 optimizer/scheduler 状态 (step {self.global_step})')
             except Exception as e:
                 logger.warning(f'{prefix}无法恢复 optimizer 状态: {e}，使用新初始化')
-            self._resume_opt_state = None
-            self._resume_sched_state = None
+                self._resume_opt_state = None
+                # scheduler 不依赖 param groups，单独恢复
+                if self._resume_sched_state is not None:
+                    try:
+                        self.scheduler.load_state_dict(self._resume_sched_state)
+                        logger.info(f'{prefix}独立恢复 scheduler 状态 (step {self.global_step})')
+                    except Exception as se:
+                        logger.warning(f'{prefix}无法恢复 scheduler 状态: {se}')
+                        self._resume_sched_state = None
 
         # 恢复训练时，用 global_step 偏移 phase 内计数器，让显示从真实进度开始
         resume_offset = self.global_step if phase_name else 0
@@ -439,33 +447,56 @@ class Trainer:
                     sec_loss_val = 0.0
                     chord_loss_val = 0.0
 
-                    # Section prediction loss（辅助任务）
+                    # Section prediction loss（辅助任务，fp32 CE 防 bf16 溢出 NaN）
                     if sec_head_logits is not None:
-                        sec_bars_target = batch['sec_bars_target'].to(self.device)
+                        # NaN guard: 检查 sec head logits
+                        _sec_keys_flat = sec_head_logits['key'].view(-1, sec_head_logits['key'].size(-1))
+                        _sec_types_flat = sec_head_logits['type'].view(-1, sec_head_logits['type'].size(-1))
+                        if (torch.isnan(_sec_keys_flat).any() or torch.isinf(_sec_keys_flat).any() or
+                            torch.isnan(_sec_types_flat).any() or torch.isinf(_sec_types_flat).any()):
+                            logger.error(
+                                f'{prefix}NaN/Inf in sec_head_logits! '
+                                f'key=[{_sec_keys_flat.min().item():.2f}, {_sec_keys_flat.max().item():.2f}] '
+                                f'type=[{_sec_types_flat.min().item():.2f}, {_sec_types_flat.max().item():.2f}] '
+                                f'Resetting gradient accumulation.')
+                            self.optimizer.zero_grad()
+                            accum = 0
+                            continue
+
                         sec_keys_target = batch['sec_keys_target'].to(self.device)
                         sec_types_target = batch['sec_types_target'].to(self.device)
 
-                        has_sec_targets = (sec_bars_target != -1).any()
+                        has_sec_targets = (sec_keys_target != -1).any()
                         if has_sec_targets:
-                            bars_loss = nn.functional.cross_entropy(
-                                sec_head_logits['bars'].permute(0, 2, 1),
-                                sec_bars_target, ignore_index=-1, reduction='mean',
-                            )
                             keys_loss = nn.functional.cross_entropy(
-                                sec_head_logits['key'].permute(0, 2, 1),
+                                sec_head_logits['key'].permute(0, 2, 1).float(),
                                 sec_keys_target, ignore_index=-1, reduction='mean',
                             )
                             types_loss = nn.functional.cross_entropy(
-                                sec_head_logits['type'].permute(0, 2, 1),
+                                sec_head_logits['type'].permute(0, 2, 1).float(),
                                 sec_types_target, ignore_index=-1, reduction='mean',
                             )
-                            sec_loss_val = bars_loss.item() + keys_loss.item() + types_loss.item()
-                            loss = loss + model.config.sec_loss_weight * (bars_loss + keys_loss + types_loss)
+                            sec_loss_val = keys_loss.item() + types_loss.item()
+                            loss = loss + model.config.sec_loss_weight * (keys_loss + types_loss)
                         else:
                             sec_loss_val = 0.0
 
-                    # Chord prediction loss（辅助任务）
+                    # Chord prediction loss（辅助任务，fp32 CE 防 bf16 溢出 NaN）
                     if chord_head_logits is not None:
+                        # NaN guard: 检查 chord head logits
+                        _chord_func_flat = chord_head_logits['func'].view(-1, chord_head_logits['func'].size(-1))
+                        _chord_inv_flat = chord_head_logits['inv'].view(-1, chord_head_logits['inv'].size(-1))
+                        if (torch.isnan(_chord_func_flat).any() or torch.isinf(_chord_func_flat).any() or
+                            torch.isnan(_chord_inv_flat).any() or torch.isinf(_chord_inv_flat).any()):
+                            logger.error(
+                                f'{prefix}NaN/Inf in chord_head_logits! '
+                                f'func=[{_chord_func_flat.min().item():.2f}, {_chord_func_flat.max().item():.2f}] '
+                                f'inv=[{_chord_inv_flat.min().item():.2f}, {_chord_inv_flat.max().item():.2f}] '
+                                f'Resetting gradient accumulation.')
+                            self.optimizer.zero_grad()
+                            accum = 0
+                            continue
+
                         chord_func_targets = batch['chord_func_targets'].to(self.device)
                         chord_inv_targets = batch['chord_inv_targets'].to(self.device)
 
@@ -477,12 +508,12 @@ class Trainer:
 
                         if has_chord_func:
                             chord_func_loss = nn.functional.cross_entropy(
-                                chord_head_logits['func'].permute(0, 2, 1),
+                                chord_head_logits['func'].permute(0, 2, 1).float(),
                                 chord_func_targets, ignore_index=-1, reduction='mean',
                             )
                         if has_chord_inv:
                             chord_inv_loss = nn.functional.cross_entropy(
-                                chord_head_logits['inv'].permute(0, 2, 1),
+                                chord_head_logits['inv'].permute(0, 2, 1).float(),
                                 chord_inv_targets, ignore_index=-1, reduction='mean',
                             )
 
@@ -497,6 +528,15 @@ class Trainer:
 
                 if accum % config.grad_accum_steps == 0:
                     total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                    # 梯度 NaN/Inf 检测：跳过 optimizer step 防止权重污染
+                    if torch.isnan(torch.tensor(total_norm)) or torch.isinf(torch.tensor(total_norm)):
+                        logger.error(f'{prefix}梯度 NaN/Inf (norm={total_norm}), 跳过 optimizer step!')
+                        self.optimizer.zero_grad()
+                        accum = 0
+                        total_loss = 0.0  # 防止 NaN 污染 logging 累加器
+                        continue
+
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
@@ -688,7 +728,7 @@ class Trainer:
         self.model.eval()
         total_sum = 0.0
         total_tokens = 0
-        sec_correct_bars = sec_correct_keys = sec_correct_types = 0
+        sec_correct_keys = sec_correct_types = 0
         sec_total = 0
         chord_correct_func = chord_correct_inv = 0
         chord_total_func = chord_total_inv = 0
@@ -761,14 +801,12 @@ class Trainer:
                 type_correct.scatter_add_(0, types_v, correct_v.float())
 
                 # ── Section accuracy ──────────────────────────
-                if sec_head is not None and 'sec_bars_target' in batch:
-                    sec_bars = batch['sec_bars_target'].to(self.device)
+                if sec_head is not None and 'sec_keys_target' in batch:
                     sec_keys = batch['sec_keys_target'].to(self.device)
                     sec_types = batch['sec_types_target'].to(self.device)
-                    sec_mask = sec_bars != -1
+                    sec_mask = sec_keys != -1
                     if sec_mask.any():
                         sec_total += sec_mask.sum().item()
-                        sec_correct_bars += (sec_head['bars'].argmax(-1)[sec_mask] == sec_bars[sec_mask]).sum().item()
                         sec_correct_keys += (sec_head['key'].argmax(-1)[sec_mask] == sec_keys[sec_mask]).sum().item()
                         sec_correct_types += (sec_head['type'].argmax(-1)[sec_mask] == sec_types[sec_mask]).sum().item()
 
@@ -793,7 +831,6 @@ class Trainer:
         if overall_total > 0:
             results['acc/overall'] = (type_correct.sum() / overall_total).item()
         if sec_total > 0:
-            results['acc/sec_bars'] = sec_correct_bars / sec_total
             results['acc/sec_keys'] = sec_correct_keys / sec_total
             results['acc/sec_types'] = sec_correct_types / sec_total
         if chord_total_func > 0:

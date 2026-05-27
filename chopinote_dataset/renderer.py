@@ -126,16 +126,12 @@ class REMIToMusicXML:
         current_prog: int = 0
         current_sub: int = 0
 
-        # ── Pending note accumulation ──
-        pending_interval: Optional[int] = None
-        pending_vel: int = 0
-        pending_prog: int = 0
-        pending_sub: int = 0
-        pending_articulations: list = []
-        pending_ornaments: list = []
+        # ── Pending note accumulation (list for chord support) ──
+        pending_notes: list[dict] = []  # [{interval, vel, prog, sub, articulations, ornaments, tuplet}]
         pending_rest: bool = False
+        pending_rest_prog: int = 0
+        pending_rest_sub: int = 0
         pending_grace_type: Optional[str] = None
-        pending_tuplet: Optional[tuple] = None
 
         # ── Position-level accumulators (cleared on position change) ──
         pos_articulations: list = []
@@ -199,44 +195,43 @@ class REMIToMusicXML:
 
             # ── Note events ──
             elif token_type == '<Note_ON':
-                pending_interval = value
-                pending_vel = 0
-                pending_prog = current_prog
-                pending_sub = current_sub
+                # Chord support: accumulate multiple Note_ON before Duration
+                pending_notes.append({
+                    'interval': value,
+                    'vel': 0,
+                    'prog': current_prog,
+                    'sub': current_sub,
+                    'articulations': list(pos_articulations),
+                    'ornaments': list(pos_ornaments),
+                    'tuplet': current_tuplet,
+                })
                 pending_rest = False
-                pending_tuplet = current_tuplet
-                # Copy position-level markings to pending so Duration will attach them
-                pending_articulations = list(pos_articulations)
-                pending_ornaments = list(pos_ornaments)
-                # pending_grace_type is set by <GraceNote> token, carry through
 
             elif token_type == '<Velocity':
-                if pending_interval is not None:
-                    pending_vel = value
+                # Apply velocity to ALL pending notes
+                for pn in pending_notes:
+                    pn['vel'] = value
 
             elif token_type == '<Duration':
-                if pending_interval is not None:
+                if pending_notes:
                     tonic = key_name_to_tonic_midi(current_key_name)
-                    midi_pitch = tonic + pending_interval
-                    midi_pitch = max(0, min(127, midi_pitch))
-                    parts[(pending_prog, pending_sub)][cur_measure][cur_position].append({
-                        'type': 'note',
-                        'pitch': midi_pitch,
-                        'velocity': pending_vel,
-                        'duration': value,
-                        'articulations': list(pending_articulations),
-                        'ornaments': list(pending_ornaments),
-                        'grace_type': pending_grace_type,
-                        'tuplet': pending_tuplet,
-                    })
-                    pending_interval = None
-                    pending_vel = 0
-                    pending_articulations.clear()
-                    pending_ornaments.clear()
+                    for pn in pending_notes:
+                        midi_pitch = tonic + pn['interval']
+                        midi_pitch = max(0, min(127, midi_pitch))
+                        parts[(pn['prog'], pn['sub'])][cur_measure][cur_position].append({
+                            'type': 'note',
+                            'pitch': midi_pitch,
+                            'velocity': pn['vel'],
+                            'duration': value,
+                            'articulations': list(pn['articulations']),
+                            'ornaments': list(pn['ornaments']),
+                            'grace_type': pending_grace_type,
+                            'tuplet': pn['tuplet'],
+                        })
+                    pending_notes.clear()
                     pending_grace_type = None
-                    pending_tuplet = None
                 elif pending_rest:
-                    parts[(current_prog, current_sub)][cur_measure][cur_position].append({
+                    parts[(pending_rest_prog, pending_rest_sub)][cur_measure][cur_position].append({
                         'type': 'rest',
                         'duration': value,
                     })
@@ -244,19 +239,19 @@ class REMIToMusicXML:
 
             elif token_type == '<Rest>':
                 pending_rest = True
-                pending_prog = current_prog
-                pending_sub = current_sub
-                pending_interval = None
+                pending_rest_prog = current_prog
+                pending_rest_sub = current_sub
+                pending_notes.clear()
 
             # ── Expressive markings (position-level + pending) ──
             elif token_type == '<Artic':
                 pos_articulations.append(value)
-                if pending_interval is not None:
-                    pending_articulations.append(value)
+                for pn in pending_notes:
+                    pn['articulations'].append(value)
             elif token_type == '<Ornament':
                 pos_ornaments.append(value)
-                if pending_interval is not None:
-                    pending_ornaments.append(value)
+                for pn in pending_notes:
+                    pn['ornaments'].append(value)
 
             # ── Performance events (position-based) ──
             elif token_type == '<Dynamic':

@@ -693,9 +693,18 @@ CRASH_LOG="$LOG_DIR/crashes.log"
 WATCHDOG_LOG="$LOG_DIR/watchdog.log"
 MAX_RESTARTS={max_restarts}
 RESTART_DELAY={restart_delay}
+CHECKPOINT_DIR="{checkpoint_dir}"
 RESUME_ARG="{resume_arg}"
 
 cd "$PROJECT_DIR"
+
+# 动态查找最新 checkpoint（处理保留策略删除旧文件的情况）
+_find_latest_ckpt() {{
+    local latest=$(ls -1 "$CHECKPOINT_DIR"/step_*.pt 2>/dev/null | sort -t_ -k2 -n | tail -1)
+    if [ -n "$latest" ]; then
+        echo "--resume $latest"
+    fi
+}}
 
 echo "[$(date "+%Y-%m-%d %H:%M:%S")] ⚙️  看门狗启动 (最多重启 $MAX_RESTARTS 次)" >> "$WATCHDOG_LOG"
 
@@ -724,7 +733,7 @@ print(f'CUDA cleared | GPU: {{torch.cuda.get_device_name(0)}} | '
         --batch-size {batch_size} \
         --output-dir "$CHECKPOINT_DIR" \
         --log-dir "$TB_DIR" \
-        $RESUME_ARG \
+        $(if [ -n "$RESUME_ARG" ] && [ -f "${{RESUME_ARG#--resume }}" ]; then echo "$RESUME_ARG"; else _find_latest_ckpt; fi) \
         2>> "$CRASH_LOG"
 
     EXIT_CODE=$?

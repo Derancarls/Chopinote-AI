@@ -251,7 +251,11 @@ class TokenDataset(Dataset):
                 local_pos = pos - start
                 if 0 <= local_pos < T and i < len(attrs_list):
                     attr = attrs_list[i]
-                    sec_bars_target[local_pos] = attr.get('bars', -1)
+                    bars_val = attr.get('bars', -1)
+                    # 钳制 bars 到有效范围，避免 section_head 的 CE out-of-range 崩溃
+                    if bars_val > 128:
+                        bars_val = 128
+                    sec_bars_target[local_pos] = bars_val
                     sec_keys_target[local_pos] = key_ids[pos] if 0 <= pos < len(key_ids) else -1
                     sec_types_target[local_pos] = attr.get('type', -1)
         else:
