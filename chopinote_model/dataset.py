@@ -251,7 +251,11 @@ class TokenDataset(Dataset):
                 local_pos = pos - start
                 if 0 <= local_pos < T and i < len(attrs_list):
                     attr = attrs_list[i]
-                    sec_bars_target[local_pos] = attr.get('bars', -1)
+                    bars_val = attr.get('bars', -1)
+                    # 钳制 bars 到有效范围，避免 section_head 的 CE out-of-range 崩溃
+                    if bars_val > 128:
+                        bars_val = 128
+                    sec_bars_target[local_pos] = bars_val
                     sec_keys_target[local_pos] = key_ids[pos] if 0 <= pos < len(key_ids) else -1
                     sec_types_target[local_pos] = attr.get('type', -1)
         else:
@@ -387,7 +391,7 @@ def create_dataloader(split_file: str, data_dir: str = 'data/processed',
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=2,
-        persistent_workers=True,
-        pin_memory=True,
+        num_workers=0,          # 0: 禁用 multiprocessing，避免 worker 连接丢失崩溃
+        persistent_workers=False,
+        pin_memory=False,       # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
     )

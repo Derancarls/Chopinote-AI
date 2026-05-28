@@ -359,7 +359,7 @@ def generate(model: MusicTransformer, tokenizer: REMITokenizer,
 
         logits = model.forward(next_token, kv_caches=kv_caches,
                                measure_ids=cached_measure_ids)  # (1, T', V)
-        logits = logits[:, -1, :] / temperature  # (1, V)
+        logits = logits[:, -1, :] / max(temperature, 1e-8)  # (1, V)
 
         # ── 音高限制：遮盖当前乐器音域外的 NOTE_ON token ──
         if cur_program is not None and cur_program < 112:
@@ -535,7 +535,7 @@ def generate_structure_plan(model: MusicTransformer, tokenizer: REMITokenizer,
             next_token = generated[:, -1:]
 
         logits = model.forward(next_token, kv_caches=kv_caches)
-        logits = logits[:, -1, :] / temperature
+        logits = logits[:, -1, :] / max(temperature, 1e-8)
 
         # 只允许结构 token
         structure_mask = torch.full_like(logits, float('-inf'))
@@ -635,7 +635,7 @@ def generate_harmony_skeleton(model: MusicTransformer, tokenizer: REMITokenizer,
             next_token = generated[:, -1:]
 
         logits = model.forward(next_token, kv_caches=kv_caches)
-        logits = logits[:, -1, :] / temperature
+        logits = logits[:, -1, :] / max(temperature, 1e-8)
 
         # ── 状态机约束 ──
         if state == 'chord':

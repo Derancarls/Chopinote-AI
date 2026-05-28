@@ -653,7 +653,7 @@ def annotate_file(token_path: str, output_dir: str) -> Optional[str]:
         n_bars_in_sec = bar_end - bar_start
         primary_key = _get_primary_key(bars, bar_start, bar_end)
         section_attrs.append({
-            'bars': min(n_bars_in_sec, 128),
+            'bars': n_bars_in_sec,
             'key': _key_to_id(primary_key),
             'type': sec_type if s < len(section_types) else _section_fallback_id(s),
         })

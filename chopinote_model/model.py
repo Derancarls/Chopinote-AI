@@ -21,6 +21,8 @@ except AttributeError:
     pass
 # 4D mask + cuDNN 会回退到 math backend → OOM
 _SDPA_BACKENDS_4D = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+# 推理时只用 Flash + Efficient（Blackwell 5120 CuDNN 特定长度无可用内核）
+_SDPA_BACKENDS_INFER = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 
 
 class CausalSelfAttention(nn.Module):
@@ -44,11 +46,12 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer('_rope_cos', None, persistent=False)
         self.register_buffer('_rope_sin', None, persistent=False)
 
-    def _ensure_rope_cache(self, device: torch.device, dtype: torch.dtype):
-        if self._rope_cos is not None and self._rope_cos.device == device:
+    def _ensure_rope_cache(self, device: torch.device, dtype: torch.dtype, min_len: int = 0):
+        need_len = max(self.max_len, min_len) if not self.training else self.max_len
+        if self._rope_cos is not None and self._rope_cos.device == device and self._rope_cos.dtype == dtype and self._rope_cos.size(0) >= need_len:
             return
         theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, device=device).float() / self.head_dim))
-        pos = torch.arange(self.max_len, device=device).float()
+        pos = torch.arange(need_len, device=device).float()
         freqs = torch.outer(pos, theta)
         self._rope_cos = freqs.cos().to(dtype)
         self._rope_sin = freqs.sin().to(dtype)
@@ -76,10 +79,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        self._ensure_rope_cache(x.device, q.dtype)
-
         if kv_cache is not None and kv_cache[0] is not None:
             cache_len = kv_cache[0].size(2)
+        else:
+            cache_len = 0
+
+        self._ensure_rope_cache(x.device, q.dtype, min_len=cache_len + T)
+
+        if kv_cache is not None and kv_cache[0] is not None:
             k_new = self._apply_rope(k, self._rope_cos[cache_len:cache_len + T],
                                       self._rope_sin[cache_len:cache_len + T])
             k = torch.cat([kv_cache[0], k_new], dim=2)
@@ -97,7 +104,9 @@ class CausalSelfAttention(nn.Module):
             kv_cache[0] = k
             kv_cache[1] = v
 
-        use_causal = kv_cache is None or kv_cache[0] is None or cache_len == 0
+        # 推理时始终 is_causal=True（单 token 生成等价且 SDPA 内核更稳定）
+        use_causal = (kv_cache is None or kv_cache[0] is None) if not self.training else (
+            kv_cache is None or kv_cache[0] is None or cache_len == 0)
 
         # ── 段落偏置（段落感知注意力）───────────────────────────
         if sec_bias is not None:
@@ -115,7 +124,8 @@ class CausalSelfAttention(nn.Module):
                 if pad.size(0) < T_kv:
                     pad = F.pad(pad, (0, T_kv - pad.size(0)), value=_NEG_INF)
                 attn_mask = attn_mask + pad.view(1, 1, 1, -1)
-            with sdpa_kernel(_SDPA_BACKENDS_4D):
+            sdpa_backends_4d = _SDPA_BACKENDS_INFER if not self.training else _SDPA_BACKENDS_4D
+            with sdpa_kernel(sdpa_backends_4d):
                 y = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_mask,
                     dropout_p=self.dropout.p if self.training else 0.0,
@@ -131,12 +141,27 @@ class CausalSelfAttention(nn.Module):
             else:
                 attn_mask = None
 
-            with sdpa_kernel(_SDPA_BACKENDS):
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    is_causal=use_causal,
-                )
+            sdpa_backends = _SDPA_BACKENDS_INFER if not self.training else _SDPA_BACKENDS
+            try:
+                with sdpa_kernel(sdpa_backends):
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        is_causal=use_causal,
+                    )
+            except RuntimeError:
+                # Fallback: 手动 attention（Blackwell 某些长度下 SDPA 无可用内核）
+                scale = self.head_dim ** -0.5
+                attn = (q @ k.transpose(-2, -1)) * scale
+                if attn_mask is not None:
+                    attn = attn + attn_mask
+                if use_causal:
+                    causal = torch.triu(
+                        torch.full((T, T_kv), _NEG_INF, device=x.device, dtype=q.dtype),
+                        diagonal=T_kv - T + 1)
+                    attn = attn + causal[None, None, :, :]
+                attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+                y = attn @ v  # attn: (B,H,T,S) @ v: (B,H,S,D) → (B,H,T,D)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -200,14 +225,11 @@ class TransformerBlock(nn.Module):
 
 
 class SectionPredictionHead(nn.Module):
-    """段落属性预测头（双任务训练的辅助任务）。"""
+    """段落属性预测头（双任务训练的辅助任务）。不预测段落长度（causal 架构下无法看到未来）。"""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_model = config.d_model
-        # 段落持续小节数预测（0 ~ n_section_bars_classes + padding）
-        self.bars_head = nn.Linear(config.d_model,
-                                   config.n_section_bars_classes + 1)
         # 段落主调预测（30 keys + padding）
         self.key_head = nn.Linear(config.d_model, 31)
         # 段落类型预测（22 types + padding）
@@ -215,7 +237,6 @@ class SectionPredictionHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> dict:
         return {
-            'bars': self.bars_head(x),
             'key': self.key_head(x),
             'type': self.type_head(x),
         }
@@ -343,11 +364,17 @@ class MusicTransformer(nn.Module):
         # 边界区域: 检测 section_id 变化的 bar 前后 4 小节
         boundary_mask = self._compute_boundary_mask(section_ids, bar_positions)  # (B, T_full, T_full)
 
+        # clamp 标量偏置参数，防止训练过程中梯度爆炸
+        _a = self.sec_bias_alpha.clamp(0.0, self.config.sec_bias_param_max)
+        _b = self.sec_bias_beta.clamp(0.0, self.config.sec_bias_param_max)
+        _g = self.sec_bias_gamma.clamp(0.0, self.config.sec_bias_param_max)
+        _d = self.sec_bias_delta.clamp(0.0, self.config.sec_bias_param_max)
+
         sec_bias = torch.zeros(B, 1, T_full, T_full, device=device, dtype=dtype)
-        sec_bias += self.sec_bias_alpha * same_inst.unsqueeze(1)
-        sec_bias += self.sec_bias_beta * (~same_inst.bool() & same_type.bool()).to(dtype).unsqueeze(1)
-        sec_bias -= self.sec_bias_gamma * (~same_type.bool()).to(dtype).unsqueeze(1)
-        sec_bias += self.sec_bias_delta * boundary_mask.unsqueeze(1)
+        sec_bias += _a * same_inst.unsqueeze(1)
+        sec_bias += _b * (~same_inst.bool() & same_type.bool()).to(dtype).unsqueeze(1)
+        sec_bias -= _g * (~same_type.bool()).to(dtype).unsqueeze(1)
+        sec_bias += _d * boundary_mask.unsqueeze(1)
 
         # 距离衰减（适用于同类型跨实例和边界区域）
         decay = torch.exp(-bar_dist.unsqueeze(1) / self.sec_bias_decay_len)
@@ -478,16 +505,20 @@ class MusicTransformer(nn.Module):
         decay_full = torch.exp(-bar_dist / self.chord_decay_len)
         decay_epsilon = (bar_dist <= self.chord_epsilon_bar_window).to(dtype)
 
+        _cg = self.chord_bias_gamma.clamp(0.0, self.config.chord_bias_param_max)
+        _ce = self.chord_bias_epsilon.clamp(0.0, self.config.chord_bias_param_max)
+        _cz = self.chord_bias_zeta.clamp(0.0, self.config.chord_bias_param_max)
+
         chord_bias = torch.zeros(B, 1, T_full, T_full, device=device, dtype=dtype)
 
         # γ: 同和弦凝聚 × 距离衰减
-        chord_bias += self.chord_bias_gamma * same_chord.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
+        chord_bias += _cg * same_chord.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
 
         # ε: 和弦切换桥接 × 窄窗口
-        chord_bias += self.chord_bias_epsilon * chord_change.to(dtype).unsqueeze(1) * decay_epsilon.unsqueeze(1)
+        chord_bias += _ce * chord_change.to(dtype).unsqueeze(1) * decay_epsilon.unsqueeze(1)
 
         # ζ: 同功能组弱正偏置 × 距离衰减
-        chord_bias += self.chord_bias_zeta * same_group.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
+        chord_bias += _cz * same_group.to(dtype).unsqueeze(1) * decay_full.unsqueeze(1)
 
         # ── 与 sec_bias δ 去重 ──
         if sec_bias is not None:
@@ -560,7 +591,7 @@ class MusicTransformer(nn.Module):
             x = x + self.section_embedding(sec_ids_emb)
             x = x + self.section_type_embedding(sec_types_emb)
 
-            in_kv_decode = kv_caches is not None and kv_caches[0] is not None and kv_caches[0][0] is not None
+            in_kv_decode = kv_caches is not None and len(kv_caches) > 0 and kv_caches[0] is not None and kv_caches[0][0] is not None
             if in_kv_decode:
                 sec_bias = self._compute_sec_bias(
                     section_ids_full, section_types_full, measure_ids_full, query_slice=T)
@@ -593,7 +624,7 @@ class MusicTransformer(nn.Module):
                 if chord_func_ids.ndim == 1:
                     chord_func_ids = chord_func_ids.unsqueeze(0)
                 chord_ids_full = chord_func_ids
-                in_kv_decode = kv_caches is not None and kv_caches[0] is not None and kv_caches[0][0] is not None
+                in_kv_decode = kv_caches is not None and len(kv_caches) > 0 and kv_caches[0] is not None and kv_caches[0][0] is not None
                 if in_kv_decode:
                     chord_bias = self._compute_chord_bias(
                         chord_ids_full, measure_ids_full, sec_bias, query_slice=T)

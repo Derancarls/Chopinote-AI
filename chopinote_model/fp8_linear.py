@@ -133,7 +133,6 @@ class FP8Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_fp8 or not self._fp8_compatible():
-            self._update_scales(x)
             target_dtype = self.weight.dtype
             bias = self.bias.to(target_dtype) if self.bias is not None else None
             return F.linear(x.to(target_dtype), self.weight, bias)
@@ -143,8 +142,3 @@ class FP8Linear(nn.Module):
         return FP8LinearFn.apply(x, self._w_fp8_fwd, self._w_fp8_bwd,
                                  self.weight, self.bias,
                                  self._scale_x, self._scale_w)
-
-    @torch.no_grad()
-    def _update_scales(self, x: torch.Tensor):
-        self._scale_x = compute_scale(x.detach())
-        self._scale_w = compute_scale(self.weight)

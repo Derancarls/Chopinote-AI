@@ -54,15 +54,15 @@ class Trainer:
         self._token_id_to_type, self._type_names = self._build_token_type_map()
 
         # 去重参数（weight tying 会导致同一 tensor 作为多个 Parameter 被 yield）
-        params = list(dict.fromkeys(model.parameters()))
+        param_groups = self._build_param_groups(model, train_config.lr, train_config)
         try:
             self.optimizer = AdamW(
-                params, lr=train_config.lr, weight_decay=0.1,
+                param_groups, lr=train_config.lr, weight_decay=0.1,
                 betas=(0.9, 0.95), fused=True,
             )
         except (RuntimeError, TypeError):
             self.optimizer = AdamW(
-                params, lr=train_config.lr, weight_decay=0.1,
+                param_groups, lr=train_config.lr, weight_decay=0.1,
                 betas=(0.9, 0.95),
             )
         self.scheduler = _get_scheduler(
@@ -199,6 +199,7 @@ class Trainer:
                     copy_rows = min(old_emb.shape[0], new_emb.shape[0])
                     new_emb[:copy_rows] = old_emb[:copy_rows]
                     logger.info(f'Embedding {key}: 复用 {copy_rows}/{new_emb.shape[0]} 行来自 checkpoint')
+
         # ─────────────────────────────────────────────────────
 
         self.model.load_state_dict(model_state)
@@ -267,9 +268,8 @@ class Trainer:
                 dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
-                num_workers=2,
-                persistent_workers=True,
-                pin_memory=False,   # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
+                num_workers=0,          # 0: 禁用 multiprocessing，避免 worker 连接丢失崩溃
+                pin_memory=False,       # False: 避免 worker 异常退出导致 pin_memory 线程崩溃
                 collate_fn=collate_fn,
                 drop_last=True,
             )
@@ -302,12 +302,12 @@ class Trainer:
         config = self.train_config
         model = self.model
 
-        params = list(dict.fromkeys(model.parameters()))
+        param_groups = self._build_param_groups(model, lr, config)
         try:
-            self.optimizer = AdamW(params, lr=lr, weight_decay=0.1,
+            self.optimizer = AdamW(param_groups, lr=lr, weight_decay=0.1,
                                    betas=(0.9, 0.95), fused=True)
         except (RuntimeError, TypeError):
-            self.optimizer = AdamW(params, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+            self.optimizer = AdamW(param_groups, lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
         self.scheduler = _get_scheduler(self.optimizer, warmup_steps, total_steps)
 
         prefix = f'[{phase_name}] ' if phase_name else ''
@@ -316,13 +316,36 @@ class Trainer:
         if getattr(self, '_resume_opt_state', None) is not None:
             try:
                 self.optimizer.load_state_dict(self._resume_opt_state)
+                # 重建正确的参数组结构（旧 checkpoint 可能只有 1 个 flat group）
+                fixed = self._build_param_groups(model, lr, config)
+                # 保留已恢复的超参（betas/eps/weight_decay），避免 KeyError
+                restored_hparams = {}
+                for g in self.optimizer.param_groups:
+                    for k, v in g.items():
+                        if k != 'params':
+                            restored_hparams[k] = v
+                for g in fixed:
+                    for k, v in restored_hparams.items():
+                        g.setdefault(k, v)
+                self.optimizer.param_groups = fixed
                 if self._resume_sched_state is not None:
                     self.scheduler.load_state_dict(self._resume_sched_state)
                 logger.info(f'{prefix}从 checkpoint 恢复 optimizer/scheduler 状态 (step {self.global_step})')
             except Exception as e:
                 logger.warning(f'{prefix}无法恢复 optimizer 状态: {e}，使用新初始化')
-            self._resume_opt_state = None
-            self._resume_sched_state = None
+                self._resume_opt_state = None
+                # scheduler 不依赖 param groups，单独恢复
+                if self._resume_sched_state is not None:
+                    try:
+                        self.scheduler.load_state_dict(self._resume_sched_state)
+                        logger.info(f'{prefix}独立恢复 scheduler 状态 (step {self.global_step})')
+                    except Exception as se:
+                        logger.warning(f'{prefix}无法恢复 scheduler 状态: {se}')
+                        self._resume_sched_state = None
+
+        # 恢复训练时，用 global_step 偏移 phase 内计数器，让显示从真实进度开始
+        resume_offset = self.global_step if phase_name else 0
+        adjusted_total = total_steps + resume_offset
 
         model.train()
         model.set_gradient_checkpointing(config.gradient_checkpointing)
@@ -424,33 +447,56 @@ class Trainer:
                     sec_loss_val = 0.0
                     chord_loss_val = 0.0
 
-                    # Section prediction loss（辅助任务）
+                    # Section prediction loss（辅助任务，fp32 CE 防 bf16 溢出 NaN）
                     if sec_head_logits is not None:
-                        sec_bars_target = batch['sec_bars_target'].to(self.device)
+                        # NaN guard: 检查 sec head logits
+                        _sec_keys_flat = sec_head_logits['key'].view(-1, sec_head_logits['key'].size(-1))
+                        _sec_types_flat = sec_head_logits['type'].view(-1, sec_head_logits['type'].size(-1))
+                        if (torch.isnan(_sec_keys_flat).any() or torch.isinf(_sec_keys_flat).any() or
+                            torch.isnan(_sec_types_flat).any() or torch.isinf(_sec_types_flat).any()):
+                            logger.error(
+                                f'{prefix}NaN/Inf in sec_head_logits! '
+                                f'key=[{_sec_keys_flat.min().item():.2f}, {_sec_keys_flat.max().item():.2f}] '
+                                f'type=[{_sec_types_flat.min().item():.2f}, {_sec_types_flat.max().item():.2f}] '
+                                f'Resetting gradient accumulation.')
+                            self.optimizer.zero_grad()
+                            accum = 0
+                            continue
+
                         sec_keys_target = batch['sec_keys_target'].to(self.device)
                         sec_types_target = batch['sec_types_target'].to(self.device)
 
-                        has_sec_targets = (sec_bars_target != -1).any()
+                        has_sec_targets = (sec_keys_target != -1).any()
                         if has_sec_targets:
-                            bars_loss = nn.functional.cross_entropy(
-                                sec_head_logits['bars'].permute(0, 2, 1),
-                                sec_bars_target, ignore_index=-1, reduction='mean',
-                            )
                             keys_loss = nn.functional.cross_entropy(
-                                sec_head_logits['key'].permute(0, 2, 1),
+                                sec_head_logits['key'].permute(0, 2, 1).float(),
                                 sec_keys_target, ignore_index=-1, reduction='mean',
                             )
                             types_loss = nn.functional.cross_entropy(
-                                sec_head_logits['type'].permute(0, 2, 1),
+                                sec_head_logits['type'].permute(0, 2, 1).float(),
                                 sec_types_target, ignore_index=-1, reduction='mean',
                             )
-                            sec_loss_val = bars_loss.item() + keys_loss.item() + types_loss.item()
-                            loss = loss + model.config.sec_loss_weight * (bars_loss + keys_loss + types_loss)
+                            sec_loss_val = keys_loss.item() + types_loss.item()
+                            loss = loss + model.config.sec_loss_weight * (keys_loss + types_loss)
                         else:
                             sec_loss_val = 0.0
 
-                    # Chord prediction loss（辅助任务）
+                    # Chord prediction loss（辅助任务，fp32 CE 防 bf16 溢出 NaN）
                     if chord_head_logits is not None:
+                        # NaN guard: 检查 chord head logits
+                        _chord_func_flat = chord_head_logits['func'].view(-1, chord_head_logits['func'].size(-1))
+                        _chord_inv_flat = chord_head_logits['inv'].view(-1, chord_head_logits['inv'].size(-1))
+                        if (torch.isnan(_chord_func_flat).any() or torch.isinf(_chord_func_flat).any() or
+                            torch.isnan(_chord_inv_flat).any() or torch.isinf(_chord_inv_flat).any()):
+                            logger.error(
+                                f'{prefix}NaN/Inf in chord_head_logits! '
+                                f'func=[{_chord_func_flat.min().item():.2f}, {_chord_func_flat.max().item():.2f}] '
+                                f'inv=[{_chord_inv_flat.min().item():.2f}, {_chord_inv_flat.max().item():.2f}] '
+                                f'Resetting gradient accumulation.')
+                            self.optimizer.zero_grad()
+                            accum = 0
+                            continue
+
                         chord_func_targets = batch['chord_func_targets'].to(self.device)
                         chord_inv_targets = batch['chord_inv_targets'].to(self.device)
 
@@ -462,12 +508,12 @@ class Trainer:
 
                         if has_chord_func:
                             chord_func_loss = nn.functional.cross_entropy(
-                                chord_head_logits['func'].permute(0, 2, 1),
+                                chord_head_logits['func'].permute(0, 2, 1).float(),
                                 chord_func_targets, ignore_index=-1, reduction='mean',
                             )
                         if has_chord_inv:
                             chord_inv_loss = nn.functional.cross_entropy(
-                                chord_head_logits['inv'].permute(0, 2, 1),
+                                chord_head_logits['inv'].permute(0, 2, 1).float(),
                                 chord_inv_targets, ignore_index=-1, reduction='mean',
                             )
 
@@ -482,6 +528,15 @@ class Trainer:
 
                 if accum % config.grad_accum_steps == 0:
                     total_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                    # 梯度 NaN/Inf 检测：跳过 optimizer step 防止权重污染
+                    if torch.isnan(torch.tensor(total_norm)) or torch.isinf(torch.tensor(total_norm)):
+                        logger.error(f'{prefix}梯度 NaN/Inf (norm={total_norm}), 跳过 optimizer step!')
+                        self.optimizer.zero_grad()
+                        accum = 0
+                        total_loss = 0.0  # 防止 NaN 污染 logging 累加器
+                        continue
+
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
@@ -491,10 +546,10 @@ class Trainer:
                     self.global_step += 1
 
                     if not _fp8_enabled and config.use_fp8 and \
-                       local_step >= config.fp8_warmup_steps:
+                       (local_step >= config.fp8_warmup_steps or self.global_step >= config.fp8_warmup_steps):
                         model.set_fp8_mode(True)
                         _fp8_enabled = True
-                        logger.info(f'{prefix}Step {local_step}: FP8 模式已启用')
+                        logger.info(f'{prefix}Step {local_step + resume_offset}: FP8 模式已启用')
 
                     self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
 
@@ -523,9 +578,8 @@ class Trainer:
                         sec_str = f' | Sec: {sec_loss_val:.4f}' if sec_loss_val > 0 else ''
                         chord_str = f' | Chord: {chord_loss_val:.4f}' if chord_loss_val > 0 else ''
                         logger.info(
-                            f'{prefix}Step {local_step}/{total_steps}'
-                            f'{f" (global {self.global_step})" if phase_name else ""} | '
-                            f'Loss: {avg_loss:.4f} | '
+                            f'{prefix}Step {local_step + resume_offset}/{adjusted_total}'
+                            f' | Loss: {avg_loss:.4f} | '
                             f'LR: {self.scheduler.get_last_lr()[0]:.2e} | '
                             f'GN: {total_norm:.2f}{sec_str}{chord_str} | '
                             f'Time: {elapsed:.1f}s'
@@ -545,6 +599,8 @@ class Trainer:
                         acc_log = '  '.join(acc_strs) if acc_strs else ''
                         logger.info(f'{prefix}Val loss: {val_metrics["loss"]:.4f}  {acc_log}')
                         model.train()
+                        # 释放验证阶段缓存，防止 PyTorch 分配器占用显存不还
+                        torch.cuda.empty_cache()
 
                     if save_steps and local_step % save_steps == 0:
                         self.save_checkpoint(self._last_avg_loss)
@@ -625,6 +681,37 @@ class Trainer:
         return type_index, type_names
 
     @staticmethod
+    def _build_param_groups(model: nn.Module, lr: float,
+                            train_config: TrainingConfig) -> list[dict]:
+        """按模块分组设不同 LR，防止 aux heads / bias scalars 梯度爆炸。
+
+        - backbone (全部非 aux): lr
+        - aux_head (section_head, chord_head): lr * aux_head_lr_mult
+        - attn_bias (sec_bias_*, chord_bias_*): lr * attn_bias_lr_mult
+        """
+        backbone, aux_head, attn_bias = [], [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if 'section_head' in name or 'chord_head' in name:
+                aux_head.append(p)
+            elif 'sec_bias_' in name or 'chord_bias_' in name:
+                attn_bias.append(p)
+            else:
+                backbone.append(p)
+        groups = [
+            {'params': backbone, 'lr': lr},
+            {'params': aux_head, 'lr': lr * train_config.aux_head_lr_mult},
+            {'params': attn_bias, 'lr': lr * train_config.attn_bias_lr_mult},
+        ]
+        logger.info(
+            f'Param groups: backbone={len(backbone)} aux_head={len(aux_head)}'
+            f' attn_bias={len(attn_bias)}'
+            f' (aux_lr={lr * train_config.aux_head_lr_mult:.2e}'
+            f' bias_lr={lr * train_config.attn_bias_lr_mult:.2e})')
+        return groups
+
+    @staticmethod
     def _apply_loss_mask(labels: torch.Tensor, masked_ids: set) -> torch.Tensor:
         """向量化 loss 屏蔽：将 labels 中属于 masked_ids 的 token 设为 -100。"""
         if not masked_ids:
@@ -641,7 +728,7 @@ class Trainer:
         self.model.eval()
         total_sum = 0.0
         total_tokens = 0
-        sec_correct_bars = sec_correct_keys = sec_correct_types = 0
+        sec_correct_keys = sec_correct_types = 0
         sec_total = 0
         chord_correct_func = chord_correct_inv = 0
         chord_total_func = chord_total_inv = 0
@@ -673,14 +760,20 @@ class Trainer:
                 with autocast('cuda', dtype=torch.bfloat16):
                     output = self.model(input_ids, attention_mask, **model_kwargs)
 
-                # 解析输出
+                # 解析输出（与训练路径一致，按 dict keys 区分 sec/chord head）
                 logits = output
                 sec_head = chord_head = None
                 if isinstance(output, tuple):
                     if len(output) == 3:
                         logits, sec_head, chord_head = output
                     elif len(output) == 2:
-                        logits, sec_head = output
+                        if isinstance(output[1], dict):
+                            if 'bars' in output[1]:
+                                logits, sec_head = output
+                            else:
+                                logits, chord_head = output
+                        else:
+                            logits, sec_head = output
 
                 # ── Loss ──────────────────────────────────────
                 if _LIGER_AVAILABLE:
@@ -708,14 +801,12 @@ class Trainer:
                 type_correct.scatter_add_(0, types_v, correct_v.float())
 
                 # ── Section accuracy ──────────────────────────
-                if sec_head is not None and 'sec_bars_target' in batch:
-                    sec_bars = batch['sec_bars_target'].to(self.device)
+                if sec_head is not None and 'sec_keys_target' in batch:
                     sec_keys = batch['sec_keys_target'].to(self.device)
                     sec_types = batch['sec_types_target'].to(self.device)
-                    sec_mask = sec_bars != -1
+                    sec_mask = sec_keys != -1
                     if sec_mask.any():
                         sec_total += sec_mask.sum().item()
-                        sec_correct_bars += (sec_head['bars'].argmax(-1)[sec_mask] == sec_bars[sec_mask]).sum().item()
                         sec_correct_keys += (sec_head['key'].argmax(-1)[sec_mask] == sec_keys[sec_mask]).sum().item()
                         sec_correct_types += (sec_head['type'].argmax(-1)[sec_mask] == sec_types[sec_mask]).sum().item()
 
@@ -740,7 +831,6 @@ class Trainer:
         if overall_total > 0:
             results['acc/overall'] = (type_correct.sum() / overall_total).item()
         if sec_total > 0:
-            results['acc/sec_bars'] = sec_correct_bars / sec_total
             results['acc/sec_keys'] = sec_correct_keys / sec_total
             results['acc/sec_types'] = sec_correct_types / sec_total
         if chord_total_func > 0:

@@ -29,15 +29,20 @@ from chopinote_model.generate import GenerationParams
 from chopinote_dataset.tokenizer import REMITokenizer
 from chopinote_dataset.converter import MusicXMLToREMI
 from chopinote_cli.presets import Preset, get_preset, list_presets as _list_presets
+from chopinote_cli.config import load_config, find_config
+from chopinote_model.auto_config import (
+    detect_system, suggest_inference, print_hardware_report,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # -- 模型加载 --------------------------------------------------
 
-def load_model(checkpoint_path: str, device: torch.device):
+def load_model(checkpoint_path: str, device: torch.device, infer_cfg=None):
     """从 checkpoint 加载模型，返回 (model, config, step, loss).
     自动适应 checkpoint 的 vocab_size，无需手动对齐 ModelConfig。
+    infer_cfg: InferenceConfig | None，自动应用最优推理设置。
     """
     if not os.path.isfile(checkpoint_path):
         print(f'  [X] checkpoint 文件不存在: {checkpoint_path}')
@@ -81,7 +86,41 @@ def load_model(checkpoint_path: str, device: torch.device):
             print(f'         - ... 还有 {len(skipped) - 5} 个')
 
     model.to(device)
+
+    # ── 硬件自适应优化 ──
+    if infer_cfg:
+        # TF32 matmul
+        if infer_cfg.use_tf32:
+            torch.set_float32_matmul_precision('high')
+        # 显存上限
+        if device.type == 'cuda' and infer_cfg.memory_fraction < 1.0:
+            try:
+                torch.cuda.set_per_process_memory_fraction(infer_cfg.memory_fraction)
+            except Exception:
+                pass
+        # 精度转换
+        if infer_cfg.dtype == 'bf16':
+            model = model.bfloat16()
+        elif infer_cfg.dtype == 'fp16':
+            model = model.half()
+        # fp8: 不转 weights，由 FP8Linear 内部量化
+    # ────────────────────────────────────────
+
     model.eval()
+
+    # FP8 模式（需在 eval 后激活）
+    if infer_cfg and infer_cfg.dtype == 'fp8':
+        try:
+            model.set_fp8_mode(True)
+        except Exception:
+            pass
+
+    # torch.compile（最后一步，包裹模型）
+    if infer_cfg and infer_cfg.torch_compile:
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+        except Exception:
+            pass
 
     step = ckpt.get('step', 0)
     loss = ckpt.get('loss', None)
@@ -421,8 +460,8 @@ def generate_with_progress(
     pbar = tqdm(total=max_bars, desc='生成中', unit='bar', ncols=80)
 
     for step in range(max_new_tokens):
-        # 滑窗回退：首轮后只喂最后一个 token（依靠 KV cache）
-        if generated.size(1) > max_len:
+        # 首轮预填充所有 seed token，后续单 token 解码（依靠 KV cache）
+        if step > 0:
             next_token = generated[:, -1:]
 
         logits = model.forward(next_token, kv_caches=kv_caches, measure_ids=cached_measure_ids)
@@ -621,7 +660,7 @@ def save_to_musicxml(
     if save_tokens and token_ids:
         tok_path = output_path.rsplit('.musicxml', 1)[0] + '.tokens'
         try:
-            with open(tok_path, 'w') as f:
+            with open(tok_path, 'w', encoding='utf-8') as f:
                 f.write(' '.join(str(t) for t in token_ids))
         except OSError as e:
             logger.warning('保存 token 文件失败: %s', e)
@@ -640,7 +679,7 @@ def save_to_musicxml(
 def load_tokens_file(tokens_path: str) -> list[int] | None:
     """从 .tokens 文件加载 token ID 列表。"""
     try:
-        with open(tokens_path) as f:
+        with open(tokens_path, encoding='utf-8') as f:
             return [int(x) for x in f.read().strip().split()]
     except (OSError, ValueError) as e:
         logger.warning('加载 token 文件失败: %s', e)
@@ -877,7 +916,7 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
             print(f'\n--- 变体 {i + 1}/{num_samples} ---')
             params = dict(base_params)
             if variant_seed is not None:
-                params['seed'] = variant_seed + i
+                params['seed'] = variant_seed
             path = str(Path(base_output_path).with_name(
                 f'{Path(base_output_path).stem}_{i + 1}.musicxml'
             ))
@@ -1042,7 +1081,7 @@ def _parse_structure_tokens(structure_tokens: list[int], tokenizer) -> list[dict
             current_key = ts[len('<Key') + 1:-1]
         elif ts.startswith('<Bar_'):
             try:
-                current_bars = int(ts[len('<Bar_') + 1:-1])
+                current_bars = int(ts[len('<Bar_'):-1])
             except ValueError:
                 pass
 
@@ -1149,8 +1188,9 @@ def main():
         epilog=(
             '示例:\n'
             '  chopin best.pt input.musicxml\n'
+            '  chopin best.pt input.musicxml --config my_cfg.yaml\n'
             '  chopin best.pt input.musicxml --temp 1.2 --top-k 40\n'
-            '  chopin best.pt input.musicxml --seed 42 -n 3\n'
+            '  chopin best.pt input.musicxml --random-seed -n 3\n'
         ),
     )
     parser.add_argument('checkpoint', nargs='?', default=None,
@@ -1158,11 +1198,14 @@ def main():
     parser.add_argument('input', help='输入 MusicXML 乐谱文件路径')
     parser.add_argument('-o', '--output', default=None,
                         help='输出 MusicXML 文件路径')
-    parser.add_argument('--seed-bars', type=int, default=16,
+    parser.add_argument('--seed-bars', type=int, default=None,
                         help='从输入曲谱末尾截取的小节数作为种子（默认: 16）')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='随机种子，固定后可复现生成结果')
-    parser.add_argument('-n', '--num-samples', type=int, default=1,
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument('--seed', type=int, default=None,
+                        help='固定随机种子（与 --random-seed 互斥）')
+    seed_group.add_argument('--random-seed', action='store_true', default=None,
+                        help='自动生成随机种子实现可复现')
+    parser.add_argument('-n', '--num-samples', type=int, default=None,
                         help='一次生成 N 个变体（默认: 1）')
     parser.add_argument('--temp', type=float, default=None,
                         help='采样温度 (0.1~2.0)，指定后跳过交互式输入')
@@ -1192,6 +1235,8 @@ def main():
                         help='指定速度 BPM，如 60, 120, 180 等')
     parser.add_argument('--list-presets', action='store_true',
                         help='列出所有可用预设并退出')
+    parser.add_argument('--config', type=str, default=None,
+                        help='配置文件路径（默认自动搜索 ./chopinote_config.yaml / ~/.chopinote/config.yaml）')
     parser.add_argument('--lock-program', choices=['lock', 'free'], default=None,
                         help='乐器锁定: lock=只保留 seed 已有的乐器, free=允许自由切换')
     parser.add_argument('--rest-penalty', type=float, default=None,
@@ -1205,19 +1250,26 @@ def main():
     parser.add_argument('--prog-switch-interval', type=int, default=None,
                         help='触发切换偏置的最少连续音符数 (1~128, 默认 12)')
     # ── 段落感知生成 ─────────────────────────────────────
-    parser.add_argument('--section-aware', action='store_true',
+    parser.add_argument('--section-aware', action='store_true', default=None,
                         help='启用段落感知两阶段生成（结构规划 → 细节填充）')
-    parser.add_argument('--section-form', type=str, default='sonata',
+    parser.add_argument('--section-form', type=str, default=None,
                         choices=['sonata', 'rondo', 'aba', 'theme-variations', 'binary'],
                         help='曲式约束 (默认: sonata)')
-    parser.add_argument('--section-total-bars', type=int, default=64,
+    parser.add_argument('--section-total-bars', type=int, default=None,
                         help='结构规划目标总小节数 (默认: 64)')
 
     # ── 评价模式 ─────────────────────────────────────────
     parser.add_argument('--evaluate', action='store_true',
                         help='评价模式：对输入的乐谱打分')
+    # ── 反馈模式（默认启用） ─────────────────────────────
+    parser.add_argument('--no-feedback', action='store_true',
+                        help='禁用评价反馈，纯推理模式（最快速度）')
+    parser.add_argument('--feedback-level',
+                        choices=['off', 'light', 'normal', 'strict'],
+                        default='normal',
+                        help='反馈强度: off=纯推理 light=A+C normal=A+B+C(默认) strict=A+B+C+自动重试')
     parser.add_argument('--feedback', action='store_true',
-                        help='反馈模式：启用 A→B→C 生成-评价闭环')
+                        help='[已弃用] 反馈现在默认启用，请使用 --no-feedback 关闭或 --feedback-level 调整')
     parser.add_argument('--local-weight', type=float, default=0.5,
                         help='B1 局部反馈权重 (0~1, 默认 0.5)')
     parser.add_argument('--global-weight', type=float, default=0.5,
@@ -1234,6 +1286,36 @@ def main():
                         help='对比基准组名（all, timesig_4_4, source_musescore 等）')
     args = parser.parse_args()
 
+    # 判断用户是否主动传了 CLI 参数（config 覆盖前计算，避免被配置默认值误判）
+    has_cli_params = any([
+        args.max_bars is not None, args.temp is not None,
+        args.top_k is not None, args.complexity is not None,
+        args.key_mode is not None, args.time_mode is not None,
+        args.tempo_mode is not None, args.lock_program is not None,
+        args.rest_penalty is not None, args.max_polyphony is not None,
+        args.key_bias is not None, args.prog_switch_strength is not None,
+        args.prog_switch_interval is not None,
+        args.section_aware,
+    ])
+
+    # ── 加载配置文件 ─────────────────────────────────────
+    cfg = load_config(args.config)
+    cfg_path = find_config(args.config)
+    # 配置文件覆盖 argparse 默认值（不影响 has_cli_params 判断）
+    if args.seed_bars is None:
+        args.seed_bars = cfg.seed_bars
+    if args.num_samples is None:
+        args.num_samples = cfg.num_samples
+    if args.section_form is None:
+        args.section_form = cfg.section_form
+    if args.section_total_bars is None:
+        args.section_total_bars = cfg.section_total_bars
+    # max_bars 仅当实际配置文件存在时才覆盖（无配置文件时保持交互式询问）
+    if args.max_bars is None and cfg_path:
+        args.max_bars = cfg.max_bars
+    # 注意: section_aware 属于 has_cli_params，不从 config 覆盖 args
+    # ─────────────────────────────────────────────────────
+
     # ── 评价模式 ─────────────────────────────────────────
     if args.evaluate:
         _run_evaluate(args)
@@ -1248,15 +1330,25 @@ def main():
 
     print('=== Chopinote-AI - 钢琴谱续写工具 ===')
     print()
+    if cfg_path:
+        print(f'  配置文件: {cfg_path}')
+        print()
 
-    # -- 设备 ---------------------------------------------
+    # -- 设备与硬件检测 -----------------------------------
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'  设备: {device}')
+
+    sys_profile = detect_system()
+    infer_cfg = suggest_inference(sys_profile)
+    print_hardware_report(sys_profile, infer_cfg)
+    # 在 PyTorch 初始化线程池前设置线程数
+    if infer_cfg.num_threads:
+        torch.set_num_threads(infer_cfg.num_threads)
     print()
 
     # -- 第 1 步：加载模型 --------------------------------
     print('[1/4] 加载模型...')
-    model, config, step, loss = load_model(args.checkpoint, device)
+    model, config, step, loss = load_model(args.checkpoint, device, infer_cfg=infer_cfg)
 
     # 使用 checkpoint 的 vocab_size（可能不同于当前 ModelConfig 默认值）
     model_vocab_size = config.vocab_size
@@ -1308,16 +1400,6 @@ def main():
             sys.exit(1)
         print(f'      [预设] {preset.label} — {preset.description}')
 
-    has_cli_params = any([
-        args.max_bars is not None, args.temp is not None,
-        args.top_k is not None, args.complexity is not None,
-        args.key_mode is not None, args.time_mode is not None,
-        args.tempo_mode is not None, args.lock_program is not None,
-        args.rest_penalty is not None, args.max_polyphony is not None,
-        args.key_bias is not None, args.prog_switch_strength is not None,
-        args.prog_switch_interval is not None,
-        args.section_aware,
-    ])
     if preset is None and not has_cli_params:
         preset = _select_preset_interactive()
     # ────────────────────────────────────────────────────
@@ -1332,12 +1414,22 @@ def main():
         _time_mode = time_mode_bool if time_mode_bool is not None else pa.get('lock_time')
         _tempo_mode = tempo_mode_bool if tempo_mode_bool is not None else pa.get('lock_tempo')
     else:
-        _temp = args.temp
-        _top_k = args.top_k
-        _complexity = args.complexity
-        _key_mode = key_mode_bool
-        _time_mode = time_mode_bool
-        _tempo_mode = tempo_mode_bool
+        if cfg_path:
+            # 配置文件存在 → 使用配置值（跳过交互式询问）
+            _temp = args.temp if args.temp is not None else cfg.temperature
+            _top_k = args.top_k if args.top_k is not None else cfg.top_k
+            _complexity = args.complexity if args.complexity is not None else cfg.complexity
+            _key_mode = key_mode_bool if key_mode_bool is not None else cfg.lock_key
+            _time_mode = time_mode_bool if time_mode_bool is not None else cfg.lock_time
+            _tempo_mode = tempo_mode_bool if tempo_mode_bool is not None else cfg.lock_tempo
+        else:
+            # 无配置文件 → 保留原始交互行为
+            _temp = args.temp
+            _top_k = args.top_k
+            _complexity = args.complexity
+            _key_mode = key_mode_bool
+            _time_mode = time_mode_bool
+            _tempo_mode = tempo_mode_bool
 
     # -- 第 3 步：参数设置 --------------------------------
     print('[3/4] 设置续写参数...')
@@ -1352,24 +1444,27 @@ def main():
         seed_bars=seed_bars_count,
         model_vocab_size=model_vocab_size,
     )
-    params['seed'] = args.seed  # seed 仅从 CLI 设置
+    # ── 随机种子（优先级: --seed > --random-seed > config.random_seed > 无） ──
+    if args.seed is not None:
+        params['seed'] = args.seed
+    elif args.random_seed if args.random_seed is not None else cfg.random_seed:
+        import random
+        params['seed'] = random.randint(0, 2**31 - 1)
+        print(f'      [Seed] 自动随机种子: {params["seed"]}')
 
-    # ── 新增参数注入 ──────────────────────────────────────
-    def _prog_mode_bool(v: str | None) -> bool | None:
-        return {'lock': True, 'free': False}.get(v)
     params['lock_program'] = (
-        _prog_mode_bool(args.lock_program)
-        if args.lock_program is not None else True
+        _mode_bool(args.lock_program)
+        if args.lock_program is not None else cfg.lock_program
     )
-    params['rest_penalty'] = args.rest_penalty if args.rest_penalty is not None else 0.0
-    params['max_polyphony'] = args.max_polyphony if args.max_polyphony is not None else 10
-    params['key_bias_strength'] = args.key_bias if args.key_bias is not None else 2.0
-    params['prog_switch_strength'] = args.prog_switch_strength if args.prog_switch_strength is not None else 1.0
-    params['prog_switch_interval'] = args.prog_switch_interval if args.prog_switch_interval is not None else 12
+    params['rest_penalty'] = args.rest_penalty if args.rest_penalty is not None else cfg.rest_penalty
+    params['max_polyphony'] = args.max_polyphony if args.max_polyphony is not None else cfg.max_polyphony
+    params['key_bias_strength'] = args.key_bias if args.key_bias is not None else cfg.key_bias_strength
+    params['prog_switch_strength'] = args.prog_switch_strength if args.prog_switch_strength is not None else cfg.prog_switch_strength
+    params['prog_switch_interval'] = args.prog_switch_interval if args.prog_switch_interval is not None else cfg.prog_switch_interval
     # ── 段落感知生成参数 ──────────────────────────────────
-    params['section_aware'] = args.section_aware
-    params['section_form'] = args.section_form
-    params['section_total_bars'] = args.section_total_bars
+    params['section_aware'] = cfg.section_aware if args.section_aware is None else args.section_aware
+    params['section_form'] = args.section_form if args.section_form is not None else cfg.section_form
+    params['section_total_bars'] = args.section_total_bars if args.section_total_bars is not None else cfg.section_total_bars
     params['structure_max_tokens'] = 64  # 结构规划最多 64 tokens
     # ─────────────────────────────────────────────────────
 
@@ -1426,24 +1521,30 @@ def main():
     # ────────────────────────────────────────────────────
 
     # ── 段落感知模式提示 ──────────────────────────────────
-    if args.section_aware:
-        print(f'      [段落感知] 两阶段生成 | 曲式: {args.section_form} | '
-              f'目标: {args.section_total_bars} 小节')
+    if params.get('section_aware'):
+        print(f'      [段落感知] 两阶段生成 | 曲式: {params.get("section_form")} | '
+              f'目标: {params.get("section_total_bars")} 小节')
     print()
 
-    # ── 反馈模式：A 阶段（生成前评估） ─────────────────
+    # ── 反馈模式：A 阶段（生成前评估，默认启用） ───────
     feedback_callback = None
     gen_params_obj = None
     post_filter = None
+    feedback_level = 'off' if args.no_feedback else args.feedback_level
 
+    # 兼容旧 --feedback 参数
     if args.feedback:
+        logger.warning("[已弃用] --feedback 现在默认启用，请使用 --no-feedback 关闭或 --feedback-level 调整")
+
+    if feedback_level != 'off':
         from chopinote_evaluator.feedback_controller import (
             PreGenerationEvaluator, NarrowFeedbackController, PostGenerationFilter,
         )
 
-        # A 阶段：seed 结构画像
+        # A 阶段：seed 结构画像 + 蓝图提取
         pre_eval = PreGenerationEvaluator(tokenizer, default_complexity=params.get('complexity'))
         seed_profile, gen_params_obj = pre_eval.evaluate(seed_tokens)
+        blueprint = pre_eval.extract_blueprint(seed_tokens)
 
         # 将用户 CLI 参数同步到 gen_params_obj（B 阶段的调整基准）
         _user_sync = {
@@ -1464,13 +1565,6 @@ def main():
             if _v is not None and hasattr(gen_params_obj, _k):
                 setattr(gen_params_obj, _k, _v)
 
-        # B 阶段：生成中实时反馈
-        feedback_controller = NarrowFeedbackController(
-            seed_profile, tokenizer,
-            local_weight=args.local_weight,
-            global_weight=args.global_weight,
-        )
-
         # C 阶段：生成后评价
         post_filter = PostGenerationFilter(
             tokenizer,
@@ -1482,9 +1576,21 @@ def main():
               f'密度: {seed_profile.bar_density:.1f} notes/bar | '
               f'调性: {seed_profile.tonic_key or "N/A"} | '
               f'声部: {seed_profile.voice_count}')
+        if blueprint.sections:
+            print(f'          段落: {" → ".join(f"{s.type}({s.n_bars})" for s in blueprint.sections)}')
+            print(f'          曲式: {blueprint.form_hint} | '
+                  f'和声密度: {blueprint.harmony.chord_density_per_bar_mean:.3f}')
         print()
 
-        feedback_callback = feedback_controller.on_bar
+        # B 阶段：normal/strict 模式下启用
+        if feedback_level in ('normal', 'strict'):
+            feedback_controller = NarrowFeedbackController(
+                seed_profile, tokenizer,
+                blueprint=blueprint,
+                local_weight=args.local_weight,
+                global_weight=args.global_weight,
+            )
+            feedback_callback = feedback_controller.on_bar
 
     # -- 第 4 步：生成 + 交互循环 -------------------------
     print('[4/4] 开始续写...')
@@ -1501,14 +1607,13 @@ def main():
         gen_params=gen_params_obj,
     )
 
-    # ── 反馈模式：C 阶段（生成后评价 + 退回重写 + RL reward） ─
-    if args.feedback and post_filter:
+    # ── 反馈模式：C 阶段（生成后评价 + 诊断 + 退回重写 + RL reward） ─
+    if feedback_level != 'off' and post_filter:
         saved_path = None
         if os.path.isfile(output_path):
             saved_path = output_path
         else:
-            # 只匹配本次运行时间戳的文件，避免拿到上次运行的结果 (#13)
-            base_stem = Path(output_path).stem  # e.g. output_chopinote_20260518_143000
+            base_stem = Path(output_path).stem
             candidates = sorted(
                 Path(output_path).parent.glob(f'{base_stem}*.musicxml'),
                 key=os.path.getmtime, reverse=True,
@@ -1519,56 +1624,73 @@ def main():
         if not saved_path:
             return
 
-        # 尝试退回重写（最多 max_retries 轮）
-        rollback_retries = 0
-        rollback_report = None
-        rollback_tokens = None
-
-        # 加载 token 序列（用于退回重写定位）
+        # 加载 token 序列
         tok_path = saved_path.rsplit('.musicxml', 1)[0] + '.tokens'
-        if os.path.isfile(tok_path):
-            rollback_tokens = load_tokens_file(tok_path)
+        rollback_tokens = load_tokens_file(tok_path) if os.path.isfile(tok_path) else None
 
-        while rollback_retries < args.max_retries:
-            print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
-            report = post_filter.evaluate(
-                saved_path,
-                seed_path=args.input,
-                checkpoint=args.checkpoint if args.feedback else None,
-            )
-            score = report.total_score if hasattr(report, 'total_score') else 0.0
-            legality_ok = report.legality.passed if report.legality else True
-            print(f'      | 综合评分: {score:.4f} | '
-                  f'合法性: {"通过" if legality_ok else "失败"}')
+        # 评价（light 模式不传 checkpoint，避免模型推理开销）
+        print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
+        _ckpt_for_eval = args.checkpoint if feedback_level in ('normal', 'strict') else None
+        report = post_filter.evaluate(
+            saved_path,
+            seed_path=args.input,
+            checkpoint=_ckpt_for_eval,
+        )
+        score = report.total_score if hasattr(report, 'total_score') else 0.0
+        legality_ok = report.legality.passed if report.legality else True
+        print(f'      | 综合评分: {score:.4f} | '
+              f'合法性: {"通过" if legality_ok else "失败"}')
 
+        # C 阶段结构化诊断
+        diagnoses = post_filter.diagnose_bars(report, tokenizer)
+        if diagnoses:
+            print(f'      小节诊断 ({len(diagnoses)} 个问题):')
+            for d in diagnoses[:5]:
+                sev_icon = '\033[91m●\033[0m' if d.severity > 0.7 else '\033[93m○\033[0m'
+                issues_str = ', '.join(d.issues[:2])
+                print(f'        小节 {d.bar}: {sev_icon} {issues_str}')
+                if d.suggestion:
+                    print(f'                 → {d.suggestion}')
+            if len(diagnoses) > 5:
+                print(f'         ... 还有 {len(diagnoses) - 5} 个问题')
+
+        # ── strict 模式：退回重写 ────────────────────────
+        rollback_retries = 0
+        rollback_report = report
+        max_retries = args.max_retries if feedback_level == 'strict' else 0
+
+        while rollback_retries < max_retries:
             if not post_filter.should_retry(report):
                 print(f'      | [OK] 得分达标')
-                rollback_report = report
                 break
 
-            # ✂ 尝试退回重写
+            # 使用 smart_rollback
+            section_plan = blueprint.section_plan if blueprint else None
+            diagnoses_for_rollback = post_filter.diagnose_bars(report, tokenizer)
+            rollback_bar = post_filter.smart_rollback(diagnoses_for_rollback, section_plan)
             rollback_point = None
-            if rollback_tokens is not None:
-                rollback_point = post_filter.get_rollback_point(
-                    report, tokenizer, rollback_tokens,
-                    seed_bars=args.seed_bars,
-                )
+            if rollback_bar is not None and rollback_tokens is not None:
+                bar_id = tokenizer.bar_token_id
+                bar_count = 0
+                for i, tid in enumerate(rollback_tokens):
+                    if tid == bar_id:
+                        bar_count += 1
+                        if bar_count == rollback_bar:
+                            rollback_point = i
+                            break
 
-            if rollback_point is not None and rollback_retries < args.max_retries - 1:
+            if rollback_point is not None and rollback_retries < max_retries - 1:
                 rollback_retries += 1
-                # 应用更紧的参数
                 adj = post_filter.get_retry_adjustments(report, rollback_retries)
                 if gen_params_obj:
                     gen_params_obj.apply_adjustments(adj)
-                # 截断 tokens 到退回点
                 rollback_tokens = rollback_tokens[:rollback_point]
-                # 重新生成
                 rollback_seed = torch.tensor([rollback_tokens], dtype=torch.long, device=device)
                 print(f'      | [退回重写 {rollback_retries}] '
-                      f'截断至第 {len(rollback_tokens)} token 重试, 参数: {adj}')
+                      f'退回到 bar {rollback_bar}, 参数: {adj}')
                 rollback_ids, _ = generate_with_progress(
                     model, rollback_seed, tokenizer,
-                    max_bars=params['max_bars'],  # Fix #12: use continuation bars, not total
+                    max_bars=params['max_bars'],
                     temperature=gen_params_obj.temperature if gen_params_obj else 1.0,
                     top_k=params.get('top_k', 20),
                     effective_vocab_size=model_vocab_size,
@@ -1580,25 +1702,28 @@ def main():
                     rest_penalty=gen_params_obj.rest_penalty if gen_params_obj else 0.0,
                     max_polyphony=params.get('max_polyphony', 10),
                     key_bias_strength=gen_params_obj.key_bias_strength if gen_params_obj else 0.0,
-                    prog_switch_strength=gen_params_obj.prog_switch_strength if gen_params_obj else 1.0,  # Fix #14
-                    prog_switch_interval=gen_params_obj.prog_switch_interval if gen_params_obj else 12,    # Fix #14
+                    prog_switch_strength=gen_params_obj.prog_switch_strength if gen_params_obj else 1.0,
+                    prog_switch_interval=gen_params_obj.prog_switch_interval if gen_params_obj else 12,
                     feedback_callback=feedback_callback,
                     gen_params=gen_params_obj,
                 )
                 rollback_tokens = rollback_ids[0].tolist()
                 save_to_musicxml(rollback_tokens, tokenizer, saved_path, max_bars_total,
                                  save_tokens=True)
+                report = post_filter.evaluate(saved_path, seed_path=args.input,
+                                             checkpoint=args.checkpoint)
+                rollback_report = report
+                score = report.total_score if hasattr(report, 'total_score') else 0.0
+                print(f'      | 重试后评分: {score:.4f}')
                 continue
             else:
                 print(f'      | [!] 得分 {score:.3f} < 阈值 {args.retry_threshold}'
                       f'{"，无法退回" if rollback_point is None else "，已达最大退回次数"}')
-                rollback_report = report
                 break
 
-        # 记录 RL reward（含 output_path 供 DPO 训练匹配 .tokens 文件）
-        final_report = rollback_report or report
+        # 记录 RL reward
         post_filter.log_reward(
-            final_report, gen_params_obj,
+            rollback_report, gen_params_obj,
             retry_count=rollback_retries,
             seed_info={'path': args.input, 'bars': max_bars_total, 'seed_bars': args.seed_bars},
             extra={'musicxml_path': saved_path},
