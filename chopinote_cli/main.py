@@ -1261,8 +1261,15 @@ def main():
     # ── 评价模式 ─────────────────────────────────────────
     parser.add_argument('--evaluate', action='store_true',
                         help='评价模式：对输入的乐谱打分')
+    # ── 反馈模式（默认启用） ─────────────────────────────
+    parser.add_argument('--no-feedback', action='store_true',
+                        help='禁用评价反馈，纯推理模式（最快速度）')
+    parser.add_argument('--feedback-level',
+                        choices=['off', 'light', 'normal', 'strict'],
+                        default='normal',
+                        help='反馈强度: off=纯推理 light=A+C normal=A+B+C(默认) strict=A+B+C+自动重试')
     parser.add_argument('--feedback', action='store_true',
-                        help='反馈模式：启用 A→B→C 生成-评价闭环')
+                        help='[已弃用] 反馈现在默认启用，请使用 --no-feedback 关闭或 --feedback-level 调整')
     parser.add_argument('--local-weight', type=float, default=0.5,
                         help='B1 局部反馈权重 (0~1, 默认 0.5)')
     parser.add_argument('--global-weight', type=float, default=0.5,
@@ -1519,19 +1526,25 @@ def main():
               f'目标: {params.get("section_total_bars")} 小节')
     print()
 
-    # ── 反馈模式：A 阶段（生成前评估） ─────────────────
+    # ── 反馈模式：A 阶段（生成前评估，默认启用） ───────
     feedback_callback = None
     gen_params_obj = None
     post_filter = None
+    feedback_level = 'off' if args.no_feedback else args.feedback_level
 
+    # 兼容旧 --feedback 参数
     if args.feedback:
+        logger.warning("[已弃用] --feedback 现在默认启用，请使用 --no-feedback 关闭或 --feedback-level 调整")
+
+    if feedback_level != 'off':
         from chopinote_evaluator.feedback_controller import (
             PreGenerationEvaluator, NarrowFeedbackController, PostGenerationFilter,
         )
 
-        # A 阶段：seed 结构画像
+        # A 阶段：seed 结构画像 + 蓝图提取
         pre_eval = PreGenerationEvaluator(tokenizer, default_complexity=params.get('complexity'))
         seed_profile, gen_params_obj = pre_eval.evaluate(seed_tokens)
+        blueprint = pre_eval.extract_blueprint(seed_tokens)
 
         # 将用户 CLI 参数同步到 gen_params_obj（B 阶段的调整基准）
         _user_sync = {
@@ -1552,13 +1565,6 @@ def main():
             if _v is not None and hasattr(gen_params_obj, _k):
                 setattr(gen_params_obj, _k, _v)
 
-        # B 阶段：生成中实时反馈
-        feedback_controller = NarrowFeedbackController(
-            seed_profile, tokenizer,
-            local_weight=args.local_weight,
-            global_weight=args.global_weight,
-        )
-
         # C 阶段：生成后评价
         post_filter = PostGenerationFilter(
             tokenizer,
@@ -1570,9 +1576,21 @@ def main():
               f'密度: {seed_profile.bar_density:.1f} notes/bar | '
               f'调性: {seed_profile.tonic_key or "N/A"} | '
               f'声部: {seed_profile.voice_count}')
+        if blueprint.sections:
+            print(f'          段落: {" → ".join(f"{s.type}({s.n_bars})" for s in blueprint.sections)}')
+            print(f'          曲式: {blueprint.form_hint} | '
+                  f'和声密度: {blueprint.harmony.chord_density_per_bar_mean:.3f}')
         print()
 
-        feedback_callback = feedback_controller.on_bar
+        # B 阶段：normal/strict 模式下启用
+        if feedback_level in ('normal', 'strict'):
+            feedback_controller = NarrowFeedbackController(
+                seed_profile, tokenizer,
+                blueprint=blueprint,
+                local_weight=args.local_weight,
+                global_weight=args.global_weight,
+            )
+            feedback_callback = feedback_controller.on_bar
 
     # -- 第 4 步：生成 + 交互循环 -------------------------
     print('[4/4] 开始续写...')
@@ -1589,14 +1607,13 @@ def main():
         gen_params=gen_params_obj,
     )
 
-    # ── 反馈模式：C 阶段（生成后评价 + 退回重写 + RL reward） ─
-    if args.feedback and post_filter:
+    # ── 反馈模式：C 阶段（生成后评价 + 诊断 + 退回重写 + RL reward） ─
+    if feedback_level != 'off' and post_filter:
         saved_path = None
         if os.path.isfile(output_path):
             saved_path = output_path
         else:
-            # 只匹配本次运行时间戳的文件，避免拿到上次运行的结果 (#13)
-            base_stem = Path(output_path).stem  # e.g. output_chopinote_20260518_143000
+            base_stem = Path(output_path).stem
             candidates = sorted(
                 Path(output_path).parent.glob(f'{base_stem}*.musicxml'),
                 key=os.path.getmtime, reverse=True,
@@ -1607,56 +1624,73 @@ def main():
         if not saved_path:
             return
 
-        # 尝试退回重写（最多 max_retries 轮）
-        rollback_retries = 0
-        rollback_report = None
-        rollback_tokens = None
-
-        # 加载 token 序列（用于退回重写定位）
+        # 加载 token 序列
         tok_path = saved_path.rsplit('.musicxml', 1)[0] + '.tokens'
-        if os.path.isfile(tok_path):
-            rollback_tokens = load_tokens_file(tok_path)
+        rollback_tokens = load_tokens_file(tok_path) if os.path.isfile(tok_path) else None
 
-        while rollback_retries < args.max_retries:
-            print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
-            report = post_filter.evaluate(
-                saved_path,
-                seed_path=args.input,
-                checkpoint=args.checkpoint if args.feedback else None,
-            )
-            score = report.total_score if hasattr(report, 'total_score') else 0.0
-            legality_ok = report.legality.passed if report.legality else True
-            print(f'      | 综合评分: {score:.4f} | '
-                  f'合法性: {"通过" if legality_ok else "失败"}')
+        # 评价
+        print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
+        report = post_filter.evaluate(
+            saved_path,
+            seed_path=args.input,
+            checkpoint=args.checkpoint,
+        )
+        score = report.total_score if hasattr(report, 'total_score') else 0.0
+        legality_ok = report.legality.passed if report.legality else True
+        print(f'      | 综合评分: {score:.4f} | '
+              f'合法性: {"通过" if legality_ok else "失败"}')
 
+        # C 阶段结构化诊断
+        seed_profile_for_diag = gen_params_obj
+        diagnoses = post_filter.diagnose_bars(report, tokenizer)
+        if diagnoses:
+            print(f'      小节诊断 ({len(diagnoses)} 个问题):')
+            for d in diagnoses[:5]:
+                sev_icon = '\033[91m●\033[0m' if d.severity > 0.7 else '\033[93m○\033[0m'
+                issues_str = ', '.join(d.issues[:2])
+                print(f'        小节 {d.bar}: {sev_icon} {issues_str}')
+                if d.suggestion:
+                    print(f'                 → {d.suggestion}')
+            if len(diagnoses) > 5:
+                print(f'         ... 还有 {len(diagnoses) - 5} 个问题')
+
+        # ── strict 模式：退回重写 ────────────────────────
+        rollback_retries = 0
+        rollback_report = report
+        max_retries = args.max_retries if feedback_level == 'strict' else 0
+
+        while rollback_retries < max_retries:
             if not post_filter.should_retry(report):
                 print(f'      | [OK] 得分达标')
-                rollback_report = report
                 break
 
-            # ✂ 尝试退回重写
+            # 使用 smart_rollback
+            section_plan = blueprint.section_plan if blueprint else None
+            diagnoses_for_rollback = post_filter.diagnose_bars(report, tokenizer)
+            rollback_bar = post_filter.smart_rollback(diagnoses_for_rollback, section_plan)
             rollback_point = None
-            if rollback_tokens is not None:
-                rollback_point = post_filter.get_rollback_point(
-                    report, tokenizer, rollback_tokens,
-                    seed_bars=args.seed_bars,
-                )
+            if rollback_bar is not None and rollback_tokens is not None:
+                bar_id = tokenizer.bar_token_id
+                bar_count = 0
+                for i, tid in enumerate(rollback_tokens):
+                    if tid == bar_id:
+                        bar_count += 1
+                        if bar_count == rollback_bar:
+                            rollback_point = i
+                            break
 
-            if rollback_point is not None and rollback_retries < args.max_retries - 1:
+            if rollback_point is not None and rollback_retries < max_retries - 1:
                 rollback_retries += 1
-                # 应用更紧的参数
                 adj = post_filter.get_retry_adjustments(report, rollback_retries)
                 if gen_params_obj:
                     gen_params_obj.apply_adjustments(adj)
-                # 截断 tokens 到退回点
                 rollback_tokens = rollback_tokens[:rollback_point]
-                # 重新生成
                 rollback_seed = torch.tensor([rollback_tokens], dtype=torch.long, device=device)
                 print(f'      | [退回重写 {rollback_retries}] '
-                      f'截断至第 {len(rollback_tokens)} token 重试, 参数: {adj}')
+                      f'退回到 bar {rollback_bar}, 参数: {adj}')
                 rollback_ids, _ = generate_with_progress(
                     model, rollback_seed, tokenizer,
-                    max_bars=params['max_bars'],  # Fix #12: use continuation bars, not total
+                    max_bars=params['max_bars'],
                     temperature=gen_params_obj.temperature if gen_params_obj else 1.0,
                     top_k=params.get('top_k', 20),
                     effective_vocab_size=model_vocab_size,
@@ -1668,25 +1702,28 @@ def main():
                     rest_penalty=gen_params_obj.rest_penalty if gen_params_obj else 0.0,
                     max_polyphony=params.get('max_polyphony', 10),
                     key_bias_strength=gen_params_obj.key_bias_strength if gen_params_obj else 0.0,
-                    prog_switch_strength=gen_params_obj.prog_switch_strength if gen_params_obj else 1.0,  # Fix #14
-                    prog_switch_interval=gen_params_obj.prog_switch_interval if gen_params_obj else 12,    # Fix #14
+                    prog_switch_strength=gen_params_obj.prog_switch_strength if gen_params_obj else 1.0,
+                    prog_switch_interval=gen_params_obj.prog_switch_interval if gen_params_obj else 12,
                     feedback_callback=feedback_callback,
                     gen_params=gen_params_obj,
                 )
                 rollback_tokens = rollback_ids[0].tolist()
                 save_to_musicxml(rollback_tokens, tokenizer, saved_path, max_bars_total,
                                  save_tokens=True)
+                report = post_filter.evaluate(saved_path, seed_path=args.input,
+                                             checkpoint=args.checkpoint)
+                rollback_report = report
+                score = report.total_score if hasattr(report, 'total_score') else 0.0
+                print(f'      | 重试后评分: {score:.4f}')
                 continue
             else:
                 print(f'      | [!] 得分 {score:.3f} < 阈值 {args.retry_threshold}'
                       f'{"，无法退回" if rollback_point is None else "，已达最大退回次数"}')
-                rollback_report = report
                 break
 
-        # 记录 RL reward（含 output_path 供 DPO 训练匹配 .tokens 文件）
-        final_report = rollback_report or report
+        # 记录 RL reward
         post_filter.log_reward(
-            final_report, gen_params_obj,
+            rollback_report, gen_params_obj,
             retry_count=rollback_retries,
             seed_info={'path': args.input, 'bars': max_bars_total, 'seed_bars': args.seed_bars},
             extra={'musicxml_path': saved_path},

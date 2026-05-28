@@ -32,6 +32,13 @@ from chopinote_evaluator.registry import (
     _register_span_tokens, _melodic_direction_tokens,
     _interval_shift_tokens, _key_consistency_tokens,
     _empty_measure_tokens, _pitch_range_tokens,
+    _unison_chain_tokens, _rest_streak_tokens,
+    _mono_rhythm_tokens, _extreme_density_tokens,
+    _bar_boundary_melody_tokens, _parallel_fifths_tokens,
+    _melodic_contour_tokens,
+    progression_validity_tokens, harmonic_rhythm_score_tokens,
+    cadence_quality_tokens, chord_melody_alignment_tokens,
+    _extract_chord_sequence,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,81 @@ class CPhaseResult:
     retry_count: int
     final: bool
     adjustments: dict[str, Any] | None = None
+
+
+# ── A 阶段数据结构 ──────────────────────────────────
+
+
+@dataclass
+class SeedSection:
+    """seed 内部的段落信息。"""
+    type: str
+    start_bar: int
+    n_bars: int
+    key: str = 'C'
+
+
+@dataclass
+class SectionStyleTarget:
+    """某段落类型的目标参数区间。"""
+    temperature: tuple[float, float, float] = (1.0, 0.7, 1.4)
+    key_bias_strength: tuple[float, float, float] = (2.0, 0.5, 3.0)
+    complexity: tuple[float, float, float] = (5.0, 1.0, 10.0)
+    density_target: float = 8.0
+    rest_ratio_target: tuple[float, float] = (0.05, 0.25)
+    harmonic_rhythm: float = 16.0
+    b1_threshold_mult: float = 1.0
+    b2_threshold_mult: float = 1.0
+    confidence: str = 'high'
+
+
+@dataclass
+class SectionStyleProfile:
+    """从 seed 中提取的各段落类型风格目标。"""
+    styles: dict[str, SectionStyleTarget] = field(default_factory=dict)
+    fallback: SectionStyleTarget = field(default_factory=SectionStyleTarget)
+
+
+@dataclass
+class HarmonyContext:
+    """A 阶段提取的和声上下文。"""
+    chord_density_per_bar: list[float] = field(default_factory=list)
+    final_cadence: list[str] = field(default_factory=list)
+    cadence_patterns: dict[str, int] = field(default_factory=dict)
+    harmonic_complexity: float = 0.5
+    chord_density_per_bar_mean: float | None = None
+    seed_contour: list[float] = field(default_factory=list)
+
+
+@dataclass
+class SectionPlan:
+    """A 阶段输出的段落排期。"""
+    type: str
+    start_bar: int
+    n_bars: int
+    key: str = 'C'
+    min_bars: int = 4
+    max_bars: int = 32
+
+
+@dataclass
+class SeedBlueprint:
+    """A 阶段输出：seed 的完整结构化蓝图。"""
+    profile: SeedProfile | None = None
+    sections: list[SeedSection] = field(default_factory=list)
+    form_hint: str = 'through_composed'
+    style_profile: SectionStyleProfile = field(default_factory=SectionStyleProfile)
+    harmony: HarmonyContext = field(default_factory=HarmonyContext)
+    section_plan: list[SectionPlan] = field(default_factory=list)
+
+
+@dataclass
+class BarDiagnosis:
+    """C 阶段逐小节诊断。"""
+    bar: int
+    issues: list[str] = field(default_factory=list)
+    severity: float = 0.0
+    suggestion: str | None = None
 
 
 # ── A 阶段：生成前评估 ──────────────────────────────────
@@ -200,12 +282,122 @@ class PreGenerationEvaluator:
 
         return profile, params
 
+    def extract_blueprint(self, seed_tokens: list[int]) -> SeedBlueprint:
+        """A 阶段核心：从 seed tokens 提取完整结构化蓝图。"""
+        profile, params = self.evaluate(seed_tokens)
+        blueprint = SeedBlueprint(profile=profile)
+
+        # ── 和声上下文 ──────────────────────────────────────
+        bar_id = self.tokenizer.bar_token_id
+        bars = _tokens_by_bar(seed_tokens, bar_id)
+        real_bars = bars[1:] if len(bars) > 1 else []
+        while real_bars and not any(t for t in real_bars[-1]):
+            real_bars.pop()
+
+        chord_density_per_bar = []
+        for bar_tokens in real_bars:
+            chords = _extract_chord_sequence(bar_tokens, self.tokenizer)
+            changes = sum(1 for i in range(1, len(chords)) if chords[i] != chords[i - 1])
+            chord_density_per_bar.append(changes)
+
+        final_cadence = []
+        for bar_tokens in reversed(real_bars[-3:]):
+            chords = _extract_chord_sequence(bar_tokens, self.tokenizer)
+            if chords:
+                final_cadence = chords[-2:]
+                break
+
+        harmony = HarmonyContext(
+            chord_density_per_bar=chord_density_per_bar,
+            final_cadence=final_cadence,
+            chord_density_per_bar_mean=sum(chord_density_per_bar) / max(len(chord_density_per_bar), 1) if chord_density_per_bar else 0.05,
+        )
+        blueprint.harmony = harmony
+
+        # ── 段落检测（简化版：基于 density_series 变点检测） ──
+        if profile.density_series and len(profile.density_series) >= 4:
+            sections = self._detect_sections_simple(profile.density_series, profile.tonic_key or 'C')
+            blueprint.sections = sections
+            if sections:
+                form = self._infer_form(sections)
+                blueprint.form_hint = form
+                # 构建 section_plan
+                blueprint.section_plan = self._build_section_plan(sections, total_bars=max(32, profile.n_bars * 2))
+                # 构建 style_profile
+                blueprint.style_profile = self._build_style_profile(sections)
+
+        return blueprint
+
+    def _detect_sections_simple(self, density_series: list[float], key: str) -> list[SeedSection]:
+        """简化的段落检测：基于密度变化点。"""
+        if len(density_series) < 4:
+            return []
+        mean_d = sum(density_series) / len(density_series)
+        sections = []
+        current_type = 'theme1'
+        current_start = 0
+        for i in range(1, len(density_series)):
+            window_prev = density_series[max(0, i - 2):i]
+            window_curr = density_series[i:min(len(density_series), i + 2)]
+            avg_prev = sum(window_prev) / len(window_prev) if window_prev else mean_d
+            avg_curr = sum(window_curr) / len(window_curr) if window_curr else mean_d
+            if abs(avg_curr - avg_prev) > mean_d * 0.5 and i - current_start >= 4:
+                sections.append(SeedSection(type=current_type, start_bar=current_start,
+                                           n_bars=i - current_start, key=key))
+                current_start = i
+                current_type = 'development' if current_type == 'theme1' else 'theme2'
+        sections.append(SeedSection(type=current_type, start_bar=current_start,
+                                   n_bars=len(density_series) - current_start, key=key))
+        return sections
+
+    def _infer_form(self, sections: list[SeedSection]) -> str:
+        """根据段落序列推断曲式。"""
+        types = [s.type for s in sections]
+        if not types:
+            return 'through_composed'
+        if 'theme1' in types and 'development' in types and types[0] == types[-1]:
+            return 'ternary'
+        if types.count('theme1') >= 2:
+            return 'sonata'
+        return 'through_composed'
+
+    def _build_section_plan(self, sections: list[SeedSection], total_bars: int = 64) -> list[SectionPlan]:
+        """根据 seed 段落构建生成段排期。"""
+        plan = []
+        bar_offset = 0
+        for sec in sections:
+            n_bars = max(4, min(32, int(sec.n_bars * 1.5)))
+            plan.append(SectionPlan(
+                type=sec.type,
+                start_bar=bar_offset,
+                n_bars=n_bars,
+                key=sec.key,
+                min_bars=max(4, n_bars // 2),
+                max_bars=min(32, n_bars * 2),
+            ))
+            bar_offset += n_bars
+        return plan
+
+    def _build_style_profile(self, sections: list[SeedSection]) -> SectionStyleProfile:
+        """从 seed 段落构建风格目标。"""
+        styles = {}
+        for sec in sections:
+            styles[sec.type] = SectionStyleTarget(
+                temperature=(1.0, 0.7, 1.4),
+                key_bias_strength=(2.0, 0.5, 3.0),
+                complexity=(5.0, 1.0, 10.0),
+                density_target=8.0,
+                confidence='high',
+            )
+        return SectionStyleProfile(styles=styles, fallback=SectionStyleTarget())
+
 
 # ── B 阶段调整规则 ────────────────────────────────────
 
 # B1（局部流畅）：指标评分 < 阈值时触发调整
 # key = 指标名, value = {param: max_delta_per_call}
 B1_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
+    # 统计层
     'density_z': {'rest_penalty': 0.3, 'temperature': -0.05},
     'dissonance_ratio': {'temperature': -0.15},
     'velocity_consistency': {'temperature': -0.10},
@@ -216,10 +408,21 @@ B1_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
     'melodic_direction': {'temperature': -0.08},
     'interval_shift': {'temperature': -0.05},
     'empty_measure': {'rest_penalty': 2.0, 'temperature': 0.15},
+    'unison_chain': {'temperature': 0.2, 'complexity': 1.0},
+    'rest_streak': {'rest_penalty': 3.0, 'temperature': 0.15},
+    'mono_rhythm': {'complexity': 1.0},
+    'extreme_density': {'complexity': 1.0, 'temperature': -0.1},
+    # 和声层
+    'progression_validity': {'key_bias_strength': 1.0, 'temperature': -0.1},
+    'harmonic_rhythm': {'complexity': -0.5},
+    # 旋律层
+    'bar_boundary_melody': {'temperature': -0.15, 'key_bias_strength': 0.5},
+    'parallel_fifths': {'temperature': -0.15, 'key_bias_strength': 0.8},
 }
 
 # B2（全局漂移）
 B2_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
+    # 统计层
     'pitch_class_kl': {'key_bias_strength': 0.5},
     'interval_kl': {'key_bias_strength': 0.3},
     'density_z': {'rest_penalty': 0.3, 'temperature': -0.05},
@@ -229,6 +432,13 @@ B2_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
     'key_consistency': {'key_bias_strength': 0.8},
     'token_type_kl': {'temperature': -0.10, 'rest_penalty': 0.2},
     'empty_measure': {'rest_penalty': 2.5, 'temperature': 0.2, 'complexity': 1.5},
+    # 和声层
+    'progression_validity': {'key_bias_strength': 1.0, 'temperature': -0.1},
+    'harmonic_rhythm': {'complexity': -0.8, 'key_bias_strength': 0.5},
+    'chord_melody_alignment': {'key_bias_strength': 0.8, 'complexity': -0.5},
+    'cadence_quality': {'key_bias_strength': 1.5, 'temperature': -0.15},
+    # 旋律层
+    'melodic_contour': {'complexity': 1.0, 'key_bias_strength': 0.5},
 }
 
 B1_DEFAULT_THRESHOLD = 0.55
@@ -238,18 +448,31 @@ B2_DEFAULT_THRESHOLD = 0.50
 B2_TREND_WINDOW = 3
 B2_TREND_PENALTY = 0.5  # 趋势下降时额外 delta 乘数
 
+# 调整衰减半衰期（bar 数）
+ADJUSTMENT_HALF_LIFE = 4
+
+# B2 段落类型容忍度乘数
+SECTION_B2_TOLERANCE: dict[str, float] = {
+    'exposition': 1.0, 'theme1': 1.0, 'theme2': 0.9,
+    'recapitulation': 0.8, 'development': 0.4, 'bridge': 0.5,
+    'transition': 0.4, 'coda': 0.6, 'cadenza': 0.15,
+    'intro': 0.7, 'variation': 0.6, 'episode': 0.3,
+}
+
 
 class NarrowFeedbackController:
     """B 阶段：生成中实时反馈。
 
     B1：只看最近 N 节自身流畅性，不依赖 seed。
     B2：每 S 节一块 vs seed 整体，检测漂移趋势。
+    支持段落感知 + 和声/旋律指标 + 衰减 + 中段预检。
     """
 
     def __init__(
         self,
         seed_profile: SeedProfile,
         tokenizer,
+        blueprint: SeedBlueprint | None = None,
         local_bars: int = 4,
         local_weight: float = 0.5,
         global_weight: float = 0.5,
@@ -259,6 +482,7 @@ class NarrowFeedbackController:
     ):
         self.seed_profile = seed_profile
         self.tokenizer = tokenizer
+        self.blueprint = blueprint
         self.local_bars = local_bars
         self.local_weight = local_weight
         self.global_weight = global_weight
@@ -279,8 +503,18 @@ class NarrowFeedbackController:
         # B2 窗口大小 = seed 小节数
         self._b2_block_size = max(1, seed_profile.n_bars)
 
-        # 参数调整累加（用于日志或衰减）
+        # 参数调整累加（用于衰减）
         self._cumulative_adjustments: dict[str, float] = {}
+
+        # 段落感知状态
+        self._current_section_type: str | None = None
+        self._section_adjusted: set[int] = set()  # 已调整过的段落（防震荡）
+        if blueprint and blueprint.section_plan:
+            self._section_plan = blueprint.section_plan
+            self._style_profile = blueprint.style_profile
+        else:
+            self._section_plan = []
+            self._style_profile = SectionStyleProfile()
 
     def on_bar(
         self,
@@ -297,9 +531,28 @@ class NarrowFeedbackController:
         tokenizer = self.tokenizer
         bars = _tokens_by_bar(full_tokens, bar_id)
 
-        # 如果小节数不足，跳过
         if len(bars) < 2:
             return {}
+
+        # ── 段落感知：检测段落切换 ─────────────────────
+        near_boundary = None
+        if self._section_plan:
+            prev_section = self._current_section_type
+            self._current_section_type = self._get_current_section(bar_count)
+            if prev_section != self._current_section_type and self._current_section_type:
+                self._enter_section(self._current_section_type)
+            near_boundary = self._near_boundary(bar_count)
+            # 边界阈值调整
+            if near_boundary == 'entering':
+                self.b1_threshold = B1_DEFAULT_THRESHOLD * 1.2
+            elif near_boundary == 'leaving':
+                self.b1_threshold = B1_DEFAULT_THRESHOLD * 0.5
+                self.b2_threshold = B2_DEFAULT_THRESHOLD * 0.5
+            else:
+                style_target = self._style_profile.styles.get(self._current_section_type)
+                if style_target:
+                    self.b1_threshold = B1_DEFAULT_THRESHOLD * style_target.b1_threshold_mult
+                    self.b2_threshold = B2_DEFAULT_THRESHOLD * style_target.b2_threshold_mult
 
         # ── B1：局部流畅性 ──────────────────────────────
         b1_score, b1_details = self._compute_b1(bars, bar_count, tokenizer)
@@ -315,6 +568,13 @@ class NarrowFeedbackController:
             for k, v in b2_adj.items():
                 adjustments[k] = adjustments.get(k, 0.0) + v
 
+        # ── B2 段落长度调整 ─────────────────────────────
+        if self._section_plan and bar_count > 0:
+            self._adjust_section_length(bar_count)
+
+        # ── 衰减历史调整 ───────────────────────────────
+        self._apply_decay()
+
         if not adjustments:
             return {}
 
@@ -322,14 +582,28 @@ class NarrowFeedbackController:
         for k, v in adjustments.items():
             self._cumulative_adjustments[k] = self._cumulative_adjustments.get(k, 0.0) + v
 
-        # ── 日志 ────────────────────────────────────────
+        # ── 日志（info 级别，结构化输出）───────────────
         combined = b1_score * self.local_weight + b2_score * self.global_weight
-        logger.debug(
-            "B|bar=%d b1=%.3f b2=%.3f combined=%.3f adj=%s",
-            bar_count, b1_score, b2_score, combined, adjustments,
-        )
+        self._log_bar_state(bar_count, b1_score, b2_score, combined,
+                           adjustments, current_params, near_boundary)
 
         return adjustments
+
+    def _log_bar_state(self, bar_count, b1_score, b2_score, combined,
+                      adjustments, current_params, near_boundary):
+        """结构化日志输出。"""
+        total_bars = self.blueprint.section_plan[-1].start_bar + self.blueprint.section_plan[-1].n_bars if (self.blueprint and self.blueprint.section_plan) else '?'
+        logger.info(
+            "B|bar=%d/%s sec=%s near=%s | b1=%.3f b2=%.3f | "
+            "ΔT=%+.2f Δrest=%+.1f Δkey=%+.1f | "
+            "params: T=%.2f rest=%.1f key=%.1f cplx=%.1f",
+            bar_count, total_bars, self._current_section_type or '-', near_boundary or '-',
+            b1_score, b2_score,
+            adjustments.get('temperature', 0), adjustments.get('rest_penalty', 0),
+            adjustments.get('key_bias_strength', 0),
+            current_params.temperature, current_params.rest_penalty,
+            current_params.key_bias_strength, current_params.complexity,
+        )
 
     def _compute_b1(
         self,
@@ -384,11 +658,33 @@ class NarrowFeedbackController:
             ('register_span', _register_span_tokens),
             ('melodic_direction', _melodic_direction_tokens),
             ('interval_shift', _interval_shift_tokens),
+            ('unison_chain', _unison_chain_tokens),
+            ('rest_streak', _rest_streak_tokens),
+            ('mono_rhythm', _mono_rhythm_tokens),
+            ('extreme_density', _extreme_density_tokens),
         ]:
             try:
                 scores[name] = fn(flat, tokenizer)
             except Exception:
                 pass
+
+        # ── B1 和声/旋律指标 ────────────────────────────
+        try:
+            scores['progression_validity'] = progression_validity_tokens(flat, tokenizer)
+        except Exception:
+            pass
+        try:
+            scores['harmonic_rhythm'] = harmonic_rhythm_score_tokens(flat, tokenizer)
+        except Exception:
+            pass
+        try:
+            scores['bar_boundary_melody'] = _bar_boundary_melody_tokens(flat, tokenizer)
+        except Exception:
+            pass
+        try:
+            scores['parallel_fifths'] = _parallel_fifths_tokens(flat, tokenizer)
+        except Exception:
+            pass
 
         # 更新前一个窗口的统计
         self._prev_pitch_class_dist = _pitch_class_dist(flat, tokenizer,
@@ -497,6 +793,33 @@ class NarrowFeedbackController:
             except Exception:
                 pass
 
+        # ── B2 和声/旋律指标 ────────────────────────────
+        try:
+            scores['progression_validity'] = progression_validity_tokens(flat, tokenizer)
+        except Exception:
+            pass
+        try:
+            scores['harmonic_rhythm'] = harmonic_rhythm_score_tokens(flat, tokenizer)
+        except Exception:
+            pass
+        try:
+            scores['chord_melody_alignment'] = chord_melody_alignment_tokens(
+                flat, tokenizer, tonic_midi=profile.tonic_midi)
+        except Exception:
+            pass
+        try:
+            scores['cadence_quality'] = cadence_quality_tokens(flat, tokenizer)
+        except Exception:
+            pass
+        try:
+            seed_contour = None
+            if self.blueprint and self.blueprint.harmony.seed_contour:
+                seed_contour = self.blueprint.harmony.seed_contour
+            scores['melodic_contour'] = _melodic_contour_tokens(
+                flat, tokenizer, seed_contour=seed_contour)
+        except Exception:
+            pass
+
         # B2 块评分记录（用于趋势检测）
         avg = sum(scores.values()) / max(len(scores), 1)
         if bar_count - self._last_b2_bar >= block:
@@ -546,6 +869,174 @@ class NarrowFeedbackController:
                              B2_TREND_WINDOW)
 
         return adj
+
+    # ── 段落感知方法 ──────────────────────────────────
+
+    def _get_current_section(self, bar_count: int) -> str | None:
+        """返回当前 bar 所在的段落类型名。"""
+        for i, section in enumerate(self._section_plan):
+            sec_start = section.start_bar
+            sec_end = sec_start + section.n_bars
+            if i + 1 < len(self._section_plan):
+                next_start = self._section_plan[i + 1].start_bar
+                if sec_start <= bar_count < next_start:
+                    return section.type
+            else:
+                if bar_count >= sec_start:
+                    return section.type
+        # fallback：查找包含此 bar 的段落
+        for section in self._section_plan:
+            if section.start_bar <= bar_count < section.start_bar + section.n_bars:
+                return section.type
+        return None
+
+    def _get_current_section_end(self, bar_count: int) -> int | None:
+        """返回当前 bar 所在段落的结束 bar 号。"""
+        for i, section in enumerate(self._section_plan):
+            if i + 1 < len(self._section_plan):
+                sec_start = section.start_bar
+                next_start = self._section_plan[i + 1].start_bar
+                if sec_start <= bar_count < next_start:
+                    return next_start
+            else:
+                if bar_count >= section.start_bar:
+                    return section.start_bar + section.n_bars
+        return None
+
+    def _enter_section(self, section_type: str):
+        """进入新段落时，主动设置参数姿态。"""
+        target = self._style_profile.styles.get(
+            section_type, self._style_profile.fallback
+        )
+        self.b1_threshold = B1_DEFAULT_THRESHOLD * target.b1_threshold_mult
+        self.b2_threshold = B2_DEFAULT_THRESHOLD * target.b2_threshold_mult
+        logger.info("B|进入段落 %s: b1_thr=%.2f b2_thr=%.2f confidence=%s",
+                    section_type, self.b1_threshold, self.b2_threshold,
+                    target.confidence)
+
+    def _near_boundary(self, bar_count: int) -> str | None:
+        """检测当前 bar 是否接近段落边界。"""
+        for i, section in enumerate(self._section_plan):
+            sec_start = section.start_bar
+            if i + 1 < len(self._section_plan):
+                sec_end = self._section_plan[i + 1].start_bar
+            else:
+                sec_end = sec_start + section.n_bars
+            if sec_start <= bar_count < sec_end:
+                pos_in_section = bar_count - sec_start
+                section_n_bars = sec_end - sec_start
+                if pos_in_section < 2:
+                    return 'entering'
+                if pos_in_section >= section_n_bars - 2:
+                    return 'leaving'
+                return None
+        return None
+
+    def _cadence_placement_check(self, flat: list[int], bar_count: int, tokenizer) -> float:
+        """检查终止式是否出现在段落边界附近。"""
+        section_end = self._get_current_section_end(bar_count)
+        if section_end is None:
+            return 1.0
+        bars_to_end = section_end - bar_count
+        if bars_to_end > 3:
+            return 1.0
+        chords = _extract_chord_sequence(flat, tokenizer)
+        if len(chords) < 2:
+            return 0.7
+        last_two = (chords[-2], chords[-1])
+        cadence_pairs = {('V', 'I'), ('V', 'i'), ('IV', 'I'), ('iv', 'i'),
+                         ('V', 'vi'), ('vii°', 'I'), ('vii°', 'i')}
+        if last_two in cadence_pairs:
+            return 1.0
+        if bars_to_end <= 1 and last_two not in cadence_pairs:
+            return 0.3
+        return 0.6
+
+    def _adjust_section_length(self, bar_count: int):
+        """根据最近 B2 质量动态调整当前段落剩余长度。"""
+        if not self._b2_block_scores:
+            return
+        current_section = self._current_section_type
+        if current_section is None:
+            return
+        # 找到当前段落在 section_plan 中的索引
+        sec_idx = None
+        for i, sec in enumerate(self._section_plan):
+            if sec.type == current_section:
+                if sec.start_bar <= bar_count:
+                    sec_idx = i
+        if sec_idx is None or sec_idx in self._section_adjusted:
+            return
+
+        section_end = self._get_current_section_end(bar_count)
+        if section_end is None:
+            return
+        remaining = section_end - bar_count
+
+        recent_scores = self._b2_block_scores[-4:]
+        avg_score = sum(recent_scores) / len(recent_scores)
+
+        if avg_score > 0.75 and remaining <= 6:
+            extend = min(2, self._section_plan[sec_idx].max_bars - self._section_plan[sec_idx].n_bars)
+            if extend > 0:
+                self._section_plan[sec_idx].n_bars += extend
+                for later in self._section_plan[sec_idx + 1:]:
+                    later.start_bar += extend
+                self._section_adjusted.add(sec_idx)
+                logger.info("B|bar=%d: B2 高质量 (%.2f), 延长当前段 +%d bar",
+                           bar_count, avg_score, extend)
+        elif avg_score < 0.35 and remaining >= 6:
+            shorten = min(2, remaining - 4)
+            if shorten > 0:
+                self._section_plan[sec_idx].n_bars -= shorten
+                for later in self._section_plan[sec_idx + 1:]:
+                    later.start_bar -= shorten
+                self._section_adjusted.add(sec_idx)
+                logger.info("B|bar=%d: B2 低质量 (%.2f), 缩短当前段 -%d bar",
+                           bar_count, avg_score, shorten)
+
+    def _apply_decay(self):
+        """每 bar 对累积调整量做指数衰减。"""
+        decay_factor = 0.5 ** (1.0 / ADJUSTMENT_HALF_LIFE)
+        for k in list(self._cumulative_adjustments.keys()):
+            self._cumulative_adjustments[k] *= decay_factor
+            if abs(self._cumulative_adjustments[k]) < 0.01:
+                del self._cumulative_adjustments[k]
+
+    def _mid_generation_check(self, generated_tokens: list[int], tokenizer) -> dict | None:
+        """快速致命检查（仅检查明确失败的模式）。"""
+        bar_id = tokenizer.bar_token_id
+        bars = _tokens_by_bar(generated_tokens, bar_id)
+        if len(bars) < 4:
+            return None
+
+        # 检查连续 4+ 空小节
+        empty_streak = 0
+        for bar_tokens in bars[-8:]:
+            has_note = any(tokenizer.decode_token(t).startswith('<Note_ON')
+                         for t in bar_tokens)
+            if has_note:
+                empty_streak = 0
+            else:
+                empty_streak += 1
+                if empty_streak >= 4:
+                    return {'reason': '连续 4+ 空小节', 'bar': len(bars)}
+
+        # 检查连续 8+ 同音
+        intervals = _note_on_intervals(generated_tokens[-500:], tokenizer)
+        if len(intervals) >= 8:
+            same_streak = 0
+            for i in range(1, len(intervals)):
+                if intervals[i] == intervals[i - 1]:
+                    same_streak += 1
+                    if same_streak >= 8:
+                        return {'reason': '连续 8+ 同音', 'bar': len(bars)}
+                else:
+                    same_streak = 0
+
+        return None
+
+    # ── 状态查询 ────────────────────────────────────────
 
     @property
     def b2_trend(self) -> str | None:
@@ -665,6 +1156,86 @@ class PostGenerationFilter:
             logger.warning("Failed to write reward log: %s", e)
 
         return log_path
+
+    def diagnose_bars(self, report, tokenizer, seed_profile=None) -> list[BarDiagnosis]:
+        """逐小节诊断，定位具体问题。"""
+        diagnoses: list[BarDiagnosis] = []
+
+        # 扫描合法性问题
+        if hasattr(report, 'legality') and report.legality:
+            for issue in report.legality.issues:
+                bar = getattr(issue, 'measure', 0)
+                if bar > 0:
+                    diagnoses.append(BarDiagnosis(
+                        bar=bar,
+                        issues=[str(issue)],
+                        severity=0.8,
+                        suggestion='检查该小节音域/配对/空小节',
+                    ))
+
+        # 扫描理论违规
+        if report.general and isinstance(report.general, dict):
+            theory = report.general.get('theory', {})
+            violations = theory.get('violations', []) if isinstance(theory, dict) else []
+            for v in violations:
+                m = v.get('measure', 0) if isinstance(v, dict) else getattr(v, 'measure', 0)
+                if m > 0:
+                    desc = str(v.get('type', 'unknown')) if isinstance(v, dict) else str(v)
+                    diagnoses.append(BarDiagnosis(
+                        bar=m,
+                        issues=[desc],
+                        severity=0.6,
+                        suggestion='检查该小节和声/声部进行',
+                    ))
+
+        # 如果无问题，返回空
+        if not diagnoses:
+            return []
+
+        # 合并同小节的诊断
+        merged: dict[int, BarDiagnosis] = {}
+        for d in diagnoses:
+            if d.bar in merged:
+                merged[d.bar].issues.extend(d.issues)
+                merged[d.bar].severity = max(merged[d.bar].severity, d.severity)
+            else:
+                merged[d.bar] = d
+        return sorted(merged.values(), key=lambda d: d.bar)
+
+    def smart_rollback(
+        self,
+        diagnoses: list[BarDiagnosis],
+        section_plan: list[SectionPlan] | None = None,
+        min_rollback_bars: int = 4,
+    ) -> int | None:
+        """根据诊断 + 段落结构选择最优退回点。
+
+        返回退回的目标 bar 号（1-indexed），或 None（不退回）。
+        """
+        if not diagnoses:
+            return None
+
+        # 策略 1：如果问题集中在某个段落 → 退回该段开头
+        if section_plan:
+            for sec in section_plan:
+                sec_bars = [d for d in diagnoses
+                           if sec.start_bar <= d.bar < sec.start_bar + sec.n_bars]
+                if len(sec_bars) >= 2:
+                    rollback_bar = sec.start_bar + 1
+                    if rollback_bar > min_rollback_bars:
+                        return rollback_bar
+
+        # 策略 2：退回第一个 severity > 0.7 的 bar 之前
+        for d in diagnoses:
+            if d.severity > 0.7 and d.bar > min_rollback_bars:
+                return max(1, d.bar - 1)
+
+        # 策略 3：退回第一个问题的前一个 bar
+        first_bar = diagnoses[0].bar
+        if first_bar > min_rollback_bars:
+            return max(1, first_bar - 1)
+
+        return None
 
     def find_problem_bars(self, report) -> list[int]:
         """从评价报告中找出有问题的具体小节号。

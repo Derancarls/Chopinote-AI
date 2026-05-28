@@ -37,6 +37,7 @@ class ModelConfig:
     sec_bias_gamma_init: float = 0.05  # 跨类型偏置
     sec_bias_delta_init: float = 0.2   # 边界桥接偏置
     sec_loss_weight: float = 0.03
+    sec_bars_loss_weight: float = 0.0  # bars_head loss weight (0=disabled, 因 n_section_bars_classes 变动权重已损坏)
     sec_bias_param_max: float = 2.0   # sec_bias 标量参数上限，防止梯度爆炸
 
     # --- 和弦感知（chord-aware / functional harmony） ---
