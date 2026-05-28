@@ -1628,12 +1628,13 @@ def main():
         tok_path = saved_path.rsplit('.musicxml', 1)[0] + '.tokens'
         rollback_tokens = load_tokens_file(tok_path) if os.path.isfile(tok_path) else None
 
-        # 评价
+        # 评价（light 模式不传 checkpoint，避免模型推理开销）
         print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
+        _ckpt_for_eval = args.checkpoint if feedback_level in ('normal', 'strict') else None
         report = post_filter.evaluate(
             saved_path,
             seed_path=args.input,
-            checkpoint=args.checkpoint,
+            checkpoint=_ckpt_for_eval,
         )
         score = report.total_score if hasattr(report, 'total_score') else 0.0
         legality_ok = report.legality.passed if report.legality else True
@@ -1641,7 +1642,6 @@ def main():
               f'合法性: {"通过" if legality_ok else "失败"}')
 
         # C 阶段结构化诊断
-        seed_profile_for_diag = gen_params_obj
         diagnoses = post_filter.diagnose_bars(report, tokenizer)
         if diagnoses:
             print(f'      小节诊断 ({len(diagnoses)} 个问题):')

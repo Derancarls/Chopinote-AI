@@ -517,29 +517,38 @@ def cadence_quality_tokens(tokens: list[int], tokenizer) -> float:
     return cadence_score
 
 
-def harmonic_rhythm_score_tokens(tokens: list[int], tokenizer) -> float:
-    """H: 和声节奏 — 检查和弦变化频率是否合理。"""
+def harmonic_rhythm_score_tokens(tokens: list[int], tokenizer,
+                                 reference_density: float | None = None) -> float:
+    """H: 和声节奏 — 检查和弦变化频率是否合理。
+
+    B1 模式 (reference_density=None): 绝对模式，检查 8-32 token/chord 区间。
+    B2 模式 (reference_density 给定): 相对模式，窗口 vs seed 的 chord change 密度比率。
+    """
     chords = _extract_chord_sequence(tokens, tokenizer)
     if len(chords) < 2:
         return 0.5
 
-    # 统计和弦变化次数 vs 总长度
     changes = sum(1 for i in range(1, len(chords)) if chords[i] != chords[i - 1])
     total = len(tokens)
     if total == 0:
         return 0.5
 
-    # 理想: 每 8-32 token 换一次和弦 (约 2-8 拍)
-    change_rate = total / max(1, changes + 1)
-
-    if 8 <= change_rate <= 32:
-        return 1.0
-    elif change_rate < 4:  # 每 4 token 换一次 — 太密
-        return max(0.0, change_rate / 4.0)
-    elif change_rate > 64:  # >64 token 不换 — 太单调
-        return max(0.0, 1.0 - (change_rate - 64) / 64.0)
+    if reference_density is not None and reference_density > 0:
+        # B2 相对模式：窗口密度 vs seed 密度比率
+        window_density = changes / total
+        ratio = min(window_density, reference_density) / max(window_density, reference_density, 1e-8)
+        return ratio
     else:
-        return 0.7
+        # B1 绝对模式：检查合理区间
+        change_rate = total / max(1, changes + 1)
+        if 8 <= change_rate <= 32:
+            return 1.0
+        elif change_rate < 4:
+            return max(0.0, change_rate / 4.0)
+        elif change_rate > 64:
+            return max(0.0, 1.0 - (change_rate - 64) / 64.0)
+        else:
+            return 0.7
 
 
 # ── B1 新增指标（统计层） ──────────────────────────────────
@@ -625,6 +634,43 @@ def _extreme_density_tokens(tokens: list[int], tokenizer) -> float:
     return 1.0
 
 
+def _max_polyphony_per_position_tokens(tokens: list[int], tokenizer,
+                                        max_per_hand: int = 6) -> float:
+    """检测同位置单声部最大同时发音数 — 超过人手生理极限则扣分。
+
+    钢琴单手通常 ≤5 音（跨 10 度），保守上限 6。
+    """
+    current_pos = None
+    pos_counts: list[int] = []
+    current_count = 0
+
+    for t in tokens:
+        s = tokenizer.decode_token(t)
+        if s.startswith('<Position'):
+            if current_pos is not None:
+                pos_counts.append(current_count)
+            current_count = 0
+        elif s.startswith('<Note_ON'):
+            current_count += 1
+        elif s.startswith('<Bar'):
+            if current_pos is not None:
+                pos_counts.append(current_count)
+            current_count = 0
+            current_pos = None
+
+    if current_count > 0:
+        pos_counts.append(current_count)
+
+    if not pos_counts:
+        return 1.0
+
+    max_notes = max(pos_counts)
+    if max_notes <= max_per_hand:
+        return 1.0
+    # 每超过 1 个音扣 0.15
+    return max(0.0, 1.0 - (max_notes - max_per_hand) * 0.15)
+
+
 # ── B1/B2 旋律/和声指标 ──────────────────────────────────
 
 
@@ -663,31 +709,97 @@ def _bar_boundary_melody_tokens(tokens: list[int], tokenizer,
 
 def _parallel_fifths_tokens(tokens: list[int], tokenizer,
                               tonic_midi: int = 60) -> float:
-    """轻量平行五度/八度检测（token 级）。"""
+    """平行五度/八度检测 — 跟踪相邻和弦间的声部引导。
+
+    正确算法: 对相邻两个和弦(同 Position 的一组 Note_ON), 按音高排序后
+    检查同一对声部是否以纯五度(7半音)或纯八度(0/12半音)平行移动。
+    """
     bar_id = tokenizer.bar_token_id
     bars = _tokens_by_bar(tokens, bar_id)
     if len(bars) < 2:
         return 1.0
     window_bars = bars[-min(4, len(bars)):]
-    parallel_count = 0
-    total_pairs = 0
+
+    # 收集所有和弦（按 position 分组的 Note_ON interval 列表）
+    all_chords: list[list[int]] = []
     for bar_tokens in window_bars:
-        notes = [t for t in bar_tokens
-                 if tokenizer.decode_token(t).startswith('<Note_ON')]
-        intervals = [int(tokenizer.decode_token(t).split(' ')[1].rstrip('>'))
-                     for t in notes]
-        for i in range(len(intervals)):
-            for j in range(i + 1, len(intervals)):
-                total_pairs += 1
-                diff = abs(intervals[i] - intervals[j])
-                if diff % 12 in (7, 0):
+        current_chord: list[int] = []
+        for t in bar_tokens:
+            s = tokenizer.decode_token(t)
+            if s.startswith('<Position'):
+                if current_chord:
+                    all_chords.append(current_chord)
+                    current_chord = []
+            elif s.startswith('<Note_ON'):
+                current_chord.append(int(s[len('<Note_ON') + 1:-1]))
+        if current_chord:
+            all_chords.append(current_chord)
+
+    if len(all_chords) < 2:
+        return 1.0
+
+    parallel_count = 0
+    voice_pair_checks = 0
+
+    for ci in range(len(all_chords) - 1):
+        chord_a = sorted(all_chords[ci])
+        chord_b = sorted(all_chords[ci + 1])
+        na, nb = len(chord_a), len(chord_b)
+        if na < 2 or nb < 2:
+            continue
+        n_voices = min(na, nb)
+        for i in range(n_voices):
+            for j in range(i + 1, n_voices):
+                interval_a = abs(chord_a[j] - chord_a[i])
+                interval_b = abs(chord_b[j] - chord_b[i])
+                # 只检查纯五度 (7) 和纯八度 (0, 12)
+                if interval_a % 12 not in (7, 0) or interval_a == 0:
+                    continue
+                if interval_b % 12 not in (7, 0) or interval_b == 0:
+                    continue
+                # 必须两声部都移动了（否则只是延留，不算平行）
+                if chord_a[i] == chord_b[i] and chord_a[j] == chord_b[j]:
+                    continue
+                voice_pair_checks += 1
+                # 纯五度 → 纯五度 或 纯八度 → 纯八度 = 平行
+                if (interval_a % 12 == interval_b % 12):
                     parallel_count += 1
-    if total_pairs < 3:
-        return 0.8
-    ratio = parallel_count / total_pairs
-    if ratio > 0.6:
-        return max(0.0, 1.0 - (ratio - 0.4) * 2.0)
+
+    if voice_pair_checks < 2:
+        return 0.9
+    ratio = parallel_count / voice_pair_checks
+    if ratio > 0.3:
+        return max(0.0, 1.0 - ratio * 1.5)
     return 1.0
+
+
+def _token_type_kl_tokens(tokens: list[int], tokenizer,
+                          reference: list[float] | None = None) -> float:
+    """Token 类型分布 KL 散度 — 对比生成段与 seed 的 token 类型使用模式。"""
+    _TT_PREFIXES = [
+        '<Note_ON', '<Duration', '<Position', '<Rest', '<Velocity',
+        '<Bar', '<Key', '<TimeSig', '<Tempo', '<Program',
+        '<Chord ', '<Pedal', '<Slur', '<Hairpin', '<Dynamic',
+        '<Artic', '<Ornament', '<GraceNote', '<Tuplet',
+        '<Octave', '<Arpeggio', '<Tie',
+    ]
+    counts = [0] * len(_TT_PREFIXES)
+    for t in tokens:
+        s = tokenizer.decode_token(t)
+        for i, prefix in enumerate(_TT_PREFIXES):
+            if s.startswith(prefix):
+                counts[i] += 1
+                break
+    total = sum(counts)
+    if total == 0:
+        return 0.5
+    dist = [c / total for c in counts]
+    if reference is not None:
+        ref = reference
+    else:
+        ref = [1.0 / len(_TT_PREFIXES)] * len(_TT_PREFIXES)
+    kl = kl_divergence(dist, ref)
+    return math.exp(-kl * 4)
 
 
 def _melodic_contour_tokens(tokens: list[int], tokenizer,
@@ -799,9 +911,12 @@ def _register_all() -> dict[str, MetricDef]:
         fn_tokens=_mono_rhythm_tokens, desc="连续 4 小节同时值类型")
     reg("extreme_density", "极端密度检测", "B1",
         fn_tokens=_extreme_density_tokens, desc="单小节 >40 或 <1 note")
+    reg("max_polyphony_per_position", "同位置最大复音数", "B1",
+        fn_tokens=_max_polyphony_per_position_tokens, desc="同位置单手 >6 音触发")
 
     # ── B2 全局专用 ─────────────────────────────
-    reg("token_type_kl", "Token类型分布KL", "B2,C", weight=0.05)
+    reg("token_type_kl", "Token类型分布KL", "B2,C", weight=0.05,
+        fn_tokens=_token_type_kl_tokens)
 
     # ── B1/B2 旋律/和声指标 ─────────────────────
     reg("bar_boundary_melody", "小节边界旋律衔接", "B1,B2",

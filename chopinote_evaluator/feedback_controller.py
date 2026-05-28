@@ -34,8 +34,9 @@ from chopinote_evaluator.registry import (
     _empty_measure_tokens, _pitch_range_tokens,
     _unison_chain_tokens, _rest_streak_tokens,
     _mono_rhythm_tokens, _extreme_density_tokens,
+    _max_polyphony_per_position_tokens,
     _bar_boundary_melody_tokens, _parallel_fifths_tokens,
-    _melodic_contour_tokens,
+    _melodic_contour_tokens, _token_type_kl_tokens,
     progression_validity_tokens, harmonic_rhythm_score_tokens,
     cadence_quality_tokens, chord_melody_alignment_tokens,
     _extract_chord_sequence,
@@ -89,6 +90,79 @@ class SectionStyleTarget:
     b1_threshold_mult: float = 1.0
     b2_threshold_mult: float = 1.0
     confidence: str = 'high'
+
+    @classmethod
+    def from_seed_section(cls, bar_tokens_list: list[list[int]], tokenizer,
+                          tonic_midi: int = 60) -> 'SectionStyleTarget':
+        """从 seed 中某段落类型的 token 统计出风格目标。
+
+        Args:
+            bar_tokens_list: 该段落类型的所有小节的 token 列表的列表
+            tokenizer: REMI tokenizer
+            tonic_midi: 主音 MIDI 编号
+
+        Returns:
+            SectionStyleTarget with confidence='high' (从真实数据推导)
+        """
+        if not bar_tokens_list:
+            return cls(confidence='low')
+
+        # 合并所有 token
+        all_tokens = [t for bar in bar_tokens_list for t in bar]
+        n_bars = len(bar_tokens_list)
+
+        # 密度统计
+        densities = []
+        for bar_tokens in bar_tokens_list:
+            nn = sum(1 for t in bar_tokens
+                     if tokenizer.decode_token(t).startswith('<Note_ON'))
+            densities.append(nn)
+        density_mean = sum(densities) / max(len(densities), 1)
+
+        # 休止比例
+        rest_count = sum(1 for t in all_tokens
+                        if tokenizer.decode_token(t) == '<Rest>')
+        note_count = sum(1 for t in all_tokens
+                        if tokenizer.decode_token(t).startswith('<Note_ON'))
+        rest_ratio = rest_count / max(rest_count + note_count, 1)
+
+        # 复杂度：基于短时值比例 + 密度 + 演奏法多样性
+        short_durs = sum(1 for t in all_tokens
+                        if tokenizer.decode_token(t).startswith('<Duration')
+                        and int(tokenizer.decode_token(t).split(' ')[1].rstrip('>')) <= 4)
+        total_durs = sum(1 for t in all_tokens
+                        if tokenizer.decode_token(t).startswith('<Duration'))
+        short_ratio = short_durs / max(total_durs, 1)
+        complexity_raw = density_mean * 0.5 + short_ratio * 10.0 * 0.5
+        complexity_val = max(1.0, min(10.0, complexity_raw))
+
+        # 力度均值 → temperature target（力度高 ≈ 情绪激烈 ≈ 温度偏高）
+        velocities = [int(tokenizer.decode_token(t).split(' ')[1].rstrip('>'))
+                     for t in all_tokens
+                     if tokenizer.decode_token(t).startswith('<Velocity')]
+        vel_mean = sum(velocities) / max(len(velocities), 1) if velocities else 4
+        temp_target = max(0.7, min(1.4, vel_mean / 4.0 * 1.0))
+
+        # 和声节奏：chord change 频率
+        chords = _extract_chord_sequence(all_tokens, tokenizer)
+        changes = sum(1 for i in range(1, len(chords)) if chords[i] != chords[i - 1])
+        harm_rhythm = len(all_tokens) / max(changes, 1)
+
+        # b1/b2 阈值乘数：seed 段落通常用 1.0（正常约束）
+        b1_mult = 1.0
+        b2_mult = 1.0
+
+        return cls(
+            temperature=(temp_target, max(0.5, temp_target - 0.3), min(2.0, temp_target + 0.3)),
+            key_bias_strength=(2.0, 0.5, 3.0),
+            complexity=(complexity_val, max(1.0, complexity_val - 3.0), min(10.0, complexity_val + 2.0)),
+            density_target=density_mean,
+            rest_ratio_target=(max(0.01, rest_ratio - 0.1), min(0.5, rest_ratio + 0.1)),
+            harmonic_rhythm=max(4.0, harm_rhythm),
+            b1_threshold_mult=b1_mult,
+            b2_threshold_mult=b2_mult,
+            confidence='high',
+        )
 
 
 @dataclass
@@ -307,29 +381,44 @@ class PreGenerationEvaluator:
                 final_cadence = chords[-2:]
                 break
 
+        # ── seed 旋律轮廓（用于 B2 melodic_contour 匹配） ──
+        seed_contour = []
+        for bar_tokens in real_bars:
+            notes = [int(self.tokenizer.decode_token(t).split(' ')[1].rstrip('>'))
+                     for t in bar_tokens
+                     if self.tokenizer.decode_token(t).startswith('<Note_ON')]
+            if notes:
+                seed_contour.append(float(max(notes)))
+            else:
+                seed_contour.append(0.0)
+
         harmony = HarmonyContext(
             chord_density_per_bar=chord_density_per_bar,
             final_cadence=final_cadence,
             chord_density_per_bar_mean=sum(chord_density_per_bar) / max(len(chord_density_per_bar), 1) if chord_density_per_bar else 0.05,
+            seed_contour=seed_contour,
         )
         blueprint.harmony = harmony
 
-        # ── 段落检测（简化版：基于 density_series 变点检测） ──
-        if profile.density_series and len(profile.density_series) >= 4:
-            sections = self._detect_sections_simple(profile.density_series, profile.tonic_key or 'C')
-            blueprint.sections = sections
-            if sections:
-                form = self._infer_form(sections)
-                blueprint.form_hint = form
-                # 构建 section_plan
-                blueprint.section_plan = self._build_section_plan(sections, total_bars=max(32, profile.n_bars * 2))
-                # 构建 style_profile
-                blueprint.style_profile = self._build_style_profile(sections)
+        # ── 段落检测（优先 6 信号 Viterbi，fallback 密度变化点） ──
+        key = profile.tonic_key or 'C'
+        sections = self._detect_sections_annotator(real_bars, key)
+        if not sections and profile.density_series and len(profile.density_series) >= 4:
+            sections = self._detect_sections_simple(profile.density_series, key)
+        blueprint.sections = sections
+        if sections:
+            form = self._infer_form(sections)
+            blueprint.form_hint = form
+            # 构建 section_plan
+            blueprint.section_plan = self._build_section_plan(sections, total_bars=max(32, profile.n_bars * 2))
+            # 构建 style_profile
+            blueprint.style_profile = self._build_style_profile(
+                sections, real_bars=real_bars)
 
         return blueprint
 
     def _detect_sections_simple(self, density_series: list[float], key: str) -> list[SeedSection]:
-        """简化的段落检测：基于密度变化点。"""
+        """简化的段落检测：基于密度变化点（fallback）。"""
         if len(density_series) < 4:
             return []
         mean_d = sum(density_series) / len(density_series)
@@ -350,6 +439,87 @@ class PreGenerationEvaluator:
                                    n_bars=len(density_series) - current_start, key=key))
         return sections
 
+    def _detect_sections_annotator(self, real_bars: list[list[int]],
+                                    key: str) -> list[SeedSection]:
+        """使用 structure_annotator 的 6 信号 Viterbi 方法检测段落。
+
+        调用 structure_annotator 的 token 级接口（纯规则，零模型依赖）：
+        extract_bar_features → 6 信号 → 加权融合 → Viterbi → infer_section_types。
+        """
+        try:
+            from scripts.structure_annotator import (
+                extract_bar_features, compute_key_change_signal,
+                compute_density_shift_signal, compute_repeat_signal,
+                compute_tempo_change_signal, compute_program_change_signal,
+                compute_silence_gap_signal, viterbi_segmentation,
+                infer_section_types, SIGNAL_WEIGHTS, MIN_SECTION_BARS,
+                BOUNDARY_THRESHOLD, SECTION_TOKEN_NAMES,
+            )
+        except ImportError:
+            return []
+
+        if len(real_bars) < MIN_SECTION_BARS * 2:
+            return []
+
+        # 解码所有 token → 字符串
+        all_token_strs = []
+        for bar_tokens in real_bars:
+            for t in bar_tokens:
+                all_token_strs.append(self.tokenizer.decode_token(t))
+            all_token_strs.append('<Bar>')
+
+        bars = extract_bar_features(all_token_strs)
+        if len(bars) < MIN_SECTION_BARS * 2:
+            return []
+
+        # 计算 6 信号
+        n = len(bars)
+        fused = sum(
+            fn(bars) * SIGNAL_WEIGHTS[wn]
+            for fn, wn in [
+                (compute_key_change_signal, 'key_change'),
+                (compute_density_shift_signal, 'density_shift'),
+                (compute_repeat_signal, 'repeat'),
+                (compute_tempo_change_signal, 'tempo_change'),
+                (compute_program_change_signal, 'program_change'),
+                (compute_silence_gap_signal, 'silence_gap'),
+            ]
+        )
+        fused = fused.astype(float)
+        total_w = sum(SIGNAL_WEIGHTS.values())
+        if total_w > 0:
+            fused = fused / total_w
+
+        boundaries = viterbi_segmentation(fused.astype(float), MIN_SECTION_BARS)
+
+        # 过滤低置信度边界
+        for i in range(n):
+            if boundaries[i] and fused[i] < BOUNDARY_THRESHOLD:
+                boundaries[i] = 0
+
+        if boundaries.sum() == 0:
+            return []
+
+        section_type_ids = infer_section_types(bars, boundaries)
+        if not section_type_ids:
+            return []
+
+        # 边界索引 → SeedSection 列表
+        boundary_list = [0] + [i for i in range(1, n) if boundaries[i]] + [n - 1]
+        boundary_list = sorted(set(boundary_list))
+        sections = []
+        for s in range(len(boundary_list) - 1):
+            start = boundary_list[s]
+            end = boundary_list[s + 1]
+            n_bars = max(1, end - start)
+            type_id = section_type_ids[s] if s < len(section_type_ids) else 14
+            type_name = SECTION_TOKEN_NAMES.get(type_id, 'theme1')
+            sections.append(SeedSection(
+                type=type_name, start_bar=start,
+                n_bars=n_bars, key=key,
+            ))
+        return sections
+
     def _infer_form(self, sections: list[SeedSection]) -> str:
         """根据段落序列推断曲式。"""
         types = [s.type for s in sections]
@@ -362,11 +532,20 @@ class PreGenerationEvaluator:
         return 'through_composed'
 
     def _build_section_plan(self, sections: list[SeedSection], total_bars: int = 64) -> list[SectionPlan]:
-        """根据 seed 段落构建生成段排期。"""
+        """根据 seed 段落构建生成段排期，按比例适配 total_bars。"""
+        # 先算各段的原始期望长度
+        raw_lengths = [max(4, min(32, int(sec.n_bars * 1.5))) for sec in sections]
+        raw_total = sum(raw_lengths)
+        # 按比例缩放到 total_bars
+        if raw_total > 0:
+            scale = total_bars / raw_total
+        else:
+            scale = 1.0
+
         plan = []
         bar_offset = 0
-        for sec in sections:
-            n_bars = max(4, min(32, int(sec.n_bars * 1.5)))
+        for i, sec in enumerate(sections):
+            n_bars = max(4, min(32, int(raw_lengths[i] * scale)))
             plan.append(SectionPlan(
                 type=sec.type,
                 start_bar=bar_offset,
@@ -378,17 +557,24 @@ class PreGenerationEvaluator:
             bar_offset += n_bars
         return plan
 
-    def _build_style_profile(self, sections: list[SeedSection]) -> SectionStyleProfile:
-        """从 seed 段落构建风格目标。"""
+    def _build_style_profile(self, sections: list[SeedSection],
+                            real_bars: list[list[int]] | None = None) -> SectionStyleProfile:
+        """从 seed 段落构建风格目标，优先从实际 token 统计推导。"""
         styles = {}
         for sec in sections:
-            styles[sec.type] = SectionStyleTarget(
-                temperature=(1.0, 0.7, 1.4),
-                key_bias_strength=(2.0, 0.5, 3.0),
-                complexity=(5.0, 1.0, 10.0),
-                density_target=8.0,
-                confidence='high',
-            )
+            # 收集该段落对应的 bar tokens
+            sec_bars = []
+            if real_bars and sec.start_bar < len(real_bars):
+                end = min(sec.start_bar + sec.n_bars, len(real_bars))
+                sec_bars = real_bars[sec.start_bar:end]
+
+            if sec_bars:
+                styles[sec.type] = SectionStyleTarget.from_seed_section(
+                    sec_bars, self.tokenizer,
+                    tonic_midi=60,
+                )
+            else:
+                styles[sec.type] = SectionStyleTarget(confidence='low')
         return SectionStyleProfile(styles=styles, fallback=SectionStyleTarget())
 
 
@@ -412,6 +598,7 @@ B1_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
     'rest_streak': {'rest_penalty': 3.0, 'temperature': 0.15},
     'mono_rhythm': {'complexity': 1.0},
     'extreme_density': {'complexity': 1.0, 'temperature': -0.1},
+    'max_polyphony_per_position': {'complexity': -1.0, 'rest_penalty': 3.0},
     # 和声层
     'progression_validity': {'key_bias_strength': 1.0, 'temperature': -0.1},
     'harmonic_rhythm': {'complexity': -0.5},
@@ -437,6 +624,7 @@ B2_ADJUSTMENT_RULES: dict[str, dict[str, float]] = {
     'harmonic_rhythm': {'complexity': -0.8, 'key_bias_strength': 0.5},
     'chord_melody_alignment': {'key_bias_strength': 0.8, 'complexity': -0.5},
     'cadence_quality': {'key_bias_strength': 1.5, 'temperature': -0.15},
+    'cadence_placement': {'key_bias_strength': 1.2, 'temperature': -0.1},
     # 旋律层
     'melodic_contour': {'complexity': 1.0, 'key_bias_strength': 0.5},
 }
@@ -662,6 +850,7 @@ class NarrowFeedbackController:
             ('rest_streak', _rest_streak_tokens),
             ('mono_rhythm', _mono_rhythm_tokens),
             ('extreme_density', _extreme_density_tokens),
+            ('max_polyphony_per_position', _max_polyphony_per_position_tokens),
         ]:
             try:
                 scores[name] = fn(flat, tokenizer)
@@ -787,6 +976,7 @@ class NarrowFeedbackController:
             ('pitch_range', _pitch_range_tokens),
             ('duration_entropy', _duration_entropy_tokens),
             ('interval_shift', _interval_shift_tokens),
+            ('token_type_kl', _token_type_kl_tokens),
         ]:
             try:
                 scores[name] = fn(flat, tokenizer)
@@ -799,7 +989,11 @@ class NarrowFeedbackController:
         except Exception:
             pass
         try:
-            scores['harmonic_rhythm'] = harmonic_rhythm_score_tokens(flat, tokenizer)
+            seed_harmonic_density = None
+            if self.blueprint and self.blueprint.harmony.chord_density_per_bar_mean:
+                seed_harmonic_density = self.blueprint.harmony.chord_density_per_bar_mean
+            scores['harmonic_rhythm'] = harmonic_rhythm_score_tokens(
+                flat, tokenizer, reference_density=seed_harmonic_density)
         except Exception:
             pass
         try:
@@ -809,6 +1003,11 @@ class NarrowFeedbackController:
             pass
         try:
             scores['cadence_quality'] = cadence_quality_tokens(flat, tokenizer)
+        except Exception:
+            pass
+        try:
+            scores['cadence_placement'] = self._cadence_placement_check(
+                flat, bar_count, tokenizer)
         except Exception:
             pass
         try:
@@ -848,7 +1047,11 @@ class NarrowFeedbackController:
     def _b2_adjustments(
         self, scores: dict[str, float], bar_count: int,
     ) -> dict[str, float]:
-        """B2 指标 → 参数调整（含趋势乘数）。"""
+        """B2 指标 → 参数调整（含趋势乘数 + 段落容忍度）。"""
+        # 段落特定容忍度：development/cadenza 等段落天然偏离 seed，降低调整力度
+        section_tolerance = SECTION_B2_TOLERANCE.get(
+            self._current_section_type or '', 1.0
+        )
         adj: dict[str, float] = {}
         for metric_name, score in scores.items():
             if metric_name not in B2_ADJUSTMENT_RULES:
@@ -857,7 +1060,7 @@ class NarrowFeedbackController:
                 continue
             deficit = (self.b2_threshold - score) / self.b2_threshold
             for param, max_delta in B2_ADJUSTMENT_RULES[metric_name].items():
-                adj[param] = adj.get(param, 0.0) + max_delta * deficit
+                adj[param] = adj.get(param, 0.0) + max_delta * deficit * section_tolerance
 
         # 趋势检测：最近 N 块持续下降 → 额外惩罚
         if len(self._b2_block_scores) >= B2_TREND_WINDOW:
