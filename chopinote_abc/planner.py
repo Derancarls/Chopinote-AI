@@ -1,0 +1,298 @@
+"""Stage 1/2 规则规划器 — Phase 1 纯规则驱动，零模型依赖。
+
+provide:
+  plan_structure()     → list[SectionPlan]    # Stage 1
+  plan_harmony()       → list[ChordAtBar]      # Stage 2
+  reharmonize_from_bar() → list[ChordAtBar]    # 和声回退
+  tonal_progression_template() → list[ChordAtBar]  # 模板
+"""
+
+from __future__ import annotations
+
+from .database import SectionPlan, ChordAtBar, A1DB
+
+
+# ═══════════════════════════════════════════════════════════════
+#  曲式模板 — 段落分配比例
+# ═══════════════════════════════════════════════════════════════
+
+FORM_TEMPLATES: dict[str, list[tuple[str, float, list[str], float | None]]] = {
+    # (section_type, bar_ratio, [sub_types], innovation_budget)
+    'sonata': [
+        ('exposition',      0.35, ['theme1', 'theme2'], 0.10),
+        ('development',     0.35, [], 0.35),
+        ('recapitulation',  0.30, ['theme1'], 0.08),
+    ],
+    'binary': [
+        ('section_a', 0.50, [], 0.10),
+        ('section_b', 0.50, [], 0.15),
+    ],
+    'theme_variations': [
+        ('theme1',    0.20, [], 0.05),
+        ('variation', 0.20, [], 0.25),
+        ('variation', 0.20, [], 0.25),
+        ('variation', 0.20, [], 0.25),
+        ('coda',      0.20, [], 0.05),
+    ],
+    'free': [
+        ('theme1',      0.25, [], 0.08),
+        ('development', 0.50, [], 0.30),
+        ('coda',        0.25, [], 0.05),
+    ],
+}
+
+
+def plan_structure(seed_tokens: list[int], tokenizer,
+                   target_bars: int = 64,
+                   form: str = 'free',
+                   seed_bar_count: int | None = None) -> list[SectionPlan]:
+    """Stage 1 规则规划器 — 分配段落。
+
+    Args:
+        seed_tokens: 用户输入的 seed
+        tokenizer: REMI tokenizer
+        target_bars: 目标总小节数（含 seed）
+        form: 曲式名，对应 FORM_TEMPLATES 的 key
+        seed_bar_count: seed 已有小节数，None=自动统计
+
+    Returns:
+        SectionPlan 列表
+    """
+    # 1. 统计 seed 小节数
+    if seed_bar_count is None:
+        bar_id = tokenizer.bar_token_id
+        seed_bar_count = sum(1 for t in seed_tokens if t == bar_id)
+
+    # 2. 检测 seed 的调性（取最后一个 Key token）
+    seed_key = 'C'
+    for tid in reversed(seed_tokens):
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith('<Key ') and ts.endswith('>'):
+            seed_key = ts[5:-1]
+            break
+
+    # 3. 计算需要生成的小节数
+    remaining_bars = max(1, target_bars - seed_bar_count)
+
+    # 4. 取模板
+    template = FORM_TEMPLATES.get(form, FORM_TEMPLATES['free'])
+
+    # 5. 按比例分配
+    sections = []
+    total_ratio = sum(r for _, r, _, _ in template)
+    bar_allocated = 0
+
+    for i, (sec_type, ratio, sub_types, innov_budget) in enumerate(template):
+        if i == len(template) - 1:
+            # 最后一段拿剩余 bar
+            n_bars = remaining_bars - bar_allocated
+        else:
+            n_bars = max(1, int(remaining_bars * ratio / total_ratio))
+        bar_allocated += n_bars
+
+        # 调性：第一段跟随 seed，之后按规则转调
+        if i == 0:
+            key = seed_key
+        elif sec_type in ('development', 'variation', 'bridge', 'episode'):
+            key = _relative_key(seed_key)  # 转关系调
+        else:
+            key = seed_key  # 再现/尾声回主调
+
+        # 终止式
+        if sec_type in ('coda',) or (sec_type == 'recapitulation' and i == len(template) - 1):
+            cadence = 'PAC'
+        elif sec_type in ('development', 'bridge', 'transition'):
+            cadence = 'HC'
+        else:
+            cadence = 'IAC'
+
+        # 发展配方
+        dev_ops = None
+        if sec_type == 'development':
+            dev_ops = ['invert']  # Phase 1 默认倒影
+        elif sec_type == 'variation':
+            dev_ops = ['fragment']
+
+        sections.append(SectionPlan(
+            type=sec_type,
+            bars=max(1, n_bars),
+            key=key,
+            cadence=cadence,
+            innovation_budget=innov_budget or 0.1,
+            development_ops=dev_ops,
+        ))
+
+    return sections
+
+
+def _relative_key(key_str: str) -> str:
+    """返回关系调（大调→属调，小调→关系大调）。"""
+    major_keys = ['C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#',
+                  'F', 'Bb', 'Eb', 'Ab', 'Db', 'Gb', 'Cb']
+    minor_keys = ['Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'D#m', 'A#m',
+                  'Dm', 'Gm', 'Cm', 'Fm', 'Bbm', 'Ebm', 'Abm']
+
+    if key_str in major_keys:
+        idx = major_keys.index(key_str)
+        return major_keys[(idx + 1) % len(major_keys)]  # 属方向
+    elif key_str in minor_keys:
+        # 小调 → 关系大调
+        idx = minor_keys.index(key_str)
+        return major_keys[idx % len(major_keys)] if idx < len(major_keys) else 'C'
+    return 'C'
+
+
+# ═══════════════════════════════════════════════════════════════
+#  和声规划
+# ═══════════════════════════════════════════════════════════════
+
+# 功能和声模板：段落类型 → 默认进行序列
+_HARMONY_TEMPLATES: dict[str, list[str]] = {
+    'theme1':       ['I', 'IV', 'V', 'I', 'vi', 'ii', 'V', 'I'],
+    'theme2':       ['I', 'ii', 'V', 'I', 'IV', 'V', 'I'],
+    'exposition':   ['I', 'IV', 'V', 'I', 'vi', 'IV', 'V', 'I'],
+    'development':  ['vi', 'ii', 'V', 'iii', 'IV', 'ii', 'V', 'I'],
+    'recapitulation': ['I', 'IV', 'V', 'I', 'IV', 'V', 'I'],
+    'coda':         ['I', 'IV', 'I', 'V', 'I'],
+    'bridge':       ['V', 'V/V', 'V', 'I'],
+    'transition':   ['V', 'ii', 'V', 'I'],
+    'variation':    ['I', 'IV', 'V', 'I', 'vi', 'V', 'I'],
+    'cadenza':      ['V', 'I', 'IV', 'V', 'I'],
+    'intro':        ['I', 'IV', 'I'],
+    'episode':      ['vi', 'V/vi', 'vi', 'IV', 'V', 'I'],
+    'section_a':    ['I', 'IV', 'V', 'I'],
+    'section_b':    ['V', 'I', 'IV', 'V', 'I'],
+}
+
+# 终止式 → 最后两和弦
+_CADENCE_CHORDS: dict[str, list[str]] = {
+    'PAC':  ['V', 'I'],
+    'IAC':  ['V', 'I'],       # 同样的和弦，但 I 可能不是根音位置
+    'HC':   ['ii', 'V'],
+    'DC':   ['V', 'vi'],
+}
+
+
+def tonal_progression_template(
+    section_type: str, n_bars: int, cadence: str = 'IAC',
+) -> list[ChordAtBar]:
+    """给定段落类型 + 小节数 + 终止式 → 和声进行序列。
+
+    原理：取模板进行，循环填充到 n_bars，最后 2 bar 替换为终止式和弦。
+    """
+    base = _HARMONY_TEMPLATES.get(section_type,
+                                   _HARMONY_TEMPLATES['theme1'])
+    cadence_pair = _CADENCE_CHORDS.get(cadence, ['V', 'I'])
+
+    chords: list[ChordAtBar] = []
+    base_idx = 0
+
+    for bar in range(n_bars):
+        if bar >= n_bars - 2 and len(cadence_pair) > 0:
+            # 终止式
+            func = cadence_pair[bar - (n_bars - len(cadence_pair))]
+            # 终止式用 root 位
+            chords.append(ChordAtBar(bar=bar, func=func, inv='root'))
+        else:
+            func = base[base_idx % len(base)]
+            # 非终止式偶尔用转位
+            inv = '1st' if (bar % 4 == 2) else 'root'
+            chords.append(ChordAtBar(bar=bar, func=func, inv=inv))
+            base_idx += 1
+
+    return chords
+
+
+def plan_harmony(A1: A1DB, seed_tokens: list[int],
+                 tokenizer) -> list[ChordAtBar]:
+    """Stage 2 规则和声规划器。
+
+    1. 从 seed 末尾提取当前调性
+    2. 按段落类型套用模板进行 + 终止式约束
+    3. 段间转调自动插 pivot chord
+    """
+    # 从 seed 推测当前和声上下文
+    seed_key = A1.seed_context.final_key if A1.seed_context else 'C'
+    current_key = seed_key
+
+    harmony: list[ChordAtBar] = []
+    global_bar = 0
+
+    for section in A1.sections:
+        # 转调：在段首插入 pivot chord
+        if section.key != current_key:
+            pivot = _pivot_chord(current_key, section.key)
+            if pivot:
+                harmony.append(ChordAtBar(bar=global_bar, func=pivot,
+                                          inv='root'))
+            current_key = section.key
+
+        # 模板进行
+        sec_chords = tonal_progression_template(
+            section.type, section.bars, section.cadence)
+
+        for c in sec_chords:
+            c.bar = global_bar
+            global_bar += 1
+            harmony.append(c)
+
+    return harmony
+
+
+def _pivot_chord(from_key: str, to_key: str) -> str | None:
+    """找两调之间的 pivot chord（两调的 I/IV/V 中的交集）。"""
+    # 简化版：大调属性方向 pivot = V7 of new key
+    # 实际上真正的 pivot chord 需要更复杂的分析，这里用属准备
+    if from_key != to_key:
+        return 'V'
+    return None
+
+
+def reharmonize_from_bar(A1: A1DB, from_bar: int) -> list[ChordAtBar]:
+    """B 触发和声回退时调用。仅重规划 from_bar 及之后的段落。
+
+    Phase 1 实现（纯规则）:
+    1. 找到 from_bar 所属段落和后续段落
+    2. 从当前调性出发，套用和声模板重新生成
+    3. 保留 from_bar 前的和声不变
+    4. 后续段如果调性不同，自动插 pivot chord
+    """
+    section = A1.get_section(from_bar)
+    if not section:
+        return []
+
+    section_idx = -1
+    for i, sec in enumerate(A1.sections):
+        if sec is section:
+            section_idx = i
+            break
+    if section_idx < 0:
+        return []
+
+    remaining_bars = section.bars - (from_bar - section.start_bar)
+    new_chords = tonal_progression_template(
+        section.type, remaining_bars, section.cadence)
+
+    # 调整 bar offset
+    for c in new_chords:
+        c.bar = from_bar + c.bar
+
+    # 后续段重新规划
+    bar_offset = from_bar + remaining_bars
+    current_key = section.key
+    for sec in A1.sections[section_idx + 1:]:
+        if sec.key != current_key:
+            pivot = _pivot_chord(current_key, sec.key)
+            if pivot:
+                new_chords.append(ChordAtBar(bar=bar_offset, func=pivot,
+                                             inv='root'))
+                bar_offset += 1
+            current_key = sec.key
+        sec_chords = tonal_progression_template(
+            sec.type, sec.bars, sec.cadence)
+        for c in sec_chords:
+            c.bar = bar_offset
+            bar_offset += 1
+            new_chords.append(c)
+
+    return new_chords

@@ -96,7 +96,7 @@ python scripts/train/run_curriculum_training.py \
 ### Hardware & Training Setup
 
 - **GPU**: RTX 5090 32GB, bf16 training
-- **Batch**: batch_size=8, grad_accum=1 (effective batch=8)
+- **Batch**: batch_size=8, grad_accum=2 (effective batch=16)
 - **Data**: `/root/autodl-tmp/data/processed/` (~1.37M token files, 13.7B tokens, 400G disk)
 - **Checkpoints**: `/root/autodl-tmp/chopinote/checkpoints/`
 - **Logs/TensorBoard**: `/root/autodl-tmp/chopinote/tensorboard/` (also symlinked at `/root/tf-logs`)

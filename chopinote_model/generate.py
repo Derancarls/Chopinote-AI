@@ -929,3 +929,234 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
     return generated[0].tolist()
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Stage 3 — 逐段迭代生成 (ABC Engine v2, Phase 1)
+# ═══════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def stage3_iterative_generate(
+    model: MusicTransformer,
+    tokenizer,
+    seed_tokens: list[int],
+    max_bars: int = 64,
+    form: str = 'free',
+    max_retries: int = 2,
+    base_temperature: float = 1.0,
+    top_k: int = 20,
+) -> tuple[list[int], dict | None]:
+    """Stage 3 逐段迭代生成 + ABC Engine 闭环。"""
+    from chopinote_abc.database import (A1DB, A2DB, A3DB, SeedContext)
+    from chopinote_abc.planner import plan_structure, plan_harmony
+
+    device = next(model.parameters()).device
+    bar_id = tokenizer.bar_token_id
+
+    a3 = A3DB()
+    a3.set_baseline(seed_tokens, tokenizer)
+
+    seed_bar_count = sum(1 for t in seed_tokens if t == bar_id)
+    a1 = A1DB(sections=plan_structure(
+        seed_tokens, tokenizer, max_bars, form, seed_bar_count))
+    a1.seed_context = SeedContext(
+        final_key=_detect_seed_key(seed_tokens, tokenizer),
+        bar_count=seed_bar_count,
+    )
+    a1.harmony = plan_harmony(a1, seed_tokens, tokenizer)
+
+    a2 = A2DB()
+    a2.from_seed(seed_tokens, a3, tokenizer)
+
+    all_tokens, report = _stage3_generate_once(
+        model, tokenizer, seed_tokens, a1, a2, a3,
+        bar_id, base_temperature, top_k,
+    )
+
+    for _ in range(max_retries):
+        if not report.get('structural_fixes'):
+            break
+        for fix in report['structural_fixes']:
+            a1.apply_fix(fix)
+        a1.reset_overrides()
+        all_tokens, report = _stage3_generate_once(
+            model, tokenizer, seed_tokens, a1, a2, a3,
+            bar_id, base_temperature, top_k,
+        )
+
+    return all_tokens, report
+
+
+@torch.no_grad()
+def _stage3_generate_once(
+    model, tokenizer, seed_tokens, a1, a2, a3,
+    bar_id, base_temperature, top_k,
+) -> tuple[list[int], dict]:
+    """单次逐段生成。"""
+    from chopinote_abc.planner import reharmonize_from_bar
+    from chopinote_abc.decision import BHardBans, apply_zone_temperature
+
+    device = next(model.parameters()).device
+    eos_id = tokenizer.eos_token_id
+    all_tokens = list(seed_tokens)
+    cumulative_bar_count = a1.seed_context.bar_count if a1.seed_context else 0
+
+    for section_idx, section in enumerate(a1.sections):
+        prefix_tokens = []
+        prefix_tokens.extend(a1.build_structure_tokens(tokenizer))
+        prefix_tokens.extend(a1.build_harmony_tokens(tokenizer))
+
+        if section_idx > 0:
+            for label in a2.records:
+                if label.startswith('theme1_') or label.startswith('seed_'):
+                    prefix_tokens.extend(a2.get_purified_tokens(label))
+            prefix_tokens.extend(
+                _prev_section_tail(all_tokens, tokenizer, last_n_bars=1))
+
+        kv_caches = [[None, None] for _ in range(model.config.n_layers)]
+        if prefix_tokens:
+            prefix_tensor = torch.tensor(
+                [prefix_tokens], dtype=torch.long, device=device)
+            model.forward(prefix_tensor, kv_caches=kv_caches)
+
+        section_tokens = []
+        b1_low_streak = 0
+
+        for bar_idx in range(section.bars):
+            gen_params = GenerationParams(
+                temperature=apply_zone_temperature(
+                    section, bar_idx, base_temperature),
+                top_k=top_k,
+            )
+            hard_bans = BHardBans()
+
+            bar_tokens = []
+            done = False
+
+            for _ in range(256):
+                if section_tokens:
+                    last_tok = section_tokens[-1]
+                elif prefix_tokens:
+                    last_tok = prefix_tokens[-1]
+                else:
+                    last_tok = seed_tokens[-1]
+
+                next_input = torch.tensor(
+                    [[last_tok]], dtype=torch.long, device=device)
+
+                logits = model.forward(next_input, kv_caches=kv_caches)
+                logits = logits[:, -1, :] / gen_params.temperature
+
+                if hard_bans.has_bans():
+                    for bid in hard_bans.merge_all():
+                        if 0 <= bid < logits.size(-1):
+                            logits[0, bid] = float('-inf')
+
+                if gen_params.top_k > 0:
+                    vals, _ = torch.topk(
+                        logits, min(gen_params.top_k, logits.size(-1)))
+                    logits[logits < vals[:, -1:]] = float('-inf')
+
+                probs = torch.softmax(logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+                tid = next_tok.item()
+                bar_tokens.append(tid)
+
+                if tid == bar_id:
+                    break
+                if tid == eos_id:
+                    done = True
+                    break
+
+            section_tokens.extend(bar_tokens)
+            cumulative_bar_count += 1
+
+            a3.record_bar(cumulative_bar_count, bar_tokens, tokenizer)
+
+            last = a3.get_last_bar()
+            if last.b1_score is not None and last.b1_score < 0.2:
+                b1_low_streak += 1
+            else:
+                b1_low_streak = 0
+
+            if b1_low_streak >= 3:
+                new_harmony = reharmonize_from_bar(
+                    a1, from_bar=cumulative_bar_count)
+                a1.override_harmony(cumulative_bar_count, new_harmony)
+                section_tokens = []
+                b1_low_streak = 0
+                break
+
+            if done:
+                break
+
+        a3.snapshot_section(section_idx, section_tokens, tokenizer, a1)
+
+        if section.type.startswith('theme') or section.type == 'exposition':
+            a2.from_section(section_idx, section_tokens, a3, tokenizer, a1)
+
+        all_tokens.extend(section_tokens)
+
+    report = _c_evaluate(all_tokens, a1, a2, a3, tokenizer)
+    return all_tokens, report
+
+
+def _c_evaluate(all_tokens, a1, a2, a3, tokenizer) -> dict:
+    """C 复盘 — Phase 1 规则版。"""
+    fixes = []
+
+    recap_idx = a1.find_section('recapitulation')
+    theme_idx = a1.find_section('theme1')
+    if recap_idx is not None and theme_idx is not None:
+        sim = a3.compare_sections(theme_idx, recap_idx)
+        if sim.get('pitch_class_dist', 1.0) < 0.7:
+            fixes.append({'type': 'tighten_recap', 'section': recap_idx})
+
+    for i, sec in enumerate(a1.sections):
+        section_bars = [b for b in a3.bar_log
+                        if sec.start_bar <= b.bar < sec.start_bar + sec.bars]
+        if len(section_bars) < sec.bars * 0.6:
+            fixes.append({
+                'type': 'extend_section', 'section': i,
+                'target_bars': int(sec.bars * 0.8),
+            })
+
+    for i, sec in enumerate(a1.sections):
+        end_bar = sec.start_bar + sec.bars - 1
+        if end_bar not in a1.cadence_markers:
+            fixes.append({
+                'type': 'add_cadence', 'bar': end_bar,
+                'cadence': sec.cadence,
+            })
+
+    archive_cmds = []
+    for i, sec in enumerate(a1.sections):
+        if sec.type == 'development':
+            bars = [b for b in a3.bar_log
+                    if sec.start_bar <= b.bar < sec.start_bar + sec.bars]
+            if bars and any(b.density > 3 for b in bars):
+                archive_cmds.append(
+                    {'section_idx': i, 'label': 'development_motif'})
+
+    return {
+        'structural_fixes': fixes,
+        'archive_commands': archive_cmds,
+        'total_bars_generated': len(a3.bar_log),
+    }
+
+
+def _detect_seed_key(tokens, tokenizer) -> str:
+    for tid in reversed(tokens):
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith('<Key ') and ts.endswith('>'):
+            return ts[5:-1]
+    return 'C'
+
+
+def _prev_section_tail(all_tokens, tokenizer, last_n_bars=1) -> list[int]:
+    bar_id = tokenizer.bar_token_id
+    bar_positions = [i for i, t in enumerate(all_tokens) if t == bar_id]
+    if len(bar_positions) <= last_n_bars:
+        return all_tokens[-64:]
+    start = bar_positions[-(last_n_bars + 1)]
+    return all_tokens[start:]
+
+
