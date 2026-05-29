@@ -54,7 +54,7 @@ class GenerationParams:
     def apply_adjustments(self, adjustments: dict[str, float]) -> GenerationParams:
         """应用参数调整，按边界裁剪。"""
         CLAMPS = {
-            'temperature': (0.3, 2.5),
+            'temperature': (0.55, 2.5),
             'rest_penalty': (0.0, 10.0),
             'key_bias_strength': (0.0, 5.0),
             'complexity': (1.0, 10.0),

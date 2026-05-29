@@ -307,6 +307,7 @@ def generate_with_progress(
     prog_switch_interval: int = 12,
     feedback_callback=None,
     gen_params: Optional[GenerationParams] = None,
+    harmony_guide: Optional[list[int]] = None,
     rollback_from_token: Optional[int] = None,
 ) -> tuple[torch.Tensor, dict]:
     """自回归生成，带 tqdm 进度条。
@@ -457,6 +458,8 @@ def generate_with_progress(
         cached_measure_ids = cached_measure_ids[-max_len:]
         seed_measure_count = cached_measure_ids[-1].item()
 
+    from chopinote_cli.remi_grammar import patch_token_sequence
+
     pbar = tqdm(total=max_bars, desc='生成中', unit='bar', ncols=80)
 
     for step in range(max_new_tokens):
@@ -603,6 +606,19 @@ def generate_with_progress(
             bar_count += 1
             pbar.update(1)
 
+            # ── 和声引导（测试用）：每 bar 开头注入 chord token ──
+            if harmony_guide and bar_count - 1 < len(harmony_guide):
+                chord_id = harmony_guide[bar_count - 1]
+                if chord_id < logits.size(-1):
+                    chord_t = torch.tensor([[chord_id]], dtype=torch.long, device=device)
+                    generated = torch.cat([generated, chord_t], dim=1)
+                    new_measure2 = seed_measure_count + bar_count
+                    cached_measure_ids = torch.cat(
+                        [cached_measure_ids,
+                         torch.tensor([new_measure2], device=device)]
+                    )
+            # ────────────────────────────────────────────────
+
             # ── B 阶段反馈（每小节结束后调整参数） ──────
             if feedback_callback is not None and gen_params is not None:
                 full_list = generated[0].tolist()
@@ -629,15 +645,24 @@ def generate_with_progress(
 
     pbar.close()
     elapsed = time.time() - start_time
+
+    # ── 生成后语法补全 ────────────────────────────────
+    raw_tokens = generated[0].tolist()
+    patched_tokens = patch_token_sequence(raw_tokens, tokenizer)
+    if len(patched_tokens) != len(raw_tokens):
+        logger.info(f'Grammar patch: {len(raw_tokens)} → {len(patched_tokens)} tokens '
+                    f'(+{len(patched_tokens) - len(raw_tokens)})')
+
     new_tokens = step + 1
+    result = torch.tensor([patched_tokens], dtype=torch.long, device=device)
     stats = {
         'bars': bar_count,
         'new_tokens': new_tokens,
-        'total_tokens': generated.size(1),
+        'total_tokens': result.size(1),
         'time_seconds': elapsed,
         'tokens_per_sec': new_tokens / elapsed if elapsed > 0 else 0,
     }
-    return generated, stats
+    return result, stats
 
 
 # -- token → MusicXML 导出 ------------------------------------
@@ -649,7 +674,7 @@ def save_to_musicxml(
     max_bars: int = 256,
     save_tokens: bool = False,
 ):
-    """将 token 序列保存为 MusicXML 文件。"""
+    """将 token 序列保存为 MusicXML + MIDI 文件。"""
     from chopinote_dataset.renderer import REMIToMusicXML
 
     renderer = REMIToMusicXML(grid_size=tokenizer.grid_size,
@@ -664,6 +689,13 @@ def save_to_musicxml(
                 f.write(' '.join(str(t) for t in token_ids))
         except OSError as e:
             logger.warning('保存 token 文件失败: %s', e)
+
+    # 自动导出 MIDI（快速试听反馈）
+    midi_path = output_path.rsplit('.musicxml', 1)[0] + '.mid'
+    try:
+        score.write('midi', midi_path)
+    except Exception as e:
+        logger.warning('MIDI 导出失败: %s', e)
 
     # 计算小节数
     parts = list(score.parts)

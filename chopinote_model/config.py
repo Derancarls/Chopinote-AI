@@ -175,7 +175,17 @@ class TrainingConfig:
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000
-    max_eval_batches: int = 50   # 限制验证批次数，50 batch × 32 = 1600 样本，~3min
+    max_eval_batches: int = 100  # 限制验证批次数，100 batch × 8 = 800 样本，~6min
+    # ── DPO 自动微调（C 进化层） ──
+    dpo_enabled: bool = False              # 是否启用自动 DPO
+    dpo_interval_steps: int = 0            # 每多少训练步检查一次 reward_log，0=不触发
+    dpo_min_new_entries: int = 20          # 至少新增多少条 reward 记录才触发
+    dpo_epochs: int = 3                    # 每次 DPO 训练 epoch 数
+    dpo_beta: float = 0.1                  # DPO beta
+    dpo_lora_rank: int = 8                 # LoRA rank
+    dpo_min_score_gap: float = 0.15        # 偏好对最小分差
+    dpo_reward_dir: str = field(default_factory=lambda: os.environ.get(
+        'CHOPINOTE_REWARD_DIR', '/root/autodl-tmp/chopinote/rewards'))
     output_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_OUTPUT_DIR', '/root/autodl-tmp/chopinote/checkpoints'))
     log_dir: str = field(default_factory=lambda: os.environ.get(

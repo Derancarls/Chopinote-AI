@@ -604,6 +604,8 @@ class Trainer:
 
                     if save_steps and local_step % save_steps == 0:
                         self.save_checkpoint(self._last_avg_loss)
+                        # ── C 进化层：DPO 自动微调 ──
+                        self._check_dpo_trigger()
             else:  # DataLoader 自然耗尽 → 新 epoch
                 epoch += 1
                 logger.info(f'{prefix}DataLoader epoch {epoch} 完成 (step {local_step}/{total_steps}), 启动新 epoch')
@@ -721,6 +723,178 @@ class Trainer:
         labels = labels.clone()
         labels[is_masked] = -100
         return labels
+
+    # ── C 进化层：DPO 自动微调 ──────────────────────────────────
+
+    def _check_dpo_trigger(self):
+        """检查 reward_log 是否有足够新数据，触发 DPO 微调。"""
+        cfg = self.train_config
+        if not cfg.dpo_enabled:
+            return
+        if cfg.dpo_interval_steps <= 0:
+            return
+        if self.global_step % cfg.dpo_interval_steps != 0:
+            return
+
+        reward_log = Path(cfg.dpo_reward_dir) / 'reward_log.jsonl'
+        if not reward_log.is_file():
+            return
+
+        new_count = self._count_new_reward_entries(reward_log)
+        if new_count < cfg.dpo_min_new_entries:
+            logger.info(
+                f'DPO: {new_count} 条新 reward, 不足 {cfg.dpo_min_new_entries}, 跳过')
+            return
+
+        self._run_dpo_phase(reward_log)
+
+    def _count_new_reward_entries(self, reward_log: Path) -> int:
+        """统计自上次 DPO 以来新增的 reward 条目。"""
+        total = 0
+        try:
+            with open(reward_log) as f:
+                for _ in f:
+                    total += 1
+        except Exception:
+            return 0
+        last = getattr(self, '_dpo_last_processed_line', 0)
+        return max(0, total - last)
+
+    def _count_total_lines(self, path: Path) -> int:
+        try:
+            with open(path) as f:
+                return sum(1 for _ in f)
+        except Exception:
+            return 0
+
+    def _run_dpo_phase(self, reward_log: Path):
+        """执行一次 DPO 微调，完成后恢复训练。"""
+        logger.info('=' * 60)
+        logger.info(f'DPO phase 启动 (step {self.global_step})')
+
+        # 1. 保存 pre-DPO checkpoint
+        pre_dpo_path = Path(self.train_config.output_dir) / f'step_{self.global_step}_pre_dpo.pt'
+        self.save_checkpoint(self._last_avg_loss)
+        self._join_save_thread()
+        ckpt_path = Path(self.train_config.output_dir) / f'step_{self.global_step}.pt'
+        if ckpt_path.is_file() and not pre_dpo_path.is_file():
+            shutil.copy(ckpt_path, pre_dpo_path)
+            logger.info(f'Pre-DPO backup: {pre_dpo_path}')
+
+        # 2. 构建偏好对
+        from scripts.train.dpo_train import (
+            build_preference_dataset, apply_lora_to_model,
+            compute_log_probs, dpo_loss,
+            DPODataLoader, LoRALinear,
+        )
+        from chopinote_dataset.tokenizer import REMITokenizer
+
+        tokenizer = REMITokenizer(grid_size=16, velocity_levels=8)
+        pairs = build_preference_dataset(
+            str(reward_log.parent), tokenizer,
+            data_dir=self.train_config.data_dir,
+            min_score_gap=self.train_config.dpo_min_score_gap,
+            max_pairs=200,
+        )
+        if len(pairs) < 4:
+            logger.info('DPO: 偏好对不足 4 对，跳过')
+            if pre_dpo_path.is_file():
+                pre_dpo_path.unlink()
+            return
+
+        # 3. 冻结全模型，只训练 LoRA
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        # 4. 应用 LoRA
+        lora_params, lora_param_names = apply_lora_to_model(
+            self.model,
+            rank=self.train_config.dpo_lora_rank,
+            alpha=16.0,
+        )
+        logger.info(f'DPO: LoRA 可训练参数 {sum(p.numel() for p in lora_params)}')
+
+        # 5. 参考模型 = 当前快照（不可训练）
+        import copy
+        ref_model = copy.deepcopy(self.model)
+        ref_model.to(self.device)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+
+        # 6. 数据
+        dpo_loader = DPODataLoader(pairs, tokenizer, batch_size=1)
+
+        # 7. 优化
+        dpo_optimizer = torch.optim.AdamW(lora_params, lr=1e-4, weight_decay=0.01)
+        from torch.amp import autocast
+
+        n_batches = 0
+        final_loss = 0.0
+        for epoch in range(self.train_config.dpo_epochs):
+            for batch in dpo_loader:
+                pref_ids = batch['preferred'].to(self.device)
+                rej_ids = batch['rejected'].to(self.device)
+                pref_labels = batch['pref_labels'].to(self.device)
+                rej_labels = batch['rej_labels'].to(self.device)
+
+                dpo_optimizer.zero_grad()
+
+                with autocast('cuda', dtype=torch.bfloat16):
+                    policy_w = compute_log_probs(self.model, pref_ids, pref_labels)
+                    policy_l = compute_log_probs(self.model, rej_ids, rej_labels)
+                    with torch.no_grad():
+                        ref_w = compute_log_probs(ref_model, pref_ids, pref_labels)
+                        ref_l = compute_log_probs(ref_model, rej_ids, rej_labels)
+                    loss, acc = dpo_loss(
+                        policy_w, policy_l, ref_w, ref_l,
+                        beta=self.train_config.dpo_beta,
+                    )
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+                dpo_optimizer.step()
+                n_batches += 1
+                final_loss = loss.item()
+
+            logger.info(f'DPO epoch {epoch+1}/{self.train_config.dpo_epochs} '
+                        f'loss={final_loss:.4f} acc={acc:.3f}')
+
+        # 8. 合并 LoRA
+        self._merge_lora_weights()
+
+        # 9. 清理
+        del ref_model
+        torch.cuda.empty_cache()
+
+        # 10. 记录游标 + 保存 post-DPO checkpoint
+        self._dpo_last_processed_line = self._count_total_lines(reward_log)
+        self.save_checkpoint(self._last_avg_loss)
+        self._join_save_thread()
+
+        logger.info(f'DPO phase 完成 ({n_batches} batch, final loss={final_loss:.4f})')
+        logger.info('=' * 60)
+
+    def _merge_lora_weights(self):
+        """LoRA ΔW 合并回原始权重，解冻全模型。"""
+        for name, module in self.model.named_modules():
+            if not hasattr(module, 'lora_a'):
+                continue
+            delta = (module.lora_b.T @ module.lora_a) * module.scaling
+            module.original.weight.data.add_(delta.to(module.original.weight.dtype))
+            # 恢复为普通 nn.Linear
+            parent_name = '.'.join(name.split('.')[:-1])
+            parent = self.model
+            for p in name.split('.')[:-1]:
+                parent = getattr(parent, p)
+            if parent is not self.model:
+                setattr(parent, name.split('.')[-1], module.original)
+
+        for p in self.model.parameters():
+            p.requires_grad_(True)
+        logger.info('DPO: LoRA 权重已合并，全模型参数已解冻')
+
+    # ───────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader, max_batches: int = 0) -> dict:
