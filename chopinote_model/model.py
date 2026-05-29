@@ -14,6 +14,21 @@ from .fp8_linear import FP8Linear
 _NEG_INF = float('-inf')
 
 # flash/efficient attention (SDPA 4D mask 只需这两个)
+
+
+class RMSNorm(nn.Module):
+    """Per-head RMSNorm（QK-Norm 用，沿 head_dim 标准化）。"""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, n_heads, T, head_dim)
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.float() * rms * self.weight).to(x.dtype)
+
+
 _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 try:
     _SDPA_BACKENDS.insert(0, SDPBackend.CUDNN_ATTENTION)
@@ -37,10 +52,27 @@ class CausalSelfAttention(nn.Module):
         self.d_model = config.d_model
         self.max_len = config.max_seq_len
         self.use_section = config.use_section_attention
+        self.attn_logit_cap = config.attn_logit_cap
 
         self.qkv = FP8Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = FP8Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
+
+        # ── QK-Norm（稳定注意力，防止 logit 爆炸）──
+        if config.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
+        # ── Per-head Q/K 缩放（头特异性注意力温度）──
+        if config.use_head_scale:
+            self.q_head_scale = nn.Parameter(torch.ones(config.n_heads))
+            self.k_head_scale = nn.Parameter(torch.ones(config.n_heads))
+        else:
+            self.register_buffer('q_head_scale', torch.ones(config.n_heads), persistent=False)
+            self.register_buffer('k_head_scale', torch.ones(config.n_heads), persistent=False)
 
         # RoPE cache
         self.register_buffer('_rope_cos', None, persistent=False)
@@ -78,6 +110,10 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # ── QK-Norm + Per-head scale ──────────────────────
+        q = self.q_norm(q) * self.q_head_scale.to(dtype=q.dtype).view(1, -1, 1, 1)
+        k = self.k_norm(k) * self.k_head_scale.to(dtype=k.dtype).view(1, -1, 1, 1)
 
         if kv_cache is not None and kv_cache[0] is not None:
             cache_len = kv_cache[0].size(2)
@@ -153,6 +189,9 @@ class CausalSelfAttention(nn.Module):
                 # Fallback: 手动 attention（Blackwell 某些长度下 SDPA 无可用内核）
                 scale = self.head_dim ** -0.5
                 attn = (q @ k.transpose(-2, -1)) * scale
+                # ── Attention logit soft-capping（Gemma 风格）─
+                if self.attn_logit_cap > 0:
+                    attn = self.attn_logit_cap * torch.tanh(attn / self.attn_logit_cap)
                 if attn_mask is not None:
                     attn = attn + attn_mask
                 if use_causal:
@@ -299,6 +338,15 @@ class MusicTransformer(nn.Module):
             # 和弦预测头
             self.chord_head = ChordPredictionHead(config)
 
+        # ── 声部感知组件 ──────────────────────────────────────
+        if config.use_voice_count:
+            self.voice_count_embedding = nn.Embedding(config.n_voices + 1, config.d_model)
+
+        # ── 节内位置感知 ────────────────────────────────────
+        if config.use_measure_in_section:
+            self.measure_in_section_embedding = nn.Embedding(
+                config.max_measures_in_section + 1, config.d_model)
+
         self.blocks = nn.ModuleList([
             TransformerBlock(config, i) for i in range(config.n_layers)
         ])
@@ -327,6 +375,13 @@ class MusicTransformer(nn.Module):
             with torch.no_grad():
                 self.chord_embedding.weight[0].zero_()
                 self.chord_inv_embedding.weight[0].zero_()
+        # voice_count_embedding / measure_in_section_embedding 零初始化（不冲击已有训练）
+        if self.config.use_voice_count:
+            with torch.no_grad():
+                self.voice_count_embedding.weight.zero_()
+        if self.config.use_measure_in_section:
+            with torch.no_grad():
+                self.measure_in_section_embedding.weight.zero_()
 
     def _compute_sec_bias(self, section_ids: torch.Tensor,
                           section_types: torch.Tensor,
@@ -545,6 +600,14 @@ class MusicTransformer(nn.Module):
         for block in self.blocks:
             block.use_checkpointing = enabled
 
+    def set_dropout(self, p: float):
+        """动态设置所有 dropout 概率（用于阶梯衰减）。"""
+        self.dropout.p = p
+        for block in self.blocks:
+            block.attn.dropout.p = p
+            # FFN dropout 在 Sequential 末尾
+            block.ffn[-1].p = p
+
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
                 kv_caches: Optional[list] = None,
@@ -553,6 +616,8 @@ class MusicTransformer(nn.Module):
                 section_types: Optional[torch.Tensor] = None,
                 chord_func_ids: Optional[torch.Tensor] = None,
                 chord_inv_ids: Optional[torch.Tensor] = None,
+                voice_count_ids: Optional[torch.Tensor] = None,
+                measure_in_section_ids: Optional[torch.Tensor] = None,
                 return_sec_head: bool = False,
                 return_chord_head: bool = False) -> torch.Tensor:
         B, T = input_ids.shape
@@ -572,6 +637,13 @@ class MusicTransformer(nn.Module):
         if measure_ids.size(1) > T:
             measure_ids = measure_ids[:, -T:]
         x = x + self.measure_embedding(measure_ids)
+
+        # ── Measure-in-section embedding ────────────────────
+        if self.config.use_measure_in_section and measure_in_section_ids is not None:
+            if measure_in_section_ids.ndim == 1:
+                measure_in_section_ids = measure_in_section_ids.unsqueeze(0)
+            ms_clamped = measure_in_section_ids[:, -T:].clamp(0, self.config.max_measures_in_section)
+            x = x + self.measure_in_section_embedding(ms_clamped)
 
         # ── Section embedding ────────────────────────────────────
         sec_bias = None
@@ -599,6 +671,13 @@ class MusicTransformer(nn.Module):
                 sec_bias = self._compute_sec_bias(
                     section_ids_full[:, -T:], section_types_full[:, -T:],
                     measure_ids_full[:, -T:], query_slice=0)
+
+        # ── Voice count embedding ────────────────────────────────
+        if self.config.use_voice_count and voice_count_ids is not None:
+            if voice_count_ids.ndim == 1:
+                voice_count_ids = voice_count_ids.unsqueeze(0)
+            voice_ids_clamped = voice_count_ids[:, -T:].clamp(0, self.config.n_voices)
+            x = x + self.voice_count_embedding(voice_ids_clamped)
 
         # ── Chord embedding ──────────────────────────────────────
         chord_bias = None

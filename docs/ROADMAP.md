@@ -3,9 +3,9 @@
 > 已实现功能按版本号记录。Y 增量为大版本（架构/能力升级），Z 增量为小版本（优化/修复）。
 > 每个版本对应的已知问题见 `known_issues_<version>.md`。
 >
-> **当前训练状态**：Phase 1 预训练中（2026-05-27，step 12000 恢复，当前 step ~21500/140000，bs=8, grad_accum=4, effective_bs=32）
-> loss ~0.73, NaN ~3%, ~9 天预估 → Phase 2 微调 50k steps
-> 上次重启原因：n_section_bars_classes 128→2048 导致 bars_head 损坏，已回退 128
+> **当前训练状态**：Phase 1 预训练中（2026-05-28，step 20000 恢复，当前 step ~35000/140000，bs=8, grad_accum=1, effective_bs=8）
+> loss ~0.66 (step 3000 时 1.71), val_loss 0.81, NaN ~2.35%, ~5.8s/step, VRAM 22.7G/32G
+> Phase 2 微调 50k steps 待启动
 
 ---
 
@@ -95,21 +95,21 @@
 
 ---
 
-## v0.1.3 系列 — 评估与反馈
+## v0.1.3 系列 — ABC Engine 前身
 
 ### v0.1.3 — Bug 修复
 - MIDI 转换器修复、模型注意力掩码修复等 4 个 Bug
 
-### v0.1.3-eval — 音乐性评价模块
-- 两层评价：广义（音高密度/复音/音程分布/移调弹性）+ 狭义（旋律性/多声平衡/节奏密度弹性）
+### v0.1.3-eval — 乐谱打分层
+- C 阶段前身：两层评分（广义 + 狭义）
 - 集成到 `chopin` CLI
 
 ### 修复批次
 - 转调后音程主音更新、统一 `_infer_genre`、死代码清理
 
-### v0.1.3-eval2 — 生成-评价反馈闭环
-- **A/B1/B2/C 四阶段闭环**：生成 → 评价 → 退回重写 → 评价
-- evaluator 反馈控制器、多模块修复
+### v0.1.3-eval2 — ABC Engine 原型
+- **A/B1/B2/C 四阶段闭环**：生成 → 评分 → 退回重写
+- 反馈控制器、多模块修复
 
 ---
 
@@ -362,7 +362,7 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 ---
 
-### v0.2.4-train2 — Renderer 和弦修复 + 反馈空小节检测 + 训练稳定性（2026-05-27，HEAD）
+### v0.2.4-train2 — Renderer 和弦修复 + 反馈空小节检测 + 训练稳定性（2026-05-27）
 
 **Renderer 和弦累积修复**（`renderer.py`）：
 - `pending_interval` 单值 → `pending_notes: list[dict]` 列表累积
@@ -387,15 +387,58 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 ---
 
-### 当前训练（2026-05-27 运行中）
+### v0.2.4-eval — ABC Engine 默认启用 + A 阶段蓝图 + B 段落感知 + C 诊断（2026-05-28）
+
+**ABC Engine 默认启用**：
+- A(感知层) B(决策层) C(进化层) 不需要 `--feedback` 标志，默认对生成结果执行三阶段认知处理
+- B1/B2 调整规则补入 `empty_measure` 等明显生成失败指标
+
+**A 感知层 (Perceptor)**：
+- `SectionStyleTarget.from_seed_section()` 从 seed 真实 token 统计推导风格目标
+- `HarmonyContext` 新增 `seed_contour`，供 B2 melodic_contour 对比
+- 段落检测优先集成 `structure_annotator` 的 6 信号 Viterbi 方法
+- `_build_section_plan` 支持按比例缩放段落长度
+
+**B 决策层 (Reasoner)，含 B1/B2 子阶段**：
+- B1 局部流畅 + B2 全局漂移双轨道
+- B2 段落容忍度（`SECTION_B2_TOLERANCE`），development/cadenza 段降低调整力度
+- `_cadence_placement_check`：终止式位置合理性检查
+
+**C 进化层 (Reflector)**：
+- 结构化小节级诊断报告（`diagnose_bars()`）
+
+**新指标**（`registry.py`）：
+- `_max_polyphony_per_position_tokens`、`_token_type_kl_tokens`
+- `harmonic_rhythm_score_tokens` 支持 B1 绝对 / B2 相对双模式
+- `_parallel_fifths_tokens` 重建为声部引导算法
+- `_melodic_contour_tokens` 支持 seed_contour 参考对比
+
+**CLI**：eval light 模式不传 checkpoint，减少推理开销
+
+---
+
+### v0.2.4-eval2 — A 阶段段落检测增强 + B1/B2 新指标 + bars_head 移除（2026-05-28）
+
+- `bars_head` 从 `SectionPredictionHead` 中完整移除（仅保留 key_head + type_head）
+- `SectionStyleTarget.from_seed_section()` 统计密度/休止比例/复杂度/力度均值 → 温度映射
+- `_detect_sections_annotator` 集成 structure_annotator 6 信号 Viterbi
+- 平行五度检测重写为声部引导算法
+- `_token_type_kl`、`_max_polyphony_per_position` 注册为正式指标
+- B 调整乘入 `section_tolerance` 因子
+
+---
+
+### 当前训练（2026-05-28 运行中）
 
 - **模型**：1.21B, 24L/32H/2048d, RoPE, 段落感知 + 功能和声
 - **GPU**：NVIDIA RTX 5090 32GB
-- **配置**：bs=8, grad_accum=4 (effective_bs=32), bf16 AMP, gradient checkpointing, VRAM ~22.3 GiB
-- **进度**：Phase 1 预训练 step ~21500/140000（15.3%），从 step_12000.pt 恢复，当前 loss ~0.73
-- **计划**：Phase 1 共 140k steps → Phase 2 MusicXML 微调 50k steps
-- **监控**：`tmux attach -t chopinote:0` / TensorBoard port 6006
-- **生成质量**：step 12000 模型严重欠训练（loss 0.94），生成 REMI 语法有错（48% Note_ON 无 Duration），需等 loss 降至 0.3-0.5 才稳定
+- **配置**：bs=8, grad_accum=1 (effective_bs=8), bf16 AMP, gradient checkpointing, VRAM ~22.7 GiB
+- **进度**：Phase 1 预训练 step ~35100/140000（25%），从 step_20000.pt 恢复，当前 train loss ~0.66, val loss 0.81
+- **速度**：~5.8s/step（相比 v0.1.2 的 12.4s/step 提速 2.1x），训练约 24.7 小时推进 15100 步
+- **NaN 率**：~2.35%（step 12000 时 ~5%，持续改善）
+- **Token 准确率**（val）：overall 79.6%, note 71.3%, duration 79.2%, chord_func 82.1%, chord_inv 84.8%
+- **计划**：Phase 1 共 140k steps（预计剩余 ~6天）→ Phase 2 MusicXML 微调 50k steps
+- **监控**：`tmux attach -t chopinote:0` / TensorBoard
 
 ---
 
@@ -405,17 +448,39 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | 方向 | 优先级 | 说明 | 依赖 |
 |------|--------|------|------|
-| **训练完成 → 效果评估** | **P0** | Phase 1 预训练完成后全面评估（loss 曲线、per-token-type accuracy、生成样本人工听评）。决定 Phase 2 微调是否继续或调整超参 | 当前训练 |
-| **P2: 手动 attention 性能优化** | **高** | sec_bias 手动 attention 比 SDPA 慢 15-22x。等待 PyTorch 原生 custom attention bias API 或改 sdpa_kernel 后端。当前不影响训练（训练不开 sec_bias 手动路径），但生成推理速度受限于此 | torch.compile 兼容性 |
-| **MuseScore 插件版** | 高 | 完整验证通过后，抽轻量版做 MuseScore 插件。用户可在 MuseScore 内一键调用模型续写/生成，实时渲染乐谱。需考虑：模型量化/蒸馏缩小体积、插件 API 封装（QML + 本地服务进程通信）、生成进度反馈 | 训练完成 + 效果达标 |
-| ~~交互重构：CLI + 配置文件~~ | ✅ | **v0.2.4-config1 已完成**。YAML 配置文件 + Config dataclass + CLI `--config` 参数，20 项生成参数集中管理，优先级链 CLI > preset > config | 无 |
-| **A 阶段增强：seed 分段、和弦标注与段落长度规划** | 中 | 三合一：(1) seed 段落边界检测，(2) seed 和弦功能标注，(3) **`section_length_planner()` 预计算各段长度**。取消模型 bars_head，段落长度不再作为模型预测目标，改由 A 阶段根据 seed 长度 + 段落类型分布函数算出初始长度（默认 4-20 小节，seed 越短弹性越大），B 阶段可动态微调。用户可通过 `section_length_multiplier` 参数整体缩放 | 训练基本可用 |
-| **B1 段落边界感知** | 中 | 在段落分割位置强化反馈处理逻辑：边界前按前段落风格约束、边界后按后段落风格快速切换，避免段落过渡处的生成崩坏或风格混淆 | 训练基本可用 |
-| **B2 段落级灵活漂移** | 中 | 允许不同段落之间存在风格差异，但约束同一段落的风格相对稳定。B2 评分窗口按段落边界划分，对跨段落对比引入段落类型加权 | 训练基本可用 |
-| **C 阶段多轨优化** | 中 | 多轨生成场景下加入轨间指标：声部独立性、节奏互补性、音区避让、声部进行规则。退回重写时支持单轨回滚 | 训练基本可用 |
-| 相对音高编码（音程制） | 中 | 替代绝对半音程 NOTE_ON，提升移调泛化 | 训练完成（破坏性变更） |
-| 不限轨方案（Program + Voice） | 低 | 突破 4 subtrack 限制 | — |
-| 条件嵌入层（路径 B） | 低 | 外部控制参数注入 Transformer | — |
-| FC-Attention / 超长序列 | 低 | 突破 4096 max_seq_len | — |
-| 序列并行 / 多卡训练 | 低 | 支持更大模型 | — |
-| ~~GPU 自动适配~~ | ✅ | **v0.2.4-dev1 已完成**。`auto_config.py` 硬件检测 + 自动推理/训练配置 | 无 |
+| **训练完成 → 效果评估** | **P0** | Phase 1 预训练完成后全面评估（loss 曲线、per-token-type accuracy、生成样本人工听评）。决定 Phase 2 微调是否继续或调整超参 | 当前训练 (step ~35100/140000) |
+| **Phase 2 MusicXML 微调** | **P1** | Phase 1 结束后用 MusicXML 数据微调 50k steps，lr=1e-4, warmup=2000，提升乐谱语法规范性 | Phase 1 完成 |
+| **生成质量验证 + 渲染器回归** | **P1** | 用最新 checkpoint 生成样本，跑 roundtrip_test 13 维同度检测，人工听评判断可听性 | 训练 loss < 0.5 |
+| **C 进化层：DPO 接入训练循环** | **P1** | ABC Engine 的 C 进化层已有 DPO 代码但未接入训练持续使用。C 打分 → 自动构造偏好对 → 训练间隙拉起 DPO 微调。投入产出比最高 | 训练基本可用 + 生成质量可接受 |
+| **分层迭代生成（长序列）** | **P1** | 利用三阶段 pipeline，Stage 3 从一次性生成改为逐段循环。每段 input = [全曲结构规划] + [全曲和声骨架] + [段索引] + [上一段尾部]，全局结构永远在 context 中。解决 4096 只能写 ~2 段的根本限制，奏鸣曲式（呈示→发展→再现）可表达 | 生成质量可接受 |
+| **A 感知层：主题发展 (Motif Bank)** | 中 | A 感知层从 seed 提取核心动机，生成时约束模型引用/变形（倒影/增值/减值/转调） | 训练完成 |
+| **A 感知层：乐句结构 (Phrase Grammar)** | 中 | antecedent/consequent/sentence/period 模板，B 决策层在乐句边界检查终止式合理性 | 训练完成 |
+| **A 感知层：SSF 调性编码** | 中 | 12-dim PC mask 替代离散 key token，支持调式混合。Phase 1: 段落级 TonicField；Phase 2: 小节级 LocalField delta | 需新增标注 pipeline |
+| **A 感知层：终止式规划** | 中 | 生成器规划终止式类型和位置（PAC/IAC/HC/DC），非事后评价。A 在 section_plan 标注预期终止类型，Stage 2 和声骨架约束 | 训练完成 |
+| **B 决策层：音乐理论正则 / 硬约束** | 中 | loss 加 theory-based 正则项（禁止平行五度、终止式 V-I 解决）；B 不采样违反声部引导规则的 token | 训练基本可用 |
+| **B1 段落边界感知** | 中 | 在段落分割位置强化 B 决策层处理逻辑：边界前按前段风格约束、边界后快速切换，B1 局部 + B2 全局联合判断 | 训练基本可用 |
+| **B2 段落级灵活漂移** | 中 | 允许段落间风格差异，但约束段落内风格稳定。B2 评分窗口按段落边界划分 | 训练基本可用 |
+| **C 多轨复盘优化** | 中 | 多轨生成加入轨间指标：声部独立性、节奏互补性、音区避让。退回重写支持单轨回滚 | 训练基本可用 |
+| **相对音高编码（音程制）** | 中 | 替代绝对半音程 NOTE_ON，提升移调泛化 | 训练完成（破坏性变更） |
+| **B 决策层升级为蓝图驱动** | 中 | A 感知层给完整 blueprint + 风格目标，B 决策层主动设定每段理想参数区间，段落切换时主动改变参数姿态 | 训练基本可用 |
+| **P2: 手动 attention 性能优化** | 低 | sec_bias 手动 attention 比 SDPA 慢 15-22x。等待 PyTorch 原生 custom attention bias API 或改 sdpa_kernel 后端。当前不影响训练，但推理速度受限于此 | torch.compile 兼容性 |
+| **Voice-Stream Transformer** | 低 | 基于声部分流（Voice 而非 Track 划分）的多轨生成架构。每个 stream 是纯旋律线，piano reduction 后处理合并为 Track。解决巴赫赋格/爱之梦等声部跨手、单轨多声部场景 | 训练完成 + 不限轨方案 |
+| **MuseScore 插件版** | 低 | 完整验证通过后，抽轻量版做 MuseScore 插件。用户可在 MuseScore 内一键调用模型续写/生成，实时渲染乐谱 | 训练完成 + 效果达标 |
+| **不限轨方案（Program + Voice）** | 低 | 突破 4 subtrack 限制 | — |
+| **条件嵌入层（路径 B）** | 低 | key/time/tempo/style/program 嵌入注入 Transformer，支持 CFG 引导生成 | — |
+| **FC-Attention / 超长序列** | 低 | 突破 4096 max_seq_len | — |
+| **序列并行 / 多卡训练** | 低 | 支持更大模型 | — |
+
+### 已完成
+
+| 方向 | 版本 | 说明 |
+|------|------|------|
+| ✅ GPU 自动适配 | v0.2.4-dev1 | `auto_config.py` 硬件检测 + 自动推理/训练配置 |
+| ✅ CLI 配置文件系统 | v0.2.4-config1 | YAML + Config dataclass + 优先级链 |
+| ✅ Renderer 和弦累积修复 | v0.2.4-train2 | `pending_interval` → `pending_notes` |
+| ✅ 训练稳定性修复 | v0.2.4-train2 | NaN guard、bars_head 回退、DataLoader 修复 |
+| ✅ ABC Engine 默认启用 | v0.2.4-eval | A(感知层) B(决策层,B1/B2) C(进化层) 自动激活 |
+| ✅ A 感知层：段落检测 + style_target | v0.2.4-eval/eval2 | 6 信号 Viterbi、seed 真实数据推导风格目标 |
+| ✅ B 决策层：B1/B2 容忍度 + 新指标 | v0.2.4-eval/eval2 | SECTION_B2_TOLERANCE、cadence_placement 等 |
+| ✅ 平行五度检测重写 | v0.2.4-eval2 | 声部引导算法 |
+| ✅ bars_head 移除 | v0.2.4-eval2 | SectionPredictionHead 仅保留 key + type |

@@ -80,6 +80,8 @@ def main():
     # 通用
     parser.add_argument('--batch-size', type=int, default=8,
                         help='batch size per step (default: 8)')
+    parser.add_argument('--grad-accum', type=int, default=1,
+                        help='gradient accumulation steps (default: 1, effective batch=8)')
     parser.add_argument('--compile', action='store_true', default=False,
                         help='启用 torch.compile (mode=reduce-overhead)')
     parser.add_argument('--use-fp8', action='store_true', default=False,
@@ -95,6 +97,18 @@ def main():
                         help='TensorBoard 日志目录 (default: ./logs)')
     parser.add_argument('--resume', type=str, default=None,
                         help='从 checkpoint 恢复（跳过之前的 phase）')
+    parser.add_argument('--dpo-enabled', action='store_true', default=False,
+                        help='启用 DPO 自动微调（C 进化层）')
+    parser.add_argument('--dpo-interval', type=int, default=0,
+                        help='DPO 检查间隔（训练步数），0=不触发')
+    parser.add_argument('--dpo-min-entries', type=int, default=20,
+                        help='触发 DPO 所需最小新增 reward 条目数')
+    parser.add_argument('--dpo-epochs', type=int, default=3,
+                        help='每次 DPO 训练 epoch 数')
+    parser.add_argument('--dpo-beta', type=float, default=0.1,
+                        help='DPO beta 参数')
+    parser.add_argument('--dpo-lora-rank', type=int, default=8,
+                        help='DPO LoRA rank')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -133,6 +147,7 @@ def main():
 
     train_config = TrainingConfig(
         batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum,
         compile=args.compile,
         use_fp8=args.use_fp8,
         fp8_warmup_steps=args.fp8_warmup_steps,
@@ -141,7 +156,17 @@ def main():
         log_dir=args.log_dir,
         data_dir=args.data_dir,
         phases=[phase1, phase2],
+        # DPO (C 进化层)
+        dpo_enabled=args.dpo_enabled,
+        dpo_interval_steps=args.dpo_interval,
+        dpo_min_new_entries=args.dpo_min_entries,
+        dpo_epochs=args.dpo_epochs,
+        dpo_beta=args.dpo_beta,
+        dpo_lora_rank=args.dpo_lora_rank,
     )
+    if args.dpo_enabled:
+        logger.info('DPO 自动微调: 启用 (间隔=%d步, 最少=%d条目)',
+                    args.dpo_interval, args.dpo_min_entries)
 
     logger.info('=' * 60)
     logger.info('Phase 1 (预训练):')

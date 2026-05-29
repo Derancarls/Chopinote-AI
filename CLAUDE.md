@@ -60,10 +60,10 @@ python scripts/train/run_curriculum_training.py \
 ### Packages
 
 - **`chopinote_model/`** — Decoder-only Transformer:
-  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), SectionPredictionHead (bars/key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear optional
-  - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig, PhaseConfig, TokenLossMask, section/chord config fields
-  - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation
-  - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), auto-loads `.sec.json` and `.chord.json` sidecars, collate_fn (dynamic padding for all fields)
+  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, **QK-Norm** (per-head RMSNorm), **per-head Q/K scaling**, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), **voice_count_embedding** (同位置声部计数), **measure_in_section_embedding** (节内相对位置), SectionPredictionHead (bars/key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear, **attention logit soft-capping** (manual fallback)
+  - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig (FP8 enabled by default, **Z-loss**, **EMA β=0.999**, **dropout schedule** 0.15→0.10→0.08, token-level weighted CE loss), PhaseConfig, TokenLossMask
+  - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred + **Z-loss**), **EMA weight tracking** (saved in ckpt), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation, **dropout step-based scheduling**
+  - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), auto-loads `.sec.json` and `.chord.json` sidecars, **voice_count_ids** + **measure_in_section_ids** per-token, collate_fn (dynamic padding for all fields)
   - `generate.py` — Three-stage generation: Stage 1 (structure plan) → Stage 2 (harmony skeleton, Chord→Inv state machine) → Stage 3 (note filling with sec_bias+chord_bias), KV cache, section-aware context tracking
 
 - **`chopinote_dataset/`** — Data processing:
@@ -73,13 +73,13 @@ python scripts/train/run_curriculum_training.py \
   - `processor.py` — batch preprocessor base classes
   - `splitter.py` — dataset train/val/test split
 
-- **`chopinote_evaluator/`** — Music evaluation:
-  - `feedback_controller.py` — A/B1/B2/C feedback loop: PreGenerationEvaluator (seed profile), NarrowFeedbackController (per-bar B1 local + B2 global drift), PostGenerationFilter (C phase scoring + rollback retry + RL reward logging)
-  - `registry.py` — Metric registry, token-level implementations for 20+ metrics including 4 chord metrics (chord_melody_alignment, progression_validity, cadence_quality, harmonic_rhythm)
-  - `score.py` — Evaluator (MusicXML-level scoring with benchmarks)
-  - `report.py` — Evaluation report generation
-  - `general/` — General metrics (statistics, legality, theory, harmony)
-  - `specific/` — Specific metrics (coherence, consistency, model_scorer)
+- **`chopinote_abc/`** — ABC Engine (A/B/C 三位一体认知架构):
+  - `feedback_controller.py` — APerceptor (A: 感知提取蓝图), BReasoner (B: 推理控制采样), CReflector (C: 复盘打分进化)
+  - `registry.py` — 指标注册表 (B/C 共用)
+  - `score.py` — 乐谱评分入口 (C 专用)
+  - `report.py` — 诊断报告生成
+  - `general/` — 通用指标 (统计/理论/和声/合法性)
+  - `specific/` — 专用指标 (连贯性/一致性/模型评分)
 
 - **`chopinote_cli/`** — CLI entry (`chopin` command):
   - `main.py` — inference CLI with preset + feedback mode + interactive retry
@@ -96,7 +96,7 @@ python scripts/train/run_curriculum_training.py \
 ### Hardware & Training Setup
 
 - **GPU**: RTX 5090 32GB, bf16 training
-- **Batch**: batch_size=8, grad_accum=4 (effective batch=32)
+- **Batch**: batch_size=8, grad_accum=1 (effective batch=8)
 - **Data**: `/root/autodl-tmp/data/processed/` (~1.37M token files, 13.7B tokens, 400G disk)
 - **Checkpoints**: `/root/autodl-tmp/chopinote/checkpoints/`
 - **Logs/TensorBoard**: `/root/autodl-tmp/chopinote/tensorboard/` (also symlinked at `/root/tf-logs`)
@@ -122,3 +122,4 @@ python scripts/train/run_curriculum_training.py \
 - The local `CloudTrain` branch and `origin/CloudTrain` are intentionally diverged — never fetch/pull/merge from origin (write-only push only)
 - Padding across batch is always identical (same file list), so single-sample padding mask suffices
 - **`docs/` directory is NEVER to be deleted from disk** — it contains local design notes, gitignored but must stay on filesystem
+- **Git commits** — 必须用 `Derancarls <derancarls@foxmail.com>` 名义，**禁止**加 `Co-Authored-By` 行，所有代码贡献只以用户名义记录

@@ -731,6 +731,7 @@ print(f'CUDA cleared | GPU: {{torch.cuda.get_device_name(0)}} | '
         --phase2-lr {phase2_lr} \
         --phase2-warmup {phase2_warmup} \
         --batch-size {batch_size} \
+        --grad-accum {grad_accum} \
         --output-dir "$CHECKPOINT_DIR" \
         --log-dir "$TB_DIR" \
         $(if [ -n "$RESUME_ARG" ] && [ -f "${{RESUME_ARG#--resume }}" ]; then echo "$RESUME_ARG"; else _find_latest_ckpt; fi) \
@@ -850,6 +851,7 @@ class LaunchController:
             phase2_lr=self.config.phase2_lr,
             phase2_warmup=self.config.phase2_warmup,
             batch_size=self.config.batch_size,
+            grad_accum=self.config.grad_accum,
             resume_arg=resume_arg,
         )
 
