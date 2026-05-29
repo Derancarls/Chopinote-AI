@@ -63,8 +63,8 @@ class TrainingConfig:
         'CHOPINOTE_TB_DIR', '/root/autodl-tmp/chopinote/tensorboard'))
 
     # 超参数
-    batch_size: int = 12
-    grad_accum: int = 3
+    batch_size: int = 8
+    grad_accum: int = 4
     phase1_steps: int = 120000
     phase1_lr: float = 1.5e-4
     phase1_warmup: int = 4000
