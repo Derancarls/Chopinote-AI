@@ -78,10 +78,10 @@ def main():
     parser.add_argument('--phase2-warmup', type=int, default=2000,
                         help='Phase 2 warmup 步数 (default: 2000)')
     # 通用
-    parser.add_argument('--batch-size', type=int, default=8,
-                        help='batch size per step (default: 8)')
-    parser.add_argument('--grad-accum', type=int, default=8,
-                        help='gradient accumulation steps (default: 8, effective batch=64)')
+    parser.add_argument('--batch-size', type=int, default=12,
+                        help='batch size per step (default: 12)')
+    parser.add_argument('--grad-accum', type=int, default=3,
+                        help='gradient accumulation steps (default: 3, effective batch=36)')
     parser.add_argument('--compile', action='store_true', default=False,
                         help='启用 torch.compile (mode=reduce-overhead)')
     parser.add_argument('--use-fp8', action='store_true', default=False,
