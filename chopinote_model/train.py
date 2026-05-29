@@ -74,6 +74,13 @@ class Trainer:
         self._last_avg_loss = float('inf')
         self._save_thread: Optional[threading.Thread] = None
 
+        # ── EMA 权重追踪 ────────────────────────────────────
+        self._ema_beta = train_config.ema_beta
+        self._ema_model: dict | None = None
+        if self._ema_beta > 0:
+            self._ema_model = {k: v.detach().cpu().clone()
+                               for k, v in model.state_dict().items()}
+
         # TensorBoard 监控
         self.writer = SummaryWriter(log_dir=train_config.log_dir)
         logger.info(f'TensorBoard 日志目录: {train_config.log_dir}')
@@ -110,6 +117,7 @@ class Trainer:
                 'scheduler_state_dict': sched_cpu,
                 'loss': loss,
                 'config': self.model_config,
+                'ema_state_dict': self._ema_model,  # None if disabled
             }
             torch.save(step_state, step_path)
             logger.info(f'Checkpoint saved: {step_path}')
@@ -143,6 +151,7 @@ class Trainer:
                     'model_state_dict': model_cpu,
                     'loss': loss,
                     'config': self.model_config,
+                    'ema_state_dict': self._ema_model,
                 }
                 torch.save(best_state, tmp_path)
                 tmp_path.rename(best_path)
@@ -213,6 +222,13 @@ class Trainer:
         self._resume_sched_state = checkpoint.get('scheduler_state_dict')
         self.global_step = checkpoint['step']
         self.best_loss = checkpoint.get('loss', float('inf'))
+        # ── 恢复 EMA 权重 ──
+        ema = checkpoint.get('ema_state_dict')
+        if ema is not None and self._ema_model is not None:
+            for k in self._ema_model:
+                if k in ema:
+                    self._ema_model[k] = ema[k].cpu().clone()
+            logger.info(f'EMA weights restored from checkpoint')
         logger.info(f'Resumed from checkpoint: {checkpoint_path} (step {self.global_step})')
 
     def train(self, train_dataloader: DataLoader = None,
@@ -393,6 +409,10 @@ class Trainer:
                 with autocast('cuda', dtype=torch.bfloat16):
                     # ── 多任务 forward ────────────────────────────
                     model_kwargs = {}
+                    if model.config.use_voice_count and 'voice_count_ids' in batch:
+                        model_kwargs['voice_count_ids'] = batch['voice_count_ids'].to(self.device)
+                    if model.config.use_measure_in_section and 'measure_in_section_ids' in batch:
+                        model_kwargs['measure_in_section_ids'] = batch['measure_in_section_ids'].to(self.device)
                     if model.config.use_section_attention and 'section_ids' in batch:
                         model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
                         model_kwargs['section_types'] = batch['section_types'].to(self.device)
@@ -434,16 +454,11 @@ class Trainer:
                         accum = 0
                         continue
                     # CE 转为 fp32 防止 bf16 log_softmax 下溢 NaN
-                    if _LIGER_AVAILABLE:
-                        loss = _ce_loss(logits.view(-1, logits.size(-1)).float(), labels.view(-1))
-                    else:
-                        loss = nn.functional.cross_entropy(
-                            logits.view(-1, logits.size(-1)).float(),
-                            labels.view(-1),
-                            ignore_index=-100,
-                            reduction='sum',
-                        )
-                    loss = loss / max(1, (labels != -100).sum())
+                    loss = self._compute_weighted_loss(
+                        logits, labels, input_ids, prefix)
+                    # ── Z-loss（压制 logit 漂移）─────────
+                    if config.z_loss_weight > 0:
+                        loss = loss + config.z_loss_weight * logits.float().pow(2).mean()
                     sec_loss_val = 0.0
                     chord_loss_val = 0.0
 
@@ -540,6 +555,15 @@ class Trainer:
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
+
+                    # ── EMA 更新 ────────────────────────────
+                    if self._ema_model is not None:
+                        beta = self._ema_beta
+                        with torch.no_grad():
+                            for name, p in model.named_parameters():
+                                self._ema_model[name].mul_(beta).add_(
+                                    p.detach().cpu(), alpha=1 - beta)
+
                     if _fp8_enabled:
                         model.invalidate_fp8_caches()
                     local_step += 1
@@ -554,6 +578,19 @@ class Trainer:
                     self.writer.add_scalar('train/grad_norm', total_norm, self.global_step)
 
                     if local_step % config.logging_steps == 0:
+                        # ── Dropout 阶梯衰减 ──────────────────
+                        ds = config.dropout_schedule
+                        if ds:
+                            milestones = sorted(ds.keys())
+                            applicable = [m for m in milestones if self.global_step >= m]
+                            if applicable:
+                                target_p = ds[applicable[-1]]
+                                current_p = model.dropout.p
+                                if abs(current_p - target_p) > 1e-6:
+                                    model.set_dropout(target_p)
+                                    logger.info(f'{prefix}Step {self.global_step}: '
+                                                f'dropout {current_p:.3f}→{target_p:.3f}')
+
                         n_micro = config.logging_steps * config.grad_accum_steps
                         avg_loss = total_loss / n_micro
                         self._last_avg_loss = avg_loss
@@ -724,7 +761,91 @@ class Trainer:
         labels[is_masked] = -100
         return labels
 
-    # ── C 进化层：DPO 自动微调 ──────────────────────────────────
+    def _compute_weighted_loss(self, logits: torch.Tensor, labels: torch.Tensor,
+                                input_ids: torch.Tensor, prefix: str) -> torch.Tensor:
+        """带 token 类型加权 + 和弦上限过滤 + 重复惩罚的 CE loss。"""
+        cfg = self.train_config
+        B, T, V = logits.shape
+
+        # Per-token CE (sum reduction, ignore -100)
+        per_token = nn.functional.cross_entropy(
+            logits.view(-1, V).float(),
+            labels.view(-1),
+            ignore_index=-100,
+            reduction='none',
+        )
+
+        # ── Token 类型映射 ──────────────────────────────────
+        type_idx_map = self._token_id_to_type.to(labels.device)
+        label_types = type_idx_map[labels.view(-1).clamp(0, type_idx_map.size(0) - 1)]
+        valid_mask = (labels.view(-1) != -100)
+
+        # ── Chord token loss 降权 ──────────────────────────
+        chord_type_idx = self._type_names.index('chord') if 'chord' in self._type_names else -1
+        pos_type_idx = self._type_names.index('position') if 'position' in self._type_names else -1
+        note_type_idx = self._type_names.index('note') if 'note' in self._type_names else -1
+
+        weights = torch.ones(B * T, device=labels.device, dtype=torch.float)
+        if chord_type_idx >= 0 and cfg.chord_token_loss_weight != 1.0:
+            is_chord = (label_types == chord_type_idx) & valid_mask
+            weights[is_chord] = cfg.chord_token_loss_weight
+        if pos_type_idx >= 0 and cfg.position_token_loss_weight != 1.0:
+            is_pos = (label_types == pos_type_idx) & valid_mask
+            weights[is_pos] = cfg.position_token_loss_weight
+
+        # ── 重复惩罚：连续 ≥4 同类型 token → loss × penalty ─
+        if cfg.repetition_penalty > 1.0:
+            type_seq = label_types.view(B, T)
+            for b in range(B):
+                run_len = 1
+                for t in range(1, T):
+                    if valid_mask.view(B, T)[b, t] and type_seq[b, t] == type_seq[b, t - 1]:
+                        run_len += 1
+                        if run_len >= 4:
+                            weights[b * T + t] *= cfg.repetition_penalty
+                    else:
+                        run_len = 1
+
+        # ── 和弦上限过滤：同 Position > max 个 note → mask 整 bar ─
+        if note_type_idx >= 0 and cfg.max_chord_notes_per_position > 0:
+            note_ids_flat = input_ids.view(-1)
+            for b in range(B):
+                bar_start = 0
+                pos_note_counts = {}  # position -> count of consecutive note tokens
+                current_pos = -1
+                bar_boundaries = []
+                for t in range(T):
+                    tid = input_ids[b, t].item()
+                    ltype = type_seq[b, t].item()
+                    if tid == self.model_config.bar_token_id:
+                        bar_boundaries.append(t)
+                    if ltype == pos_type_idx:
+                        pos_note_counts.clear()
+                        current_pos = t
+                    elif ltype == note_type_idx and current_pos >= 0:
+                        cnt = pos_note_counts.get(current_pos, 0) + 1
+                        pos_note_counts[current_pos] = cnt
+                # Mask bars where any position has > max_chord_notes_per_position notes
+                bar_boundaries.append(T)  # end marker
+                for i in range(len(bar_boundaries) - 1):
+                    b_start = bar_boundaries[i]
+                    b_end = bar_boundaries[i + 1]
+                    too_dense = any(
+                        pos >= b_start and pos < b_end and cnt > cfg.max_chord_notes_per_position
+                        for pos, cnt in pos_note_counts.items()
+                    )
+                    if too_dense:
+                        for t in range(b_start, b_end):
+                            idx = b * T + t
+                            weights[idx] = 0.0  # mask out entire bar
+                        if i == 0 and (b_end - b_start) > 0:
+                            logger.debug(
+                                f'{prefix}B{b} bar {i}: masked '
+                                f'(>={cfg.max_chord_notes_per_position} chord notes)')
+
+        per_token = per_token * weights
+        n_valid = (valid_mask & (weights > 0)).sum()
+        return per_token.sum() / max(1, n_valid)
 
     def _check_dpo_trigger(self):
         """检查 reward_log 是否有足够新数据，触发 DPO 微调。"""
@@ -920,8 +1041,12 @@ class Trainer:
                 labels = batch['labels'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
 
-                # 传递 section / chord 数据（与训练一致）
+                # 传递 section / chord / voice / measure_in_section 数据（与训练一致）
                 model_kwargs = {}
+                if self.model_config.use_voice_count and 'voice_count_ids' in batch:
+                    model_kwargs['voice_count_ids'] = batch['voice_count_ids'].to(self.device)
+                if self.model_config.use_measure_in_section and 'measure_in_section_ids' in batch:
+                    model_kwargs['measure_in_section_ids'] = batch['measure_in_section_ids'].to(self.device)
                 if self.model_config.use_section_attention and 'section_ids' in batch:
                     model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
                     model_kwargs['section_types'] = batch['section_types'].to(self.device)

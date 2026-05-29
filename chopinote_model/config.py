@@ -52,6 +52,21 @@ class ModelConfig:
     chord_loss_weight: float = 0.05
     chord_bias_param_max: float = 2.0  # chord_bias 标量参数上限，防止梯度爆炸
 
+    # --- 声部感知（voice-aware） ---
+    use_voice_count: bool = True       # 声部计数嵌入：告诉模型当前 Position 下已生成第几个音
+    n_voices: int = 16                 # 最大同位置声部计数（0-16）
+
+    # --- QK-Norm（稳定注意力） ---
+    use_qk_norm: bool = True           # Q/K 进入 attention 前做 per-head RMSNorm
+    use_head_scale: bool = True        # 每头可学习 Q/K 缩放（替代空间偏置头特异化）
+
+    # --- 节内位置感知 ---
+    use_measure_in_section: bool = True  # 小节在段落内的相对位置嵌入
+    max_measures_in_section: int = 32    # 最大节内位置（0-32，32+ clamp）
+
+    # --- Attention 软上限 ---
+    attn_logit_cap: float = 50.0         # tanh 软上限 (Gemma 风格)，0=禁用
+
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
@@ -167,8 +182,8 @@ class TrainingConfig:
     warmup_steps: int = 4000
     total_steps: int = 100000
     compile: bool = False
-    use_fp8: bool = False
-    fp8_warmup_steps: int = 100  # BF16 warmup 步数后切换 FP8
+    use_fp8: bool = True                       # FP8 Linear 加速（BF16 warmup 后自动切换）
+    fp8_warmup_steps: int = 500                # BF16 warmup 步数后切换 FP8（恢复训练时 global_step >= warmup 立即切换）
     gradient_checkpointing: bool = True  # False = 关闭 checkpointing 提速（耗更多 VRAM）
     aux_head_lr_mult: float = 0.5        # section_head / chord_head LR 乘数
     attn_bias_lr_mult: float = 0.1       # sec_bias_* / chord_bias_* 标量参数 LR 乘数
@@ -176,6 +191,20 @@ class TrainingConfig:
     save_steps: int = 1000
     eval_steps: int = 1000
     max_eval_batches: int = 100  # 限制验证批次数，100 batch × 8 = 800 样本，~6min
+    # ── Token 级 loss 加权 ──
+    chord_token_loss_weight: float = 0.5       # chord token 预测 loss 乘数（降权抑制和弦爆炸）
+    position_token_loss_weight: float = 2.0    # Position token 预测 loss 乘数（提权强调换位）
+    repetition_penalty: float = 1.2            # 连续 ≥4 同类型 token 的 loss 乘数
+    max_chord_notes_per_position: int = 8      # 训练时同 Position 和弦音 > 此值 → mask 该 bar
+    # ── 训练稳定化 ──
+    z_loss_weight: float = 1e-4                # Z-loss 权重（压制 logit 漂移），0=禁用
+    ema_beta: float = 0.999                    # 权重 EMA 衰减率，0=禁用
+    # ── Dropout 阶梯衰减 ──
+    dropout_schedule: dict = field(default_factory=lambda: {
+        0: 0.15,      # 初始
+        47000: 0.10,  # 当前恢复点
+        80000: 0.08,  # Phase 1 中期
+    })
     # ── DPO 自动微调（C 进化层） ──
     dpo_enabled: bool = False              # 是否启用自动 DPO
     dpo_interval_steps: int = 0            # 每多少训练步检查一次 reward_log，0=不触发

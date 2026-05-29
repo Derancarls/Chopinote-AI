@@ -60,10 +60,10 @@ python scripts/train/run_curriculum_training.py \
 ### Packages
 
 - **`chopinote_model/`** — Decoder-only Transformer:
-  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), SectionPredictionHead (bars/key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear optional
-  - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig, PhaseConfig, TokenLossMask, section/chord config fields
-  - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation
-  - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), auto-loads `.sec.json` and `.chord.json` sidecars, collate_fn (dynamic padding for all fields)
+  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, **QK-Norm** (per-head RMSNorm), **per-head Q/K scaling**, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), **voice_count_embedding** (同位置声部计数), **measure_in_section_embedding** (节内相对位置), SectionPredictionHead (bars/key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear, **attention logit soft-capping** (manual fallback)
+  - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig (FP8 enabled by default, **Z-loss**, **EMA β=0.999**, **dropout schedule** 0.15→0.10→0.08, token-level weighted CE loss), PhaseConfig, TokenLossMask
+  - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred + **Z-loss**), **EMA weight tracking** (saved in ckpt), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation, **dropout step-based scheduling**
+  - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), auto-loads `.sec.json` and `.chord.json` sidecars, **voice_count_ids** + **measure_in_section_ids** per-token, collate_fn (dynamic padding for all fields)
   - `generate.py` — Three-stage generation: Stage 1 (structure plan) → Stage 2 (harmony skeleton, Chord→Inv state machine) → Stage 3 (note filling with sec_bias+chord_bias), KV cache, section-aware context tracking
 
 - **`chopinote_dataset/`** — Data processing:
@@ -96,7 +96,7 @@ python scripts/train/run_curriculum_training.py \
 ### Hardware & Training Setup
 
 - **GPU**: RTX 5090 32GB, bf16 training
-- **Batch**: batch_size=8, grad_accum=8 (effective batch=64)
+- **Batch**: batch_size=8, grad_accum=1 (effective batch=8)
 - **Data**: `/root/autodl-tmp/data/processed/` (~1.37M token files, 13.7B tokens, 400G disk)
 - **Checkpoints**: `/root/autodl-tmp/chopinote/checkpoints/`
 - **Logs/TensorBoard**: `/root/autodl-tmp/chopinote/tensorboard/` (also symlinked at `/root/tf-logs`)

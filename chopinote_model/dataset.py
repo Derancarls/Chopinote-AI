@@ -8,6 +8,62 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from .config import NO_SECTION_ID, NO_SECTION_TYPE_ID
 
+# ── 声部计数：预计算 Position / Note_ON token ID 集合 ────────────
+_VOICE_POSITION_IDS: set[int] = set()
+_VOICE_NOTEON_IDS: set[int] = set()
+_VOICE_INITIALIZED = False
+
+
+def _init_voice_ids():
+    global _VOICE_POSITION_IDS, _VOICE_NOTEON_IDS, _VOICE_INITIALIZED
+    if _VOICE_INITIALIZED:
+        return
+    from chopinote_dataset.tokenizer import REMITokenizer
+    tk = REMITokenizer(grid_size=16, velocity_levels=8)
+    for token_str, token_id in tk._token_to_id.items():
+        if token_str.startswith(REMITokenizer.POSITION):
+            _VOICE_POSITION_IDS.add(token_id)
+        elif token_str.startswith(REMITokenizer.NOTE_ON):
+            _VOICE_NOTEON_IDS.add(token_id)
+    _VOICE_INITIALIZED = True
+
+
+def _compute_voice_counts(tokens: list[int]) -> list[int]:
+    """实时计算每个 token 位置的声部计数（同 Position 下第几个 Note_ON）。"""
+    _init_voice_ids()
+    result = [0] * len(tokens)
+    counter = 0
+    for i, tid in enumerate(tokens):
+        if tid in _VOICE_POSITION_IDS:
+            counter = 0
+        elif tid in _VOICE_NOTEON_IDS:
+            result[i] = counter
+            counter += 1
+        else:
+            result[i] = counter
+    return result
+
+def _compute_measure_in_section(tokens: list[int],
+                                  section_data: Optional[dict] = None,
+                                  bar_token_id: int = 4,
+                                  max_ms: int = 32) -> list[int]:
+    """每个 token 在所在段落内的小节偏移（0=本节第一小节）。"""
+    result = [0] * len(tokens)
+    if section_data is not None and 'section_token_positions' in section_data:
+        sec_positions = set(section_data['section_token_positions'])
+    else:
+        sec_positions = set()
+
+    ms_in_section = 0
+    for i, tid in enumerate(tokens):
+        result[i] = min(ms_in_section, max_ms)
+        if i in sec_positions:
+            ms_in_section = 0
+        elif tid == bar_token_id:
+            ms_in_section += 1
+    return result
+
+
 # ── Key token → key_id 映射（从 token 序列追踪调性，避免用 sec.json 的聚合值）──
 _KEY_TOKEN_MAP: Optional[dict[int, int]] = None
 _KEY_NAME_TO_ID = {
@@ -209,13 +265,32 @@ class TokenDataset(Dataset):
 
         input_ids = seq[:-1]
         labels = seq[1:]
+        T = len(input_ids)
+
+        # ── 侧边文件预加载（声部/节内计算需要段落数据）─────
+        section_data = self._load_section_data(file_idx)
+        chord_data = self._load_chord_data(file_idx)
+
+        # ── 声部计数 ──────────────────────────────────────────
+        voice_full = _compute_voice_counts(tokens)
+        if start > 0:
+            voice_slice = voice_full[start:start + T + 1][:-1]
+        else:
+            voice_slice = voice_full[:T]
+        voice_count_ids = torch.tensor(voice_slice, dtype=torch.long)
+
+        # ── 节内位置计数 ──────────────────────────────────────
+        ms_full = _compute_measure_in_section(tokens, section_data)
+        if start > 0:
+            ms_slice = ms_full[start:start + T + 1][:-1]
+        else:
+            ms_slice = ms_full[:T]
+        measure_in_section_ids = torch.tensor(ms_slice, dtype=torch.long)
 
         # attention mask: 1 表示有效 token
         attention_mask = torch.ones_like(input_ids)
 
-        # ── 段落数据加载 ────────────────────────────────────────
-        T = len(input_ids)
-        section_data = self._load_section_data(file_idx)
+        # ── 段落数据构建 ────────────────────────────────────────
         if section_data is not None:
             sec_ids_all = section_data.get('section_ids', [])
             sec_types_all = section_data.get('section_types', [])
@@ -265,8 +340,7 @@ class TokenDataset(Dataset):
             sec_keys_target = torch.full((T,), -1, dtype=torch.long)
             sec_types_target = torch.full((T,), -1, dtype=torch.long)
 
-        # ── 和弦数据加载 ────────────────────────────────────────
-        chord_data = self._load_chord_data(file_idx)
+        # ── 和弦数据构建 ────────────────────────────────────────
         if chord_data is not None:
             chord_func_ids_all = chord_data.get('chord_func_ids', [])
             chord_inv_ids_all = chord_data.get('chord_inv_ids', [])
@@ -311,6 +385,8 @@ class TokenDataset(Dataset):
             'input_ids': input_ids,
             'labels': labels,
             'attention_mask': attention_mask,
+            'voice_count_ids': voice_count_ids,
+            'measure_in_section_ids': measure_in_section_ids,
             'section_ids': sec_ids,
             'section_types': sec_types,
             'sec_bars_target': sec_bars_target,
@@ -342,6 +418,18 @@ def collate_fn(batch: list[dict]) -> dict:
         'labels': labels,
         'attention_mask': attention_mask,
     }
+
+    # ── 声部计数字段 padding ────────────────────────────────────
+    if 'voice_count_ids' in batch[0]:
+        voice_count_ids = [b['voice_count_ids'] for b in batch]
+        result['voice_count_ids'] = torch.nn.utils.rnn.pad_sequence(
+            voice_count_ids, batch_first=True, padding_value=0)
+
+    # ── 节内位置字段 padding ────────────────────────────────────
+    if 'measure_in_section_ids' in batch[0]:
+        ms_ids = [b['measure_in_section_ids'] for b in batch]
+        result['measure_in_section_ids'] = torch.nn.utils.rnn.pad_sequence(
+            ms_ids, batch_first=True, padding_value=0)
 
     # ── 段落字段 padding ────────────────────────────────────────
     if 'section_ids' in batch[0]:

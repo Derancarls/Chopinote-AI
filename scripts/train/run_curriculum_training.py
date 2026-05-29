@@ -80,8 +80,8 @@ def main():
     # 通用
     parser.add_argument('--batch-size', type=int, default=8,
                         help='batch size per step (default: 8)')
-    parser.add_argument('--grad-accum', type=int, default=4,
-                        help='gradient accumulation steps (default: 4, effective batch=32)')
+    parser.add_argument('--grad-accum', type=int, default=1,
+                        help='gradient accumulation steps (default: 1, effective batch=8)')
     parser.add_argument('--compile', action='store_true', default=False,
                         help='启用 torch.compile (mode=reduce-overhead)')
     parser.add_argument('--use-fp8', action='store_true', default=False,
