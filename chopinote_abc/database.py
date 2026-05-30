@@ -45,9 +45,9 @@ class ChordAtBar:
 @dataclass
 class SeedContext:
     """seed 的结构快照 — 段 1 生成时 B 可查询。"""
-    final_chord: str | None       # seed 最后一个和弦功能
-    final_key: str | None         # seed 最后一个已知调性
-    bar_count: int = 0            # seed 包含的小节数
+    final_chord: str | None = None  # seed 最后一个和弦功能 (Phase 3 启用)
+    final_key: str | None = None    # seed 最后一个已知调性
+    bar_count: int = 0              # seed 包含的小节数
 
 
 @dataclass
@@ -167,16 +167,13 @@ class A1DB:
         for sec in self.sections:
             type_token = f'<Section {sec.type}>'
             tid = tokenizer.encode_token(type_token)
-            if tid != tokenizer.mask_token_id:
-                tokens.append(tid)
+            tokens.append(tid)
             key_token = f'<Key {sec.key}>'
             kid = tokenizer.encode_token(key_token)
-            if kid != tokenizer.mask_token_id:
-                tokens.append(kid)
+            tokens.append(kid)
         # <SecSum> 收尾
         secsum_tid = tokenizer.encode_token('<SecSum>')
-        if secsum_tid != tokenizer.mask_token_id:
-            tokens.append(secsum_tid)
+        tokens.append(secsum_tid)
         return tokens
 
     def build_harmony_tokens(self, tokenizer) -> list[int]:
@@ -198,14 +195,12 @@ class A1DB:
             last_inv = c.inv
 
             bar_tid = tokenizer.encode_token(tokenizer.BAR)
-            if bar_tid != tokenizer.mask_token_id:
-                tokens.append(bar_tid)
+            tokens.append(bar_tid)
             chord_tid = tokenizer.encode_token(f'<Chord {c.func}>')
-            if chord_tid != tokenizer.mask_token_id:
-                tokens.append(chord_tid)
-            inv_tid = tokenizer.encode_token(f'<Inv {c.inv}>')
-            if inv_tid != tokenizer.mask_token_id:
-                tokens.append(inv_tid)
+            tokens.append(chord_tid)
+            inv_label = 'Root' if c.inv == 'root' else c.inv
+            inv_tid = tokenizer.encode_token(f'<Inv {inv_label}>')
+            tokens.append(inv_tid)
 
         return tokens
 
@@ -326,9 +321,12 @@ class A3DB:
     def snapshot_section(self, section_idx: int, tokens: list[int],
                          tokenizer, A1: A1DB | None = None):
         """段结束时调用。聚合 bar_log 中该段的记录 → 写入 snapshots。"""
-        section = A1.sections[section_idx] if A1 else None
-        start_bar = section.start_bar if section else 0
-        end_bar = start_bar + (section.bars if section else 0)
+        # 计算段落在 bar_log 中的实际 bar 范围（含 seed 偏移）
+        seed_bars = A1.seed_context.bar_count if (A1 and A1.seed_context) else 0
+        start_bar = seed_bars
+        for k in range(section_idx):
+            start_bar += A1.sections[k].bars
+        end_bar = start_bar + (A1.sections[section_idx].bars if A1 else 0)
 
         bars = [b for b in self.bar_log if start_bar <= b.bar < end_bar]
         if not bars:
@@ -356,22 +354,48 @@ class A3DB:
         self.section_snapshots[section_idx] = sec_stats
 
     def set_baseline(self, seed_tokens: list[int], tokenizer):
-        """从 seed 提取基线指标。"""
-        dummy = BarStats(bar=-1)
-        # 复用 record_bar 的统计逻辑
-        self.bar_log.append(dummy)
-        self.record_bar(-1, seed_tokens, tokenizer)
-        baseline = self.bar_log[-1]
+        """从 seed 提取基线指标（密度/音域/力度/休止/和声/PC 分布）。"""
+        # 用临时 BarStats 收集 seed 统计，不污染 bar_log
+        tmp = BarStats(bar=0)
+        n_notes = 0
+        pitches = []
+        for t in seed_tokens:
+            s = tokenizer.decode_token(t)
+            if s.startswith(tokenizer.NOTE_ON):
+                n_notes += 1
+                try:
+                    pitches.append(int(s[len(tokenizer.NOTE_ON) + 1:-1]))
+                except ValueError:
+                    pass
+            elif s.startswith(tokenizer.REST):
+                tmp.rest_ratio += 1
+            elif s.startswith('<Velocity'):
+                try:
+                    tmp.velocity_mean += int(s[len('<Velocity') + 1:-1])
+                except ValueError:
+                    pass
+
+        bar_count = max(1, sum(1 for t in seed_tokens if t == tokenizer.bar_token_id))
+        tmp.density = n_notes / bar_count
+        tmp.rest_ratio = tmp.rest_ratio / max(1, n_notes + tmp.rest_ratio)
+        tmp.velocity_mean = tmp.velocity_mean / max(1, n_notes)
+        if pitches:
+            tmp.pitch_range = (min(pitches), max(pitches))
+        tmp.pitch_class_dist = [0.0] * 12
+        for p in pitches:
+            tmp.pitch_class_dist[p % 12] += 1.0
+        total = sum(tmp.pitch_class_dist)
+        if total > 0:
+            tmp.pitch_class_dist = [c / total for c in tmp.pitch_class_dist]
+        tmp.harmonic_rhythm = 0.0  # seed 级不计算和声节奏
 
         self.baselines = {
-            'pitch_class_dist': baseline.pitch_class_dist,
-            'density': baseline.density,
-            'rest_ratio': baseline.rest_ratio,
-            'velocity_mean': baseline.velocity_mean,
-            'harmonic_rhythm': baseline.harmonic_rhythm,
+            'pitch_class_dist': tmp.pitch_class_dist,
+            'density': tmp.density,
+            'rest_ratio': tmp.rest_ratio,
+            'velocity_mean': tmp.velocity_mean,
+            'harmonic_rhythm': tmp.harmonic_rhythm,
         }
-        # 清理临时 bar
-        self.bar_log = [b for b in self.bar_log if b.bar >= 0]
 
     # ── 读 ──────────────────────────────────────
 
@@ -446,17 +470,6 @@ class A3DB:
                 results[metric] = abs(val - base) / max(abs(val) + abs(base), 1e-8)
         return results
 
-    def record_innovation(self, bar: int, meta: dict):
-        """B 判定某 bar 为有意的创新 → 记入创新日志。
-
-        供 C 回顾哪些偏离是 B 主动放行的，用于新颖性评估。
-        """
-        self.innovation_log.append({
-            'bar': bar,
-            **meta,
-        })
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Phase 2: C 新颖性评估 + DPO reward log
 # ═══════════════════════════════════════════════════════════════
@@ -493,7 +506,7 @@ def compute_diversity_bonus(current_tokens: list[int],
     - 和之前不同 → 高 → 加分
     """
     if not previous_generations:
-        return 0.0
+        return 0.3  # 无历史数据时返回中性值
 
     # 简化实现：用 token type 分布做 KL
     from .motif import _kl_divergence
@@ -524,27 +537,45 @@ def compute_diversity_bonus(current_tokens: list[int],
     return _kl_divergence(cur_dist, mean_prev)
 
 
-def write_reward_log(output_path: str, report: dict,
-                     novelty: float, diversity: float):
+def write_reward_log(output_path: str, report, novelty: float, diversity: float,
+                     seed_path: str = '', musicxml_path: str = '', total_score: float = 0.0,
+                     seed_bars: int = 0):
     """将 C 复盘结果 + 新颖性/多样性写入 JSONL 奖励日志。
 
     格式与 scripts/train/dpo_train.py 的预期输入兼容。
+    report 可以是 dict 或 EvalReport dataclass。
     """
     import json
     import os
     from datetime import datetime
 
+    # 兼容 dict 和 dataclass
+    if hasattr(report, 'get'):
+        fixes = report.get('structural_fixes', [])
+        archive_count = report.get('archive_commands_count',
+                                    len(report.get('archive_commands', [])))
+        total_bars = report.get('total_bars_generated', 0)
+    else:
+        fixes = getattr(report, 'structural_fixes', [])
+        archive_count = len(getattr(report, 'archive_commands', []))
+        total_bars = getattr(report, 'total_bars_generated', 0)
+        if total_score == 0.0:
+            total_score = getattr(report, 'total_score', 0.0)
+
     entry = {
         'timestamp': datetime.now().isoformat(),
-        'structural_fixes_count': len(report.get('structural_fixes', [])),
-        'archive_commands_count': len(report.get('archive_commands', [])),
-        'total_bars': report.get('total_bars_generated', 0),
+        'total_score': total_score,
+        'structural_fixes_count': len(fixes),
+        'archive_commands_count': archive_count,
+        'total_bars': total_bars,
         'novelty_bonus': novelty,
         'diversity_bonus': diversity,
+        'seed_info': {'path': seed_path, 'seed_bars': seed_bars},
+        'musicxml_path': musicxml_path,
         'structural_fixes': [
-            {'type': f.type, 'section': f.section, 'bar': f.bar}
+            {'type': f.type, 'section': f.section, 'bar': getattr(f, 'bar', None)}
             if hasattr(f, 'type') else f
-            for f in report.get('structural_fixes', [])
+            for f in fixes
         ],
     }
 
@@ -634,7 +665,11 @@ class A2DB:
         if not section:
             return
 
-        start_bar = section.start_bar
+        # 计算段落在 bar_log 中的实际 bar 范围（含 seed 偏移）
+        seed_bars = A1.seed_context.bar_count if A1.seed_context else 0
+        start_bar = seed_bars
+        for k in range(section_idx):
+            start_bar += A1.sections[k].bars
         end_bar = start_bar + section.bars
         section_bars = [b for b in A3.bar_log if start_bar <= b.bar < end_bar]
 

@@ -641,6 +641,8 @@ class Trainer:
 
                     if save_steps and local_step % save_steps == 0:
                         self.save_checkpoint(self._last_avg_loss)
+                        # ── 自动评估生成：填充 reward_log ──
+                        self._run_eval_generation()
                         # ── C 进化层：DPO 自动微调 ──
                         self._check_dpo_trigger()
             else:  # DataLoader 自然耗尽 → 新 epoch
@@ -846,6 +848,65 @@ class Trainer:
         per_token = per_token * weights
         n_valid = (valid_mask & (weights > 0)).sum()
         return per_token.sum() / max(1, n_valid)
+
+    def _run_eval_generation(self):
+        """在 checkpoint 后自动评估生成，填充 reward_log。
+
+        只在训练暂停期间运行（save_checkpoint 之后、下一个 batch 之前），
+        复用当前已加载的模型，避免子进程 GPU 争抢。
+        """
+        cfg = self.train_config
+        if not cfg.eval_enabled:
+            return
+        if cfg.eval_interval_steps <= 0:
+            return
+        if self.global_step % cfg.eval_interval_steps != 0:
+            return
+
+        if not cfg.eval_seed_list or not os.path.isfile(cfg.eval_seed_list):
+            logger.warning("eval_seed_list 不存在或为空: %s", cfg.eval_seed_list)
+            return
+
+        logger.info("=" * 50)
+        logger.info("自动评估生成 (step %d)", self.global_step)
+
+        from scripts.train.batch_evaluate import run_batch_evaluation
+        from chopinote_dataset.tokenizer import REMITokenizer
+
+        tokenizer = REMITokenizer(grid_size=16, velocity_levels=8)
+
+        with open(cfg.eval_seed_list) as f:
+            seeds = [line.strip() for line in f
+                     if line.strip() and not line.startswith('#')]
+
+        temperatures = [float(x.strip())
+                       for x in cfg.eval_temperatures.split(',')]
+
+        output_dir = os.path.join(
+            cfg.output_dir, 'eval_output')
+
+        reward_log = os.path.join(cfg.dpo_reward_dir, 'reward_log.jsonl')
+
+        # 切 eval 模式
+        was_training = self.model.training
+        self.model.eval()
+
+        try:
+            run_batch_evaluation(
+                self.model, tokenizer, seeds, temperatures,
+                samples_per_seed=cfg.eval_samples_per_seed,
+                max_bars=cfg.eval_max_bars,
+                output_dir=output_dir,
+                reward_log_path=reward_log,
+            )
+        except Exception as e:
+            logger.error("评估生成异常: %s", e, exc_info=True)
+        finally:
+            if was_training:
+                self.model.train()
+            torch.cuda.empty_cache()
+            logger.info("自动评估生成完成")
+            logger.info("=" * 50)
 
     def _check_dpo_trigger(self):
         """检查 reward_log 是否有足够新数据，触发 DPO 微调。"""

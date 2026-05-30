@@ -1,6 +1,6 @@
 """MusicXML 解析器 — 将 MusicXML 解析为统一的 Score 中间表示。
 
-复用 music21 做底层解析，输出 chopinote_evaluator 自己的数据结构。
+复用 music21 做底层解析，输出 ABC Engine 自己的数据结构。
 """
 
 from __future__ import annotations

@@ -215,6 +215,13 @@ class TrainingConfig:
     dpo_min_score_gap: float = 0.15        # 偏好对最小分差
     dpo_reward_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_REWARD_DIR', '/root/autodl-tmp/chopinote/rewards'))
+    # ── 自动评估生成（填充 reward_log，为 DPO 提供偏好数据） ──
+    eval_enabled: bool = False               # 是否在 checkpoint 后自动跑评估生成
+    eval_interval_steps: int = 5000          # 每多少步跑一次评估生成
+    eval_seed_list: str = ""                 # 种子文件列表（一行一个 MusicXML 路径）
+    eval_samples_per_seed: int = 2           # 每种子生成几个变体（不同温度）
+    eval_max_bars: int = 48                  # 生成长度
+    eval_temperatures: str = "0.9,1.1"       # 温度档位（逗号分隔）
     output_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_OUTPUT_DIR', '/root/autodl-tmp/chopinote/checkpoints'))
     log_dir: str = field(default_factory=lambda: os.environ.get(

@@ -673,13 +673,20 @@ def save_to_musicxml(
     output_path: str,
     max_bars: int = 256,
     save_tokens: bool = False,
+    export_midi: bool = True,
+    fast_path: bool = False,
 ):
-    """将 token 序列保存为 MusicXML + MIDI 文件。"""
+    """将 token 序列保存为 MusicXML + MIDI 文件。
+
+    Args:
+        fast_path: If True, write MusicXML directly without music21 (~100x faster).
+                   Does NOT support MIDI export. Use for C evaluation review.
+    """
     from chopinote_dataset.renderer import REMIToMusicXML
 
     renderer = REMIToMusicXML(grid_size=tokenizer.grid_size,
                                velocity_levels=tokenizer.velocity_levels)
-    score = renderer.render_from_tokens(token_ids, output_path)
+    score = renderer.render_from_tokens(token_ids, output_path, fast_path=fast_path)
 
     # 保存 token 序列（用于退回重写和 DPO）
     if save_tokens and token_ids:
@@ -690,14 +697,17 @@ def save_to_musicxml(
         except OSError as e:
             logger.warning('保存 token 文件失败: %s', e)
 
-    # 自动导出 MIDI（快速试听反馈）
-    midi_path = output_path.rsplit('.musicxml', 1)[0] + '.mid'
-    try:
-        score.write('midi', midi_path)
-    except Exception as e:
-        logger.warning('MIDI 导出失败: %s', e)
+    # 自动导出 MIDI（快速试听反馈）— fast_path 跳过
+    if export_midi and score is not None:
+        midi_path = output_path.rsplit('.musicxml', 1)[0] + '.mid'
+        try:
+            score.write('midi', midi_path)
+        except Exception as e:
+            logger.warning('MIDI 导出失败: %s', e)
 
-    # 计算小节数
+    # 计算小节数（fast_path 返回 None，由调用方自行计算）
+    if score is None:
+        return 0
     parts = list(score.parts)
     if parts:
         num_measures = len(list(parts[0].getElementsByClass('Measure')))
@@ -1038,42 +1048,47 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
 
 def _run_evaluate(args):
     """评价模式入口：对输入乐谱做广义/狭义评价。"""
-    from chopinote_evaluator.score import Evaluator
-    from chopinote_evaluator.benchmarks.build_benchmarks import load_benchmarks
+    from chopinote_abc.scoring import evaluate_generation
+    from chopinote_abc.parser import parse_musicxml
 
     print('=== Chopinote-AI 乐谱评价 ===')
     print()
 
-    benchmarks = load_benchmarks()
-    if not benchmarks:
-        print('[X] 基准数据未找到，请先运行 benchmarks/build_benchmarks.py')
-        sys.exit(1)
-
     print(f'  输入: {args.input}')
-    print(f'  基准组: {args.group}')
-    print(f'  场景权重: α={args.alpha}')
     if args.seed_path:
         print(f'  种子: {args.seed_path}')
     print()
 
-    ev = Evaluator(
-        benchmarks=benchmarks,
-        alpha=args.alpha,
-        group=args.group,
+    # 解析乐谱 + 评估
+    score_obj = parse_musicxml(args.input)
+    seed_score = parse_musicxml(args.seed_path) if args.seed_path else None
+
+    from chopinote_dataset.tokenizer import REMITokenizer
+    tokenizer = REMITokenizer()
+
+    # 从 Score 提取 token 用于评价
+    # (simplified: use score-level evaluation only)
+    report = evaluate_generation(
+        [], tokenizer,  # tokens not available in standalone eval mode
+        seed_tokens=None,
+        score=score_obj,
     )
 
-    report = ev.evaluate(
-        score_path=args.input,
-        seed_path=args.seed_path,
-        checkpoint=args.checkpoint if args.evaluate else None,
-    )
-
-    print(report.to_text())
+    print(f'  综合评分: {report.total_score:.4f}')
+    print(f'  合法性: {"通过" if report.legality_passed else "失败"}')
+    print(f'  广义分: {report.general_score:.4f}')
+    print(f'  理论违规: {report.theory.get("n_violations", 0)}')
 
     # JSON 输出
     if args.output:
+        import json
         with open(args.output, 'w') as f:
-            f.write(report.to_json())
+            json.dump({
+                'total_score': report.total_score,
+                'legality_passed': report.legality_passed,
+                'general_score': report.general_score,
+                'theory': report.theory,
+            }, f, indent=2, ensure_ascii=False)
         print()
         print(f'  JSON 报告已保存: {args.output}')
 
@@ -1558,210 +1573,103 @@ def main():
               f'目标: {params.get("section_total_bars")} 小节')
     print()
 
-    # ── 反馈模式：A 阶段（生成前评估，默认启用） ───────
-    feedback_callback = None
-    gen_params_obj = None
-    post_filter = None
+    # ── ABC Engine 生成模式（默认） ─────────────────────
     feedback_level = 'off' if args.no_feedback else args.feedback_level
 
     # 兼容旧 --feedback 参数
     if args.feedback:
         logger.warning("[已弃用] --feedback 现在默认启用，请使用 --no-feedback 关闭或 --feedback-level 调整")
 
-    if feedback_level != 'off':
-        from chopinote_evaluator.feedback_controller import (
-            PreGenerationEvaluator, NarrowFeedbackController, PostGenerationFilter,
-        )
-
-        # A 阶段：seed 结构画像 + 蓝图提取
-        pre_eval = PreGenerationEvaluator(tokenizer, default_complexity=params.get('complexity'))
-        seed_profile, gen_params_obj = pre_eval.evaluate(seed_tokens)
-        blueprint = pre_eval.extract_blueprint(seed_tokens)
-
-        # 将用户 CLI 参数同步到 gen_params_obj（B 阶段的调整基准）
-        _user_sync = {
-            'temperature': params.get('temperature', 1.0),
-            'top_k': params.get('top_k', 20),
-            'rest_penalty': params.get('rest_penalty', 0.0),
-            'key_bias_strength': params.get('key_bias_strength', 2.0),
-            'max_polyphony': params.get('max_polyphony', 10),
-            'complexity': params.get('complexity', 5.0),
-            'lock_key': params.get('lock_key', True),
-            'lock_time': params.get('lock_time', True),
-            'lock_tempo': params.get('lock_tempo', True),
-            'lock_program': params.get('lock_program', True),
-            'prog_switch_strength': params.get('prog_switch_strength', 1.0),
-            'prog_switch_interval': params.get('prog_switch_interval', 12),
-        }
-        for _k, _v in _user_sync.items():
-            if _v is not None and hasattr(gen_params_obj, _k):
-                setattr(gen_params_obj, _k, _v)
-
-        # C 阶段：生成后评价
-        post_filter = PostGenerationFilter(
-            tokenizer,
-            retry_threshold=args.retry_threshold,
-            max_retries=args.max_retries,
-        )
-
-        print(f'  [A 阶段] seed: {seed_profile.n_bars} 小节 | '
-              f'密度: {seed_profile.bar_density:.1f} notes/bar | '
-              f'调性: {seed_profile.tonic_key or "N/A"} | '
-              f'声部: {seed_profile.voice_count}')
-        if blueprint.sections:
-            print(f'          段落: {" → ".join(f"{s.type}({s.n_bars})" for s in blueprint.sections)}')
-            print(f'          曲式: {blueprint.form_hint} | '
-                  f'和声密度: {blueprint.harmony.chord_density_per_bar_mean:.3f}')
-        print()
-
-        # B 阶段：normal/strict 模式下启用
-        if feedback_level in ('normal', 'strict'):
-            feedback_controller = NarrowFeedbackController(
-                seed_profile, tokenizer,
-                blueprint=blueprint,
-                local_weight=args.local_weight,
-                global_weight=args.global_weight,
-            )
-            feedback_callback = feedback_controller.on_bar
-
-    # -- 第 4 步：生成 + 交互循环 -------------------------
-    print('[4/4] 开始续写...')
-    seed_tensor = torch.tensor([seed_tokens], dtype=torch.long, device=device)
     output_path = make_output_path(args.input, args.output)
     max_bars_total = params['max_bars'] + args.seed_bars
+    seed_tensor = torch.tensor([seed_tokens], dtype=torch.long, device=device)
 
-    interactive_retry_loop(
-        model, tokenizer, seed_tensor, device,
-        params, output_path, max_bars_total, model_vocab_size,
-        num_samples=args.num_samples, do_validate=args.validate,
-        auto_save=has_cli_params,
-        feedback_callback=feedback_callback,
-        gen_params=gen_params_obj,
-    )
+    if feedback_level != 'off':
+        # ── ABC Engine v2: 三阶段逐段迭代生成 ──
+        from chopinote_model.generate import stage3_iterative_generate
+        from chopinote_abc.scoring import evaluate_generation
+        from chopinote_abc.database import write_reward_log
 
-    # ── 反馈模式：C 阶段（生成后评价 + 诊断 + 退回重写 + RL reward） ─
-    if feedback_level != 'off' and post_filter:
-        saved_path = None
-        if os.path.isfile(output_path):
-            saved_path = output_path
-        else:
-            base_stem = Path(output_path).stem
-            candidates = sorted(
-                Path(output_path).parent.glob(f'{base_stem}*.musicxml'),
-                key=os.path.getmtime, reverse=True,
+        form = args.section_form or 'free'
+        max_retries = args.max_retries if feedback_level == 'strict' else 1
+
+        print(f'  [ABC Engine] 曲式: {form} | 目标: {params["max_bars"]} 小节 | '
+              f'温度: {params["temperature"]} | top_k: {params["top_k"]}')
+        print(f'               重试: {max_retries} | '
+              f'模式: {"严格" if feedback_level == "strict" else "正常"}')
+        print()
+
+        # 一次调用完成全部 A→B→C 流程
+        print('[ABC] 开始三阶段逐段迭代生成...')
+        all_tokens, abc_report = stage3_iterative_generate(
+            model, tokenizer, seed_tokens,
+            max_bars=params['max_bars'],
+            form=form,
+            max_retries=max_retries,
+            base_temperature=params.get('temperature', 1.0),
+            top_k=params.get('top_k', 20),
+        )
+
+        # 保存 MusicXML
+        save_to_musicxml(all_tokens, tokenizer, output_path, max_bars_total,
+                         save_tokens=True)
+        print(f'  [✓] 已保存: {output_path}')
+
+        # ── C 阶段：生成后评价 ──
+        novelty = abc_report.get('novelty_score', 0.0) if abc_report else 0.0
+        diversity = abc_report.get('diversity_score', 0.0) if abc_report else 0.0
+
+        print(f'  [C 阶段] 评价: {os.path.basename(output_path)}')
+        try:
+            eval_report = evaluate_generation(
+                all_tokens, tokenizer,
+                seed_tokens=seed_tokens,
+                musicxml_path=output_path,
+                novelty_bonus=novelty,
+                diversity_bonus=diversity,
+                structural_fixes=abc_report.get('structural_fixes', []) if abc_report else [],
+                archive_commands=abc_report.get('archive_commands', []) if abc_report else [],
             )
-            if candidates:
-                saved_path = str(candidates[0])
+            print(f'      | 综合评分: {eval_report.total_score:.4f} | '
+                  f'合法性: {"通过" if eval_report.legality_passed else "失败"}')
+            print(f'      | 广义分: {eval_report.general_score:.4f} | '
+                  f'理论违规: {eval_report.theory.get("n_violations", 0)}')
 
-        if not saved_path:
-            return
+            if eval_report.structural_fixes:
+                print(f'      | 结构修复建议 ({len(eval_report.structural_fixes)} 条):')
+                for fix in eval_report.structural_fixes[:5]:
+                    desc = getattr(fix, 'description', '') or ''
+                    print(f'        - {fix.type}: {desc}')
 
-        # 加载 token 序列
-        tok_path = saved_path.rsplit('.musicxml', 1)[0] + '.tokens'
-        rollback_tokens = load_tokens_file(tok_path) if os.path.isfile(tok_path) else None
-
-        # 评价（light 模式不传 checkpoint，避免模型推理开销）
-        print(f'  [C 阶段] 评价: {os.path.basename(saved_path)}')
-        _ckpt_for_eval = args.checkpoint if feedback_level in ('normal', 'strict') else None
-        report = post_filter.evaluate(
-            saved_path,
-            seed_path=args.input,
-            checkpoint=_ckpt_for_eval,
-        )
-        score = report.total_score if hasattr(report, 'total_score') else 0.0
-        legality_ok = report.legality.passed if report.legality else True
-        print(f'      | 综合评分: {score:.4f} | '
-              f'合法性: {"通过" if legality_ok else "失败"}')
-
-        # C 阶段结构化诊断
-        diagnoses = post_filter.diagnose_bars(report, tokenizer)
-        if diagnoses:
-            print(f'      小节诊断 ({len(diagnoses)} 个问题):')
-            for d in diagnoses[:5]:
-                sev_icon = '\033[91m●\033[0m' if d.severity > 0.7 else '\033[93m○\033[0m'
-                issues_str = ', '.join(d.issues[:2])
-                print(f'        小节 {d.bar}: {sev_icon} {issues_str}')
-                if d.suggestion:
-                    print(f'                 → {d.suggestion}')
-            if len(diagnoses) > 5:
-                print(f'         ... 还有 {len(diagnoses) - 5} 个问题')
-
-        # ── strict 模式：退回重写 ────────────────────────
-        rollback_retries = 0
-        rollback_report = report
-        max_retries = args.max_retries if feedback_level == 'strict' else 0
-
-        while rollback_retries < max_retries:
-            if not post_filter.should_retry(report):
-                print(f'      | [OK] 得分达标')
-                break
-
-            # 使用 smart_rollback
-            section_plan = blueprint.section_plan if blueprint else None
-            diagnoses_for_rollback = post_filter.diagnose_bars(report, tokenizer)
-            rollback_bar = post_filter.smart_rollback(diagnoses_for_rollback, section_plan)
-            rollback_point = None
-            if rollback_bar is not None and rollback_tokens is not None:
-                bar_id = tokenizer.bar_token_id
-                bar_count = 0
-                for i, tid in enumerate(rollback_tokens):
-                    if tid == bar_id:
-                        bar_count += 1
-                        if bar_count == rollback_bar:
-                            rollback_point = i
-                            break
-
-            if rollback_point is not None and rollback_retries < max_retries - 1:
-                rollback_retries += 1
-                adj = post_filter.get_retry_adjustments(report, rollback_retries)
-                if gen_params_obj:
-                    gen_params_obj.apply_adjustments(adj)
-                rollback_tokens = rollback_tokens[:rollback_point]
-                rollback_seed = torch.tensor([rollback_tokens], dtype=torch.long, device=device)
-                print(f'      | [退回重写 {rollback_retries}] '
-                      f'退回到 bar {rollback_bar}, 参数: {adj}')
-                rollback_ids, _ = generate_with_progress(
-                    model, rollback_seed, tokenizer,
-                    max_bars=params['max_bars'],
-                    temperature=gen_params_obj.temperature if gen_params_obj else 1.0,
-                    top_k=params.get('top_k', 20),
-                    effective_vocab_size=model_vocab_size,
-                    lock_key=gen_params_obj.lock_key if gen_params_obj else True,
-                    lock_time=gen_params_obj.lock_time if gen_params_obj else True,
-                    lock_tempo=gen_params_obj.lock_tempo if gen_params_obj else True,
-                    lock_program=gen_params_obj.lock_program if gen_params_obj else True,
-                    complexity=gen_params_obj.complexity if gen_params_obj else 5.0,
-                    rest_penalty=gen_params_obj.rest_penalty if gen_params_obj else 0.0,
-                    max_polyphony=params.get('max_polyphony', 10),
-                    key_bias_strength=gen_params_obj.key_bias_strength if gen_params_obj else 0.0,
-                    prog_switch_strength=gen_params_obj.prog_switch_strength if gen_params_obj else 1.0,
-                    prog_switch_interval=gen_params_obj.prog_switch_interval if gen_params_obj else 12,
-                    feedback_callback=feedback_callback,
-                    gen_params=gen_params_obj,
+            # 写 reward log — 统一路径 + 传 dataclass 字段
+            try:
+                write_reward_log(
+                    '/root/autodl-tmp/chopinote/reward_log.jsonl',
+                    eval_report,
+                    novelty,
+                    diversity,
+                    seed_path=args.input,
+                    musicxml_path=output_path,
+                    total_score=eval_report.total_score,
                 )
-                rollback_tokens = rollback_ids[0].tolist()
-                save_to_musicxml(rollback_tokens, tokenizer, saved_path, max_bars_total,
-                                 save_tokens=True)
-                report = post_filter.evaluate(saved_path, seed_path=args.input,
-                                             checkpoint=args.checkpoint)
-                rollback_report = report
-                score = report.total_score if hasattr(report, 'total_score') else 0.0
-                print(f'      | 重试后评分: {score:.4f}')
-                continue
-            else:
-                print(f'      | [!] 得分 {score:.3f} < 阈值 {args.retry_threshold}'
-                      f'{"，无法退回" if rollback_point is None else "，已达最大退回次数"}')
-                break
+            except Exception:
+                pass
+        except Exception as e:
+            print(f'      | [!] Score 级评价失败: {e}')
+            import traceback
+            traceback.print_exc()
 
-        # 记录 RL reward
-        post_filter.log_reward(
-            rollback_report, gen_params_obj,
-            retry_count=rollback_retries,
-            seed_info={'path': args.input, 'bars': max_bars_total, 'seed_bars': args.seed_bars},
-            extra={'musicxml_path': saved_path},
+    else:
+        # ── 无反馈模式：直接生成（兼容旧行为）──
+        print('[4/4] 开始续写（无反馈模式）...')
+        interactive_retry_loop(
+            model, tokenizer, seed_tensor, device,
+            params, output_path, max_bars_total, model_vocab_size,
+            num_samples=args.num_samples, do_validate=args.validate,
+            auto_save=has_cli_params,
+            feedback_callback=None,
+            gen_params=None,
         )
-        if rollback_retries > 0:
-            print(f'      | 共退回重写 {rollback_retries} 次')
     # ─────────────────────────────────────────────────────
     print()
 

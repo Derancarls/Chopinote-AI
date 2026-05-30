@@ -42,6 +42,13 @@ class BHardBans:
     contour_violation: set[int] = field(default_factory=set)
         # 发展部 contour 严重偏离 target_contour 的 token
 
+    def ban_context_tokens(self, tokenizer):
+        """Block global context tokens during note-filling (ABC prefix provides them)."""
+        for prefix in ('<Program', '<Tempo', '<TimeSig'):
+            for tid in range(tokenizer.vocab_size):
+                if tokenizer.decode_token(tid).startswith(prefix):
+                    self.banned_tokens.add(tid)
+
     def merge_all(self) -> set[int]:
         """合并所有违规 token 为统一集合 → 传给 generate_step。"""
         all_banned = set(self.banned_tokens)
@@ -208,20 +215,26 @@ class BFeedback:
                           b1_score: float | None) -> bool:
         """判定当前 bar 的偏离是否为有意的创新。
 
-        条件: 统计分布显著偏离（surprise > 0.5）
+        条件: 密度偏离基线（density 不在正常范围）
                + 硬约束通过（b1_score > 0.3 作为 proxy）
                + 创新预算还有剩余
         """
-        # surprise 用 PC 分布 vs 基线 KL（Phase 1/2 规则近似）
-        surprise = max(0.0, bar_stats.density_variance
-                       if hasattr(bar_stats, 'density_variance')
-                       else 0.0)
+        # 用 density 偏离度作为 surprise proxy: 显著偏离基线 → 可能是有意创新
+        density = getattr(bar_stats, 'density', 0.0)
+        rest_ratio = getattr(bar_stats, 'rest_ratio', 0.0)
 
-        # 简化版判定: b1_score 在 0.3-0.6 区间（不太差也不太完美）→ 可能是有意偏离
+        # 密度过高(>12)或过低(<2) → 偏离; 休止过多(>0.4) → 不可能是创新
+        if rest_ratio > 0.4:
+            return False
+        is_deviating = (density > 12.0 or density < 2.0)
+
+        # 硬约束通过（b1_score 不能太差）
         coherence_ok = b1_score is None or b1_score > 0.3
 
         if not coherence_ok:
             return False
+        if not is_deviating:
+            return False  # 没偏离就不需要创新预算
 
         budget = section.innovation_budget * section.bars
         if self.innovations_used >= budget:
@@ -278,14 +291,6 @@ class BFeedback:
         """每段开始前重置计数（致命信号 / 创新计数不过段）。"""
         self.b1_low_streak = 0
         self.consecutive_empty = 0
-
-    def need_harmony_rollback(self) -> bool:
-        """B 致命信号是否达到和声回退阈值。"""
-        return self.b1_low_streak >= self.FATAL_B1_THRESHOLD
-
-    def need_abort(self) -> bool:
-        """是否应该中止生成。"""
-        return self.consecutive_empty >= self.FATAL_EMPTY_THRESHOLD
 
 
 def _compute_deviation_surprise(

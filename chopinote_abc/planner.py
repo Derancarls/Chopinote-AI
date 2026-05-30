@@ -248,7 +248,7 @@ def _pivot_chord(from_key: str, to_key: str) -> str | None:
     return None
 
 
-def reharmonize_from_bar(A1: A1DB, from_bar: int) -> list[ChordAtBar]:
+def reharmonize_from_bar(A1: A1DB, from_bar: int, seed_bar_offset: int = 0) -> list[ChordAtBar]:
     """B 触发和声回退时调用。仅重规划 from_bar 及之后的段落。
 
     Phase 1 实现（纯规则）:
@@ -257,7 +257,10 @@ def reharmonize_from_bar(A1: A1DB, from_bar: int) -> list[ChordAtBar]:
     3. 保留 from_bar 前的和声不变
     4. 后续段如果调性不同，自动插 pivot chord
     """
-    section = A1.get_section(from_bar)
+    # 转为 0-based 段落内偏移（A1 的 start_bar 从 0 开始）
+    local_bar = from_bar - seed_bar_offset
+
+    section = A1.get_section(local_bar)
     if not section:
         return []
 
@@ -269,16 +272,16 @@ def reharmonize_from_bar(A1: A1DB, from_bar: int) -> list[ChordAtBar]:
     if section_idx < 0:
         return []
 
-    remaining_bars = section.bars - (from_bar - section.start_bar)
+    remaining_bars = section.bars - (local_bar - section.start_bar)
     new_chords = tonal_progression_template(
         section.type, remaining_bars, section.cadence)
 
     # 调整 bar offset
     for c in new_chords:
-        c.bar = from_bar + c.bar
+        c.bar = local_bar + c.bar
 
     # 后续段重新规划
-    bar_offset = from_bar + remaining_bars
+    bar_offset = local_bar + remaining_bars
     current_key = section.key
     for sec in A1.sections[section_idx + 1:]:
         if sec.key != current_key:
