@@ -985,110 +985,211 @@ def stage3_iterative_generate(
     return all_tokens, report
 
 
+# ═══════════════════════════════════════════════════════════════
+#  子段自动切分 — 长段 (> max_bars_per_subsection) 拆成
+#  多个子段，每子段独立 KV cache，自动续接。
+# ═══════════════════════════════════════════════════════════════
+
+_MAX_BARS_PER_SUBSECTION = 24   # ~1440 tok + prefix ~400 = ~1840, 安全在 4096 内
+_PREFIX_OVERHEAD_ESTIMATE = 400
+_AVG_TOKENS_PER_BAR = 60
+
+
+def _subsection_bars(section_bars: int, max_per_sub: int = _MAX_BARS_PER_SUBSECTION
+                    ) -> list[int]:
+    """将长段拆成子段 bar 数列表。"""
+    if section_bars <= max_per_sub:
+        return [section_bars]
+    chunks = []
+    remaining = section_bars
+    while remaining > 0:
+        n = min(max_per_sub, remaining)
+        chunks.append(n)
+        remaining -= n
+    return chunks
+
+
 @torch.no_grad()
 def _stage3_generate_once(
     model, tokenizer, seed_tokens, a1, a2, a3,
     bar_id, base_temperature, top_k,
+    max_bars_per_subsection: int = _MAX_BARS_PER_SUBSECTION,
 ) -> tuple[list[int], dict]:
-    """单次逐段生成。"""
+    """单次逐段生成 — Phase 2.5: 子段自动切分 + BFeedback + 发展配方。
+
+    长段 (> max_bars_per_subsection) 自动拆为多个子段：
+      - 每子段清 KV cache + 重构 prefix + 重新 forward
+      - 同段内 A2 地标指向主题段（不变），prev_tail 指向上一子段尾
+      - BFeedback (创新预算/致命信号) 跨子段累积，逐段 reset_per_section()
+    """
     from chopinote_abc.planner import reharmonize_from_bar
-    from chopinote_abc.decision import BHardBans, apply_zone_temperature
+    from chopinote_abc.decision import (BHardBans, BFeedback,
+                                          apply_zone_temperature)
+    from chopinote_abc.motif import contour_similarity, contour_distance
 
     device = next(model.parameters()).device
     eos_id = tokenizer.eos_token_id
     all_tokens = list(seed_tokens)
     cumulative_bar_count = a1.seed_context.bar_count if a1.seed_context else 0
 
+    b_feedback = BFeedback()
+
     for section_idx, section in enumerate(a1.sections):
-        prefix_tokens = []
-        prefix_tokens.extend(a1.build_structure_tokens(tokenizer))
-        prefix_tokens.extend(a1.build_harmony_tokens(tokenizer))
+        b_feedback.reset_per_section()
 
-        if section_idx > 0:
-            for label in a2.records:
-                if label.startswith('theme1_') or label.startswith('seed_'):
-                    prefix_tokens.extend(a2.get_purified_tokens(label))
-            prefix_tokens.extend(
-                _prev_section_tail(all_tokens, tokenizer, last_n_bars=1))
+        # ── Phase 2: 发展配方初始化 ──
+        if section.development_ops:
+            theme_dna = a2.get_dna('theme1_statement') or a2.get_dna('seed_statement')
+            theme_contour = theme_dna.contour if theme_dna else None
+            b_feedback.setup_development_ops(
+                section.development_ops, theme_contour)
 
-        kv_caches = [[None, None] for _ in range(model.config.n_layers)]
-        if prefix_tokens:
-            prefix_tensor = torch.tensor(
-                [prefix_tokens], dtype=torch.long, device=device)
-            model.forward(prefix_tensor, kv_caches=kv_caches)
-
+        # ── 子段切分 ──
+        sub_bars_list = _subsection_bars(section.bars, max_bars_per_subsection)
         section_tokens = []
-        b1_low_streak = 0
+        section_done = False
 
-        for bar_idx in range(section.bars):
-            gen_params = GenerationParams(
-                temperature=apply_zone_temperature(
-                    section, bar_idx, base_temperature),
-                top_k=top_k,
-            )
-            hard_bans = BHardBans()
+        for sub_idx, sub_bars in enumerate(sub_bars_list):
+            if section_done:
+                break
 
-            bar_tokens = []
-            done = False
+            # ── 每子段重建 prefix + 清 KV cache ──
+            prefix_tokens = []
+            # ① 全曲结构 (全局不变)
+            prefix_tokens.extend(a1.build_structure_tokens(tokenizer))
+            # ② 全曲和声 (全局不变，只保留当前段及之后的)
+            prefix_tokens.extend(a1.build_harmony_tokens(tokenizer))
 
-            for _ in range(256):
-                if section_tokens:
-                    last_tok = section_tokens[-1]
-                elif prefix_tokens:
-                    last_tok = prefix_tokens[-1]
-                else:
-                    last_tok = seed_tokens[-1]
+            # ④ A2 地标 (始终指向主题段，不是上一子段)
+            if section_idx > 0:
+                for label in a2.records:
+                    if label.startswith('theme1_') or label.startswith('seed_'):
+                        prefix_tokens.extend(a2.get_purified_tokens(label))
 
-                next_input = torch.tensor(
-                    [[last_tok]], dtype=torch.long, device=device)
+            # ⑤ 前段尾部: 首子段用上一段尾，后续子段用上一子段尾
+            if sub_idx == 0 and section_idx > 0:
+                # 首子段: 前一段的末 bar
+                prefix_tokens.extend(
+                    _prev_section_tail(all_tokens, tokenizer, last_n_bars=1))
+            elif sub_idx > 0 and section_tokens:
+                # 后续子段: 本段已生成的最后一个 bar
+                tail = _prev_section_tail(section_tokens, tokenizer, last_n_bars=1)
+                prefix_tokens.extend(tail)
 
-                logits = model.forward(next_input, kv_caches=kv_caches)
-                logits = logits[:, -1, :] / gen_params.temperature
+            kv_caches = [[None, None] for _ in range(model.config.n_layers)]
+            if prefix_tokens:
+                prefix_tensor = torch.tensor(
+                    [prefix_tokens], dtype=torch.long, device=device)
+                model.forward(prefix_tensor, kv_caches=kv_caches)
 
-                if hard_bans.has_bans():
-                    for bid in hard_bans.merge_all():
-                        if 0 <= bid < logits.size(-1):
-                            logits[0, bid] = float('-inf')
+            # ── 子段 bar 偏移: 全局 bar_idx = 段首 offset + 子段 offset ──
+            sub_bar_offset = sum(sub_bars_list[:sub_idx])
 
-                if gen_params.top_k > 0:
-                    vals, _ = torch.topk(
-                        logits, min(gen_params.top_k, logits.size(-1)))
-                    logits[logits < vals[:, -1:]] = float('-inf')
+            for bar_idx in range(sub_bars):
+                global_bar_idx = sub_bar_offset + bar_idx
 
-                probs = torch.softmax(logits, dim=-1)
-                next_tok = torch.multinomial(probs, num_samples=1)
-                tid = next_tok.item()
-                bar_tokens.append(tid)
+                # ── 温区退火（Phase 2: 热区融入 innovation_budget）──
+                temperature = apply_zone_temperature(
+                    section, global_bar_idx, base_temperature)
 
-                if tid == bar_id:
+                # ── B 发展配方调参 ──
+                gen_params = GenerationParams(
+                    temperature=temperature,
+                    top_k=top_k,
+                )
+
+                if b_feedback.invert_target is not None and section_tokens:
+                    dev_adj = b_feedback.get_development_adjustments(
+                        _extract_current_contour(section_tokens, tokenizer))
+                    if dev_adj.get('temperature'):
+                        gen_params.temperature = max(0.1, gen_params.temperature
+                                                     + dev_adj['temperature'])
+
+                hard_bans = BHardBans()
+
+                bar_tokens = []
+                done = False
+
+                for _ in range(256):
+                    if section_tokens:
+                        last_tok = section_tokens[-1]
+                    elif prefix_tokens:
+                        last_tok = prefix_tokens[-1]
+                    else:
+                        last_tok = seed_tokens[-1]
+
+                    next_input = torch.tensor(
+                        [[last_tok]], dtype=torch.long, device=device)
+
+                    logits = model.forward(next_input, kv_caches=kv_caches)
+                    logits = logits[:, -1, :] / max(gen_params.temperature, 1e-8)
+
+                    if hard_bans.has_bans():
+                        for bid in hard_bans.merge_all():
+                            if 0 <= bid < logits.size(-1):
+                                logits[0, bid] = float('-inf')
+
+                    if gen_params.top_k > 0:
+                        vals, _ = torch.topk(
+                            logits, min(gen_params.top_k, logits.size(-1)))
+                        logits[logits < vals[:, -1:]] = float('-inf')
+
+                    probs = torch.softmax(logits, dim=-1)
+                    next_tok = torch.multinomial(probs, num_samples=1)
+                    tid = next_tok.item()
+                    bar_tokens.append(tid)
+
+                    if tid == bar_id:
+                        break
+                    if tid == eos_id:
+                        done = True
+                        break
+
+                section_tokens.extend(bar_tokens)
+                cumulative_bar_count += 1
+
+                # ── A3 记录 + BFeedback 更新 ──
+                b1_proxy = _compute_b1_proxy(bar_tokens, tokenizer)
+                a3.record_bar(cumulative_bar_count, bar_tokens, tokenizer,
+                              b1_score=b1_proxy)
+
+                last = a3.get_last_bar()
+                fb_result = b_feedback.on_bar_complete(last, b1_proxy, section)
+
+                # ── Phase 2: 创新预算判定 ──
+                if fb_result.get('admit_innovation'):
+                    surprise = _compute_deviation_surprise(last, a3.baselines)
+                    b_feedback.record_innovation_entry(
+                        cumulative_bar_count, 'surprising_but_coherent',
+                        surprise, bar_tokens)
+
+                # ── 致命信号检测 ──
+                if fb_result.get('fatal') == 'reharmonize':
+                    new_harmony = reharmonize_from_bar(
+                        a1, from_bar=cumulative_bar_count)
+                    a1.override_harmony(cumulative_bar_count, new_harmony)
+                    section_tokens = []
+                    section_done = True
                     break
-                if tid == eos_id:
+
+                if fb_result.get('fatal') == 'abort':
+                    section_done = True
                     done = True
                     break
 
-            section_tokens.extend(bar_tokens)
-            cumulative_bar_count += 1
+                if done:
+                    section_done = True
+                    break
 
-            a3.record_bar(cumulative_bar_count, bar_tokens, tokenizer)
-
-            last = a3.get_last_bar()
-            if last.b1_score is not None and last.b1_score < 0.2:
-                b1_low_streak += 1
-            else:
-                b1_low_streak = 0
-
-            if b1_low_streak >= 3:
-                new_harmony = reharmonize_from_bar(
-                    a1, from_bar=cumulative_bar_count)
-                a1.override_harmony(cumulative_bar_count, new_harmony)
-                section_tokens = []
-                b1_low_streak = 0
-                break
-
-            if done:
-                break
-
+        # ── 段完成: 快照 + A2 归档 ──
         a3.snapshot_section(section_idx, section_tokens, tokenizer, a1)
+
+        # Phase 2: 创新日志写入 A3
+        for entry in b_feedback.innovation_log:
+            a3.record_innovation(entry.bar, {
+                'type': entry.innovation_type,
+                'surprise': entry.surprise,
+            })
 
         if section.type.startswith('theme') or section.type == 'exposition':
             a2.from_section(section_idx, section_tokens, a3, tokenizer, a1)
@@ -1099,35 +1200,139 @@ def _stage3_generate_once(
     return all_tokens, report
 
 
-def _c_evaluate(all_tokens, a1, a2, a3, tokenizer) -> dict:
-    """C 复盘 — Phase 1 规则版。"""
-    fixes = []
+def _extract_current_contour(tokens: list[int], tokenizer) -> list[int] | None:
+    """从最近 token 提取旋律 contour（用于 B 发展配方调参）。"""
+    pitches = []
+    _PREFIX_NOTE = tokenizer.NOTE_ON
+    for t in tokens[-128:]:
+        ts = tokenizer.decode_token(t)
+        if ts.startswith(_PREFIX_NOTE):
+            try:
+                pitches.append(int(ts.split(' ')[1]))
+            except (IndexError, ValueError):
+                pass
+    if len(pitches) >= 2:
+        return [pitches[i] - pitches[i - 1] for i in range(1, len(pitches))]
+    return None
 
+
+def _compute_b1_proxy(bar_tokens: list[int], tokenizer) -> float:
+    """Phase 2 B1 代理分 — 纯规则快速计算，不依赖模型。
+
+    检查 bar 内的基本合法性（非空、有音符、有结束标记）。
+    这个 proxy 用于 BFeedback 的 fatal signal 检测。
+    """
+    if not bar_tokens:
+        return 0.0
+
+    note_count = sum(1 for t in bar_tokens
+                     if tokenizer.decode_token(t).startswith(tokenizer.NOTE_ON))
+    rest_count = sum(1 for t in bar_tokens
+                     if tokenizer.decode_token(t).startswith('Rest'))
+
+    if note_count == 0:
+        return 0.1  # 全空 bar → 很低但不是 0
+
+    # 密度在上限附近 → 扣分
+    density = note_count / max(1, len(bar_tokens))
+    if density > 0.5:
+        density_score = 0.6
+    elif density < 0.05:
+        density_score = 0.3
+    else:
+        density_score = 0.8
+
+    # rest 比例
+    rest_ratio = rest_count / max(1, note_count + rest_count)
+    if rest_ratio > 0.7:
+        rest_score = 0.4
+    else:
+        rest_score = 0.7
+
+    # 综合
+    return (density_score + rest_score) / 2.0
+
+
+def _compute_deviation_surprise(bar_stats, baselines: dict) -> float:
+    """Phase 2 创新判定：KL(token_type_dist || baseline)。"""
+    from chopinote_abc.decision import _compute_deviation_surprise as _cds
+    return _cds(bar_stats, baselines)
+
+
+def _c_evaluate(all_tokens, a1, a2, a3, tokenizer) -> dict:
+    """C 复盘 — Phase 2: A2 自检 + PC 漂移 + 密度塌缩 + 新颖性/多样性。"""
+    from chopinote_abc.database import (StructuralFix,
+                                          compute_novelty_bonus,
+                                          compute_diversity_bonus)
+    from chopinote_abc.motif import contour_similarity
+
+    fixes: list[StructuralFix] = []
+    archive_cmds: list[dict] = []
+
+    # ── Phase 2: A2 再现部自检 ──
     recap_idx = a1.find_section('recapitulation')
     theme_idx = a1.find_section('theme1')
     if recap_idx is not None and theme_idx is not None:
+        # A3 段级统计对比
         sim = a3.compare_sections(theme_idx, recap_idx)
-        if sim.get('pitch_class_dist', 1.0) < 0.7:
-            fixes.append({'type': 'tighten_recap', 'section': recap_idx})
+        pc_similarity = sim.get('pitch_class_dist', 1.0)
+        density_similarity = sim.get('density', 1.0)
 
+        if pc_similarity < 0.7:
+            fixes.append(StructuralFix(
+                type='tighten_recap', section=recap_idx,
+                target_similarity=0.75))
+
+        # Phase 2: A2 动机级对比（contour 相似度）
+        theme_dna = a2.get_dna('theme1_statement') or a2.get_dna('seed_statement')
+        recap_dna = a2.get_dna(
+            f'recap_statement_{recap_idx}') if a2.records else None
+        if theme_dna and recap_dna:
+            motif_sim = contour_similarity(
+                theme_dna.contour, recap_dna.contour)
+            if motif_sim < 0.4:
+                fixes.append(StructuralFix(
+                    type='tighten_recap', section=recap_idx,
+                    reference_label='theme1_statement'))
+
+    # ── Phase 2: PC 漂移检测（A3 趋势）──
+    for i, sec in enumerate(a1.sections):
+        if sec.type in ('development', 'variation'):
+            trend = a3.get_trend('density', window=min(sec.bars, 8))
+            if trend is not None and trend > 2.0:
+                fixes.append(StructuralFix(
+                    type='tighten_recap', section=i,
+                    target_similarity=0.8))
+
+    # ── 密度塌缩检测 ──
     for i, sec in enumerate(a1.sections):
         section_bars = [b for b in a3.bar_log
                         if sec.start_bar <= b.bar < sec.start_bar + sec.bars]
         if len(section_bars) < sec.bars * 0.6:
-            fixes.append({
-                'type': 'extend_section', 'section': i,
-                'target_bars': int(sec.bars * 0.8),
-            })
+            fixes.append(StructuralFix(
+                type='extend_section', section=i,
+                target_bars=int(sec.bars * 0.8),
+            ))
+        # Phase 2: 检测密度塌缩（某段 density < 基线 30%）
+        if section_bars and a3.baselines:
+            bl_density = a3.baselines.get('density', 0.0)
+            sec_density = sum(b.density for b in section_bars) / len(section_bars)
+            if isinstance(bl_density, (int, float)) and bl_density > 0:
+                if sec_density < bl_density * 0.3:
+                    fixes.append(StructuralFix(
+                        type='tighten_recap', section=i,
+                        target_similarity=0.6))
 
+    # ── 终止式缺失检测 ──
     for i, sec in enumerate(a1.sections):
         end_bar = sec.start_bar + sec.bars - 1
         if end_bar not in a1.cadence_markers:
-            fixes.append({
-                'type': 'add_cadence', 'bar': end_bar,
-                'cadence': sec.cadence,
-            })
+            fixes.append(StructuralFix(
+                type='add_cadence', bar=end_bar,
+                cadence=sec.cadence,
+            ))
 
-    archive_cmds = []
+    # ── C 手动归档：发展部产生值得保留的新动机 ──
     for i, sec in enumerate(a1.sections):
         if sec.type == 'development':
             bars = [b for b in a3.bar_log
@@ -1136,11 +1341,37 @@ def _c_evaluate(all_tokens, a1, a2, a3, tokenizer) -> dict:
                 archive_cmds.append(
                     {'section_idx': i, 'label': 'development_motif'})
 
-    return {
+        # Phase 2: 变奏段密度异常的 bar 也可归档为"突变动机"
+        if sec.type == 'variation':
+            bars = [b for b in a3.bar_log
+                    if sec.start_bar <= b.bar < sec.start_bar + sec.bars]
+            if len(bars) >= 2:
+                densities = [b.density for b in bars]
+                if max(densities) - min(densities) > 2.0:
+                    archive_cmds.append(
+                        {'section_idx': i, 'label': f'variation_motif_{i}'})
+
+    # ── Phase 2: 新颖性加分 + 多样性奖励 ──
+    novelty = compute_novelty_bonus(a3, legality_violation_rate=0.05)
+    diversity = compute_diversity_bonus(all_tokens, [], tokenizer)
+
+    report = {
         'structural_fixes': fixes,
         'archive_commands': archive_cmds,
         'total_bars_generated': len(a3.bar_log),
+        'novelty_score': novelty,
+        'diversity_score': diversity,
     }
+
+    # ── Phase 2: DPO reward log ──
+    reward_path = '/root/autodl-tmp/chopinote/reward_log.jsonl'
+    try:
+        from chopinote_abc.database import write_reward_log
+        write_reward_log(reward_path, report, novelty, diversity)
+    except Exception:
+        pass  # reward log 失败不阻塞生成
+
+    return report
 
 
 def _detect_seed_key(tokens, tokenizer) -> str:

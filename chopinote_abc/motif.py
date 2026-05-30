@@ -194,3 +194,71 @@ def _kl_divergence(p: list[float], q: list[float]) -> float:
         qi = max(qi, eps)
         s += pi * math.log(pi / qi)
     return max(0.0, s)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Phase 2: B 发展配方 — 倒影 / 碎片化 / 减值
+# ═══════════════════════════════════════════════════════════════
+
+
+def invert_contour(contour: list[int]) -> list[int]:
+    """倒影：音程方向反转，大小保持。"""
+    return [-c for c in contour]
+
+
+def fragment_tokens(tokens: list[int],
+                    keep_ratio: float = 0.5) -> list[int]:
+    """碎片化：只保留前 keep_ratio 比例的 token。
+
+    fragment 在 A2 提取地标 bar 时执行——只取该 bar 的前
+    keep_ratio 比例 token，后半段丢弃，制造"碎片化动机"效果。
+    """
+    if not tokens or keep_ratio <= 0:
+        return []
+    if keep_ratio >= 1.0:
+        return list(tokens)
+    cut = max(1, int(len(tokens) * keep_ratio))
+    return tokens[:cut]
+
+
+def diminish_tokens(tokens: list[int], tokenizer,
+                    factor: float = 0.5) -> list[int]:
+    """减值：对 Duration token 的时长 × factor（默认 0.5）。
+
+    遍历 token 序列，找到 Duration token 将值减半。DURATION
+    格式如 '<Duration 2.0>' → '<Duration 1.0>'。
+    """
+    import re
+    result = []
+    _PREFIX_DUR = tokenizer.DURATION
+    for tid in tokens:
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith(_PREFIX_DUR):
+            m = re.search(r'([\d.]+)', ts)
+            if m:
+                orig = float(m.group(1))
+                new_val = max(0.0625, orig * factor)  # 最短 64 分音符
+                new_ts = re.sub(r'[\d.]+', str(new_val), ts)
+                new_tid = tokenizer.encode_token(new_ts)
+                if new_tid != tokenizer.mask_token_id:
+                    result.append(new_tid)
+                    continue
+        result.append(tid)
+    return result
+
+
+def contour_distance(a: list[int], b: list[int]) -> float:
+    """两个 contour 的归一化距离 [0, 1]。"""
+    if not a or not b:
+        return 1.0
+    n = min(len(a), len(b))
+    a_slice = a[:n]
+    b_slice = b[:n]
+    max_diff = max(abs(x) for x in a_slice + b_slice) or 1
+    dist = sum(abs(ai - bi) / max_diff for ai, bi in zip(a_slice, b_slice)) / n
+    return dist
+
+
+def contour_similarity(a: list[int], b: list[int]) -> float:
+    """两个 contour 的相似度 [0, 1]，1 = 完全相同。"""
+    return max(0.0, 1.0 - contour_distance(a, b))

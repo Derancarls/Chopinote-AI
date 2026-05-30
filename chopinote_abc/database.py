@@ -446,6 +446,112 @@ class A3DB:
                 results[metric] = abs(val - base) / max(abs(val) + abs(base), 1e-8)
         return results
 
+    def record_innovation(self, bar: int, meta: dict):
+        """B 判定某 bar 为有意的创新 → 记入创新日志。
+
+        供 C 回顾哪些偏离是 B 主动放行的，用于新颖性评估。
+        """
+        self.innovation_log.append({
+            'bar': bar,
+            **meta,
+        })
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Phase 2: C 新颖性评估 + DPO reward log
+# ═══════════════════════════════════════════════════════════════
+
+
+def compute_novelty_bonus(a3, legality_violation_rate: float = 0.0) -> float:
+    """C 新颖性加分：基于 A3 创新日志 + 合法性率。
+
+    核心公式: novelty = mean_surprise × (1 - violation_rate)
+
+    高处 surprise × 低违规 = 好创新（奖励）
+    高处 surprise × 高违规 = 坏噪声（不奖励）
+    """
+    if not a3.innovation_log:
+        return 0.0
+
+    surprises = [entry.get('surprise', 0.0)
+                 for entry in a3.innovation_log
+                 if isinstance(entry.get('surprise'), (int, float))]
+    if not surprises:
+        return 0.0
+
+    mean_surprise = sum(surprises) / len(surprises)
+    coherence_factor = max(0.0, 1.0 - legality_violation_rate)
+    return mean_surprise * coherence_factor
+
+
+def compute_diversity_bonus(current_tokens: list[int],
+                            previous_generations: list[list[int]],
+                            tokenizer) -> float:
+    """多样性奖励：当前生成 vs 之前同 seed 生成的 token type 分布差异。
+
+    - 和之前一样 → 0（模式坍缩）→ 扣分
+    - 和之前不同 → 高 → 加分
+    """
+    if not previous_generations:
+        return 0.0
+
+    # 简化实现：用 token type 分布做 KL
+    from .motif import _kl_divergence
+
+    def _token_type_dist(tokens: list[int]) -> list[float]:
+        counts = [0] * 20  # 20 token type bins
+        for t in tokens:
+            ts = tokenizer.decode_token(t)
+            if not ts:
+                continue
+            # 取 token type 前两个字符做 bin
+            bin_idx = min(19, abs(hash(ts.split(' ')[0])) % 20)
+            counts[bin_idx] += 1
+        total = sum(counts) or 1
+        return [c / total for c in counts]
+
+    cur_dist = _token_type_dist(current_tokens)
+
+    # 与所有历史生成的平均分布比较
+    prev_agg = [0.0] * 20
+    for prev_tokens in previous_generations:
+        pd = _token_type_dist(prev_tokens)
+        for i in range(20):
+            prev_agg[i] += pd[i]
+    n = len(previous_generations)
+    mean_prev = [v / n for v in prev_agg]
+
+    return _kl_divergence(cur_dist, mean_prev)
+
+
+def write_reward_log(output_path: str, report: dict,
+                     novelty: float, diversity: float):
+    """将 C 复盘结果 + 新颖性/多样性写入 JSONL 奖励日志。
+
+    格式与 scripts/train/dpo_train.py 的预期输入兼容。
+    """
+    import json
+    import os
+    from datetime import datetime
+
+    entry = {
+        'timestamp': datetime.now().isoformat(),
+        'structural_fixes_count': len(report.get('structural_fixes', [])),
+        'archive_commands_count': len(report.get('archive_commands', [])),
+        'total_bars': report.get('total_bars_generated', 0),
+        'novelty_bonus': novelty,
+        'diversity_bonus': diversity,
+        'structural_fixes': [
+            {'type': f.type, 'section': f.section, 'bar': f.bar}
+            if hasattr(f, 'type') else f
+            for f in report.get('structural_fixes', [])
+        ],
+    }
+
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    with open(output_path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
 
 # ═══════════════════════════════════════════════════════════════
 #  A2DB — 动机摘要库

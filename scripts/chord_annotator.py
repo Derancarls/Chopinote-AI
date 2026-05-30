@@ -4,7 +4,7 @@
 输出: .chord.json sidecar 文件
 
 用法:
-    python scripts/chord_annotator.py --tokens-dir data/processed/tokens_v2/ \
+    python scripts/chord_annotator.py --tokens-dir data/processed/tokens_v3/ \
         --file-list data/processed/train.txt --output-suffix .chord.json
 """
 

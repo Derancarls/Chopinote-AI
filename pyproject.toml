@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chopinote-ai"
-version = "0.1.1-Beta"
+version = "0.2.6"
 description = "自动生成古典钢琴曲谱的 AI 系统"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,14 +14,17 @@ authors = [
 ]
 dependencies = [
     "music21>=9.9",
+    "mido>=1.3",
     "numpy>=1.26",
-    "tqdm>=4.67",
+    "psutil>=5.9",
     "PyYAML>=6.0",
+    "tensorboard>=2.14",
     "torch>=2.0",
+    "tqdm>=4.67",
 ]
 
 [project.scripts]
 chopin = "chopinote_cli.main:main"
 
 [tool.setuptools.packages.find]
-include = ["chopinote_cli*", "chopinote_dataset*", "chopinote_model*", "chopinote_evaluator*"]
+include = ["chopinote_cli*", "chopinote_dataset*", "chopinote_model*", "chopinote_evaluator*", "chopinote_abc*"]

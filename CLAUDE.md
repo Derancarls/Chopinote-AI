@@ -18,7 +18,7 @@ python -m pytest tests/test_tokenizer.py -v
 python -m pytest tests/test_tokenizer.py::TestVocabSize -v
 
 # CLI inference
-chopin checkpoints/step_X.pt input.musicxml
+chopin checkpoints/step_47000.pt input.musicxml
 
 # launch control (点火控制台)
 python scripts/train/launch_control.py check          # 预检清单
@@ -52,7 +52,7 @@ python scripts/train/run_curriculum_training.py \
     --batch-size 8 \
     --output-dir /root/autodl-tmp/chopinote/checkpoints \
     --log-dir /root/autodl-tmp/chopinote/tensorboard \
-    --resume /root/autodl-tmp/chopinote/checkpoints/step_X.pt
+    --resume /root/autodl-tmp/chopinote/checkpoints/step_47000.pt
 ```
 
 ## Architecture
@@ -60,7 +60,7 @@ python scripts/train/run_curriculum_training.py \
 ### Packages
 
 - **`chopinote_model/`** — Decoder-only Transformer:
-  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, **QK-Norm** (per-head RMSNorm), **per-head Q/K scaling**, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), **voice_count_embedding** (同位置声部计数), **measure_in_section_embedding** (节内相对位置), SectionPredictionHead (bars/key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear, **attention logit soft-capping** (manual fallback)
+  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, **QK-Norm** (per-head RMSNorm), **per-head Q/K scaling**, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), **voice_count_embedding** (同位置声部计数), **measure_in_section_embedding** (节内相对位置), SectionPredictionHead (key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear, **attention logit soft-capping** (manual fallback)
   - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig (FP8 enabled by default, **Z-loss**, **EMA β=0.999**, **dropout schedule** 0.15→0.10→0.08, token-level weighted CE loss), PhaseConfig, TokenLossMask
   - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred + **Z-loss**), **EMA weight tracking** (saved in ckpt), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation, **dropout step-based scheduling**
   - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), auto-loads `.sec.json` and `.chord.json` sidecars, **voice_count_ids** + **measure_in_section_ids** per-token, collate_fn (dynamic padding for all fields)
@@ -73,13 +73,21 @@ python scripts/train/run_curriculum_training.py \
   - `processor.py` — batch preprocessor base classes
   - `splitter.py` — dataset train/val/test split
 
-- **`chopinote_abc/`** — ABC Engine (A/B/C 三位一体认知架构):
-  - `feedback_controller.py` — APerceptor (A: 感知提取蓝图), BReasoner (B: 推理控制采样), CReflector (C: 复盘打分进化)
-  - `registry.py` — 指标注册表 (B/C 共用)
-  - `score.py` — 乐谱评分入口 (C 专用)
+- **`chopinote_abc/`** — ABC Engine v2 (A/B/C 三位一体认知架构):
+  - `database.py` — A1DB (框架记忆库), A2DB (动机摘要库), A3DB (统计画像库), dataclasses
+  - `planner.py` — Stage 1/2 规则规划器 (plan_structure, plan_harmony, reharmonize_from_bar)
+  - `motif.py` — A2 动机提取 (identify_landmarks, purify_tokens, extract_dna)
+  - `decision.py` — B 决策层 (BHardBans 硬约束, apply_zone_temperature 温区退火)
+
+- **`chopinote_evaluator/`** — 旧评价模块 (与 ABC Engine 并行，逐步迁移):
+  - `feedback_controller.py` — A/B/C 三阶段反馈控制器 (PreGenerationEvaluator, NarrowFeedbackController, PostGenerationFilter)
+  - `registry.py` — 指标注册表 (~45 token 级指标)
+  - `score.py` — 乐谱评分入口
   - `report.py` — 诊断报告生成
-  - `general/` — 通用指标 (统计/理论/和声/合法性)
-  - `specific/` — 专用指标 (连贯性/一致性/模型评分)
+  - `parser.py` — MusicXML → Score 解析
+  - `general/` — 通用指标 (legality/statistics/theory/harmony)
+  - `specific/` — 专用指标 (coherence/consistency/model_scorer)
+  - `benchmarks/` — 基准库统计 (build_benchmarks.py, precomputed JSON)
 
 - **`chopinote_cli/`** — CLI entry (`chopin` command):
   - `main.py` — inference CLI with preset + feedback mode + interactive retry
@@ -102,7 +110,7 @@ python scripts/train/run_curriculum_training.py \
 - **Logs/TensorBoard**: `/root/autodl-tmp/chopinote/tensorboard/` (also symlinked at `/root/tf-logs`)
 - **Memory-critical**: manual attention path when sec_bias present (avoids SDPA), padding mask shares first sample, SDPA sdpa_kernel restricts to flash/mem_efficient
 
-### Memory Optimization (RTX 4080 32GB)
+### Memory Optimization (RTX 5090 32GB)
 
 - `torch.set_float32_matmul_precision('high')` — TF32 matmul
 - `torch.backends.cudnn.benchmark = True`
