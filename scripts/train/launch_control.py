@@ -62,9 +62,10 @@ class TrainingConfig:
     tb_dir: str = field(default_factory=lambda: os.environ.get(
         'CHOPINOTE_TB_DIR', '/root/autodl-tmp/chopinote/tensorboard'))
 
-    # 超参数
-    batch_size: int = 8
-    grad_accum: int = 4
+    # 超参数 — 同 5090 已验证配置
+    batch_size: int = 16
+    grad_accum: int = 2
+    no_checkpointing: bool = False
     phase1_steps: int = 120000
     phase1_lr: float = 1.5e-4
     phase1_warmup: int = 4000
@@ -116,6 +117,11 @@ class TrainingConfig:
                      'phase1_steps', 'phase1_lr', 'phase1_warmup',
                      'phase2_steps', 'phase2_lr', 'phase2_warmup',
                      'max_restarts', 'restart_delay'):
+            val = getattr(args, key, None)
+            if val is not None:
+                setattr(self, key, val)
+        # bool flags
+        for key in ('no_checkpointing',):
             val = getattr(args, key, None)
             if val is not None:
                 setattr(self, key, val)
@@ -1410,6 +1416,8 @@ def main():
     p_launch.add_argument('--phase2-warmup', type=int)
     p_launch.add_argument('--batch-size', type=int)
     p_launch.add_argument('--grad_accum', type=int)
+    p_launch.add_argument('--no-checkpointing', action='store_true', default=True,
+                          help='关闭 gradient checkpointing 提高训练速度')
     p_launch.add_argument('--resume', type=str, default=None,
                           help='从指定 checkpoint 恢复（默认自动检测最新）')
 

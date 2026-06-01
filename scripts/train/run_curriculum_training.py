@@ -80,8 +80,8 @@ def main():
     # 通用
     parser.add_argument('--batch-size', type=int, default=8,
                         help='batch size per step (default: 8)')
-    parser.add_argument('--grad-accum', type=int, default=1,
-                        help='gradient accumulation steps (default: 1, effective batch=8)')
+    parser.add_argument('--grad-accum', type=int, default=2,
+                        help='gradient accumulation steps (default: 2, effective batch=16)')
     parser.add_argument('--compile', action='store_true', default=False,
                         help='启用 torch.compile (mode=reduce-overhead)')
     parser.add_argument('--use-fp8', action='store_true', default=False,
@@ -109,6 +109,18 @@ def main():
                         help='DPO beta 参数')
     parser.add_argument('--dpo-lora-rank', type=int, default=8,
                         help='DPO LoRA rank')
+    parser.add_argument('--eval-enabled', action='store_true', default=False,
+                        help='启用自动评估生成（填充 reward_log）')
+    parser.add_argument('--eval-interval', type=int, default=5000,
+                        help='评估生成间隔（训练步数）')
+    parser.add_argument('--eval-seeds', type=str, default='',
+                        help='种子列表文件（一行一个 MusicXML 路径）')
+    parser.add_argument('--eval-samples', type=int, default=2,
+                        help='每种子每温度重复次数')
+    parser.add_argument('--eval-max-bars', type=int, default=48,
+                        help='评估生成长度')
+    parser.add_argument('--eval-temperatures', type=str, default='0.9,1.1',
+                        help='评估温度档位（逗号分隔）')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -163,10 +175,21 @@ def main():
         dpo_epochs=args.dpo_epochs,
         dpo_beta=args.dpo_beta,
         dpo_lora_rank=args.dpo_lora_rank,
+        # 自动评估生成
+        eval_enabled=args.eval_enabled,
+        eval_interval_steps=args.eval_interval,
+        eval_seed_list=args.eval_seeds,
+        eval_samples_per_seed=args.eval_samples,
+        eval_max_bars=args.eval_max_bars,
+        eval_temperatures=args.eval_temperatures,
     )
     if args.dpo_enabled:
         logger.info('DPO 自动微调: 启用 (间隔=%d步, 最少=%d条目)',
                     args.dpo_interval, args.dpo_min_entries)
+    if args.eval_enabled:
+        logger.info('自动评估生成: 启用 (间隔=%d步, seeds=%s, samples=%d, bars=%d)',
+                    args.eval_interval, args.eval_seeds,
+                    args.eval_samples, args.eval_max_bars)
 
     logger.info('=' * 60)
     logger.info('Phase 1 (预训练):')

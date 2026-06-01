@@ -3,8 +3,8 @@
 > 已实现功能按版本号记录。Y 增量为大版本（架构/能力升级），Z 增量为小版本（优化/修复）。
 > 每个版本对应的已知问题见 `known_issues_<version>.md`。
 >
-> **当前训练状态**：Phase 1 预训练中（2026-05-28，step 20000 恢复，当前 step ~35000/140000，bs=8, grad_accum=1, effective_bs=8）
-> loss ~0.66 (step 3000 时 1.71), val_loss 0.81, NaN ~2.35%, ~5.8s/step, VRAM 22.7G/32G
+> **当前训练状态**：Phase 1 预训练中（2026-05-31，step 50000 恢复，当前 step ~51000+/166000，bs=8, grad_accum=2, effective_bs=16）
+> train loss ~0.67, ~5.8s/step, GPU RTX 4090 48GB, VRAM 22.7G
 > Phase 2 微调 50k steps 待启动
 
 ---
@@ -428,17 +428,146 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 ---
 
-### 当前训练（2026-05-28 运行中）
+---
 
-- **模型**：1.21B, 24L/32H/2048d, RoPE, 段落感知 + 功能和声
-- **GPU**：NVIDIA RTX 5090 32GB
-- **配置**：bs=8, grad_accum=1 (effective_bs=8), bf16 AMP, gradient checkpointing, VRAM ~22.7 GiB
-- **进度**：Phase 1 预训练 step ~35100/140000（25%），从 step_20000.pt 恢复，当前 train loss ~0.66, val loss 0.81
-- **速度**：~5.8s/step（相比 v0.1.2 的 12.4s/step 提速 2.1x），训练约 24.7 小时推进 15100 步
-- **NaN 率**：~2.35%（step 12000 时 ~5%，持续改善）
-- **Token 准确率**（val）：overall 79.6%, note 71.3%, duration 79.2%, chord_func 82.1%, chord_inv 84.8%
-- **计划**：Phase 1 共 140k steps（预计剩余 ~6天）→ Phase 2 MusicXML 微调 50k steps
-- **监控**：`tmux attach -t chopinote:0` / TensorBoard
+## v0.2.5 系列 — 模型优化 + ABC Engine v2 设计
+
+### v0.2.5-dev1 — Effective Batch 64 + DPO 自动微调 + 评估优化（2026-05-28）
+
+- effective batch size 调至 64（DRAGON baseline）
+- DPO 微调自动化脚本
+- 生成 CLI 语法补全 + eval batch 增至 100
+
+### v0.2.5-dev2 — QK-Norm + 嵌入增强 + 训练特性（2026-05-29）
+
+**注意力质量**：
+- **QK-Norm**：per-head RMSNorm 对 Q/K 归一化（防止 attention logit 方差失控）
+- **per-head Q/K scaling**：每个注意力头独立的可学习温度（头特异性）
+- **Attention logit soft-capping**：cap=50（manual fallback 路径，防止极端 logit）
+
+**嵌入层扩展**：
+- **voice_count_embedding**：同 Position 下第几个音（声部计数感知）
+- **measure_in_section_embedding**：段落内相对小节位置（结构级位置感知）
+- 两个新嵌入 zero-init 不干扰预训练权重
+
+**训练增强**：
+- **Z-loss**（weight=1e-4）：辅助 loss 约束 logit 幅度，抑制 NaN
+- **EMA**（β=0.999）：平滑权重跟踪，checkpoint 持久化
+- **dropout 阶梯调度**：0.15→0.10(step 47000)→0.08(step 80000)
+- **FP8 Linear 默认启用**（warmup 500），节省显存
+- **Token 级加权 CE loss**：chord ×0.5 / position ×2.0 / 重复 ×1.2
+
+**训练**：从 step_47000.pt 恢复，bs=8, grad_accum=2, effective_bs=16
+
+### v0.2.5 — 合并到 main，正式版（2026-05-30）
+
+---
+
+## v0.2.6 系列 — ABC Engine v2 Phase 1
+
+### v0.2.6-abc1 — ABC Engine v2 Phase 1 规则实现（2026-05-30）
+
+**新建 `chopinote_abc/` 包**（~1100 行，零模型依赖）：
+
+**A1 框架记忆库**（`database.py`）：
+- `SectionPlan` / `ChordAtBar` / `SeedContext` / `StructuralFix` dataclasses
+- A1DB CRUD + prefix 序列化（structure_tokens / harmony_tokens）
+- 运行时覆盖（overrides）+ C→A1 修复写回（apply_fix）
+- 段索引（_reindex）+ 段落查找（find_section / get_section / get_chord）
+
+**A2 动机摘要库**（`database.py` + `motif.py`）：
+- `MotifDNA`（contour / rhythm / scale_degrees / strong_beat_mask / register）
+- `MotifRecord` + A2DB CRUD + 相似度搜索
+- `identify_landmarks()`：语义驱动地标 bar 选择（statement / climax / distinctive）
+- `purify_tokens()`：剥离演奏层（8 种前缀），Velocity→4 归一化
+- `extract_dna()`：从提纯 token 提取 MotifDNA
+
+**A3 统计画像库**（`database.py`）：
+- `BarStats` / `SectionStats`（density / pitch_range / velocity / rest_ratio / harmonic_rhythm / pitch_class_dist / interval_dist / token_type_counts）
+- A3DB 追加式 bar_log + 段快照 + 基线（set_baseline）
+- 统计查询：get_window / get_trend / get_cumulative / compare_sections / compare_to_baseline
+
+**Stage 1/2 规则规划器**（`planner.py`）：
+- `plan_structure()`：曲式模板（sonata/binary/theme_variations/free）→ 段落分配 + 调性规划
+- `plan_harmony()`：14 段落类型和声模板 + 终止式约束 + 段间 pivot chord
+- `reharmonize_from_bar()`：局部和声回退（B 触发）
+- `tonal_progression_template()`：模板进行 + 终止式替换
+
+**B 决策层**（`decision.py`）：
+- `BHardBans`：7 类硬约束 token 屏蔽（平行五度/平行八度/声部交叉/音域超限/极端跳跃/导音未解决/contour 偏离）
+- `apply_zone_temperature()`：段内冷→热→冷温区退火（1 bar 线性过渡）
+
+**Stage 3 迭代生成**（`generate.py` 新增 ~200 行）：
+- `stage3_iterative_generate()`：逐段循环生成 + max_retries C→A1 闭环
+- `_stage3_generate_once()` + `_c_evaluate()` Phase 1 规则版
+
+**设计文档**：`docs/abc_engine_inference_loop.md` v3（五层 prefix / KV cache 策略 / 创新预算 / Phase 1-3 分期规划）
+
+---
+
+### v0.2.6-abc2 — DPO 自动闭环 + C 增强 + 日志系统 + B1/B2 六层拆分（2026-05-31）
+
+**DPO 自动优化闭环**（`train.py` + `batch_evaluate.py`）：
+- `_run_eval_generation()`：训练中自动批量生成（seed×temp×samples）→ C 评分 → write_reward_log
+- `_check_dpo_trigger()`：reward_log 新增 ≥ 20 条 → 自动拉起 DPO
+- `_run_dpo_phase()`：build_preference_dataset → LoRA (QKV, rank=8) → DPO train 3 epoch → merge
+- pre/post-DPO checkpoint 自动保存，所有 eval/DPO 功能默认关闭
+
+**C 评价层增强**（`scoring.py`，+300 行）：
+- **MusicXML 快速审查**：`review_musicxml()` → `BarInspection`（逐 bar 声部沉默/音域违规/声部交错/平行五八度/密度极端）
+- **Token↔XML 对比**：`compare_tokens_to_xml()` → fidelity 保真度分数
+- **C→B 结构化反馈**：`CFeedback` dataclass（ban_pitches/part_bias/temperature_delta/complexity_delta/fatal）
+- 段间 `_apply_section_c_feedback()`：每段完成后实时调参
+
+**ABC 日志系统**（`logging.py`，~600 行）：
+- `ABCGenerationLogger`：每次生成独立日志文件 + JSON 汇总
+- 六层全覆盖（A1/A2/A3/B1/B2/C），组件间数据流追踪
+- 控制台 WARNING+ / 文件 DEBUG 全量
+
+**B 层六层拆分**（B1 硬约束 + B2 决策调参）：
+- `GenerationSummary` B1/B2 指标分离
+- `decision.py` BHardBans/BFeedback 独立
+- 9 处 call site 更新
+
+---
+
+### v0.2.6-abc3 — 渲染器重写 + 日志重构 + 禁令调优 + FP8 推理（2026-05-31）
+
+**渲染器性能重写**（`renderer.py`）：
+- `_inject_directions` + `_cleanup_accidentals` 改用 `xml.etree.ElementTree`（O(E×S)→O(S+E×logM)）
+- 新增 `_render_raw_xml()` fast path：直写 MusicXML 绕过 music21（**0.01s vs 540s，54000x 加速**）
+- `save_to_musicxml` 加 `export_midi` / `fast_path` 参数
+- 修复旧 music21 `_build_score` 丢 92% 音符的 bug
+
+**日志系统重构**（`logging.py`）：
+- 双 Formatter：`ABCPlainFormatter`（文件纯文本，ESC=0）+ `ABCColorFormatter`（终端彩色）
+- `AsyncFileHandler`：Queue + daemon 线程异步写，不阻塞生成主循环
+- Token 级日志：每 token 采样详情（prob/T/topK/logit_range）、每 bar token 清单
+- 前向传播耗时记录（`log_forward_pass`）
+
+**禁令调优**：
+- 上下文禁令 570→~150（仅 Tuplet/GraceNote/非seed Program）
+- Tempo/TimeSig 恢复自由采样，模型能正常结束小节
+- Fallback 从 (96,3) 收紧到 (48,6)
+- 密度从 92→24.3 notes/bar（接近纯模型 19.8，seed 12.8）
+
+**推理加速**：
+- FP8 推理默认启用（`model.set_fp8_mode(True)`，`_scaled_mm` 加速）
+- Lucy seed 命名（`lucy_seed_C_major_4bar` / `lucy_seed_Gb_major_4bar`）
+
+**设计文档**：`docs/abc_engine_roles.md`（六层角色刻画）、`docs/bar_structural_plan.md`（Bar A1 预规划架构）
+
+---
+
+### 当前训练（2026-05-31 运行中）
+
+- **模型**：1.21B, 24L/32H/2048d, RoPE, QK-Norm, 段落感知 + 功能和声 + 声部/节位嵌入
+- **GPU**：NVIDIA RTX 4090 48GB
+- **配置**：bs=8, grad_accum=2 (effective_bs=16), bf16 AMP, FP8, gradient checkpointing, VRAM ~22.7 GiB
+- **进度**：Phase 1 预训练 step ~51000+/166000（~31%），从 step_50000.pt 恢复，当前 train loss ~0.67
+- **速度**：~5.8s/step
+- **计划**：Phase 1 共 166k steps → Phase 2 MusicXML 微调 50k steps
+- **监控**：`python scripts/train/launch_control.py monitor` / TensorBoard
 
 ---
 
@@ -448,16 +577,16 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | 方向 | 优先级 | 说明 | 依赖 |
 |------|--------|------|------|
-| **训练完成 → 效果评估** | **P0** | Phase 1 预训练完成后全面评估（loss 曲线、per-token-type accuracy、生成样本人工听评）。决定 Phase 2 微调是否继续或调整超参 | 当前训练 (step ~35100/140000) |
+| **训练完成 → 效果评估** | **P0** | Phase 1 预训练完成后全面评估（loss 曲线、per-token-type accuracy、生成样本人工听评）。决定 Phase 2 微调是否继续或调整超参 | 当前训练 (step ~51000/166000) |
 | **Phase 2 MusicXML 微调** | **P1** | Phase 1 结束后用 MusicXML 数据微调 50k steps，lr=1e-4, warmup=2000，提升乐谱语法规范性 | Phase 1 完成 |
 | **生成质量验证 + 渲染器回归** | **P1** | 用最新 checkpoint 生成样本，跑 roundtrip_test 13 维同度检测，人工听评判断可听性 | 训练 loss < 0.5 |
-| **C 进化层：DPO 接入训练循环** | **P1** | ABC Engine 的 C 进化层已有 DPO 代码但未接入训练持续使用。C 打分 → 自动构造偏好对 → 训练间隙拉起 DPO 微调。投入产出比最高 | 训练基本可用 + 生成质量可接受 |
-| **分层迭代生成（长序列）** | **P1** | 利用三阶段 pipeline，Stage 3 从一次性生成改为逐段循环。每段 input = [全曲结构规划] + [全曲和声骨架] + [段索引] + [上一段尾部]，全局结构永远在 context 中。解决 4096 只能写 ~2 段的根本限制，奏鸣曲式（呈示→发展→再现）可表达 | 生成质量可接受 |
+| **C 进化层：DPO 接入训练循环** | **P1** ✅ v0.2.6-abc2 | DPO 自动闭环已完成：eval → reward_log → trigger → LoRA DPO → merge，train.py 内置 | 训练基本可用 |
+| **分层迭代生成（长序列）** | **P1** ✅ v0.2.6-abc1 | Stage 3 逐段循环生成已完成。当前限制：模型 Bar token 生成不稳定 | 需 Bar 结构预规划 |
+| **小节线架构重构** | **P1** | `<Bar>` token 从模型采样移除，A1 预规划 Bar 位置，模型只填音符。目标：确定性 bar 结构 + 密度可控 | v0.3.x |
 | **A 感知层：主题发展 (Motif Bank)** | 中 | A 感知层从 seed 提取核心动机，生成时约束模型引用/变形（倒影/增值/减值/转调） | 训练完成 |
 | **A 感知层：乐句结构 (Phrase Grammar)** | 中 | antecedent/consequent/sentence/period 模板，B 决策层在乐句边界检查终止式合理性 | 训练完成 |
 | **A 感知层：SSF 调性编码** | 中 | 12-dim PC mask 替代离散 key token，支持调式混合。Phase 1: 段落级 TonicField；Phase 2: 小节级 LocalField delta | 需新增标注 pipeline |
-| **A 感知层：终止式规划** | 中 | 生成器规划终止式类型和位置（PAC/IAC/HC/DC），非事后评价。A 在 section_plan 标注预期终止类型，Stage 2 和声骨架约束 | 训练完成 |
-| **B 决策层：音乐理论正则 / 硬约束** | 中 | loss 加 theory-based 正则项（禁止平行五度、终止式 V-I 解决）；B 不采样违反声部引导规则的 token | 训练基本可用 |
+| **B1 硬约束增强** | 中 ✅ v0.2.6-abc2 | B1/B2 已六层拆分，Par/Fifth/Octave/VoiceCrossing 硬约束已完成 | 生成质量可接受 |
 | **B1 段落边界感知** | 中 | 在段落分割位置强化 B 决策层处理逻辑：边界前按前段风格约束、边界后快速切换，B1 局部 + B2 全局联合判断 | 训练基本可用 |
 | **B2 段落级灵活漂移** | 中 | 允许段落间风格差异，但约束段落内风格稳定。B2 评分窗口按段落边界划分 | 训练基本可用 |
 | **C 多轨复盘优化** | 中 | 多轨生成加入轨间指标：声部独立性、节奏互补性、音区避让。退回重写支持单轨回滚 | 训练基本可用 |
@@ -484,3 +613,9 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 | ✅ B 决策层：B1/B2 容忍度 + 新指标 | v0.2.4-eval/eval2 | SECTION_B2_TOLERANCE、cadence_placement 等 |
 | ✅ 平行五度检测重写 | v0.2.4-eval2 | 声部引导算法 |
 | ✅ bars_head 移除 | v0.2.4-eval2 | SectionPredictionHead 仅保留 key + type |
+| ✅ QK-Norm + per-head scale | v0.2.5-dev2 | per-head Q/K RMSNorm + 可学习头温度 |
+| ✅ voice/measure 嵌入 | v0.2.5-dev2 | voice_count + measure_in_section embedding |
+| ✅ Z-loss + EMA + dropout 调度 | v0.2.5-dev2 | Z-loss 1e-4, EMA β=0.999, dropout 0.15→0.10→0.08 |
+| ✅ ABC Engine v2 Phase 1 | v0.2.6-abc1 | A1/A2/A3 数据库 + 规则规划器 + 动机提取 + B 硬约束 + Stage 3 迭代生成 |
+| ✅ DPO 自动闭环 + C 增强 + 日志 | v0.2.6-abc2 | DPO auto-trigger/训练/合并, MusicXML审查, Token↔XML对比, C→B反馈, 六层日志 |
+| ✅ 渲染器重写 + 日志重构 + 禁令调优 | v0.2.6-abc3 | ElementTree渲染(54000x), 双Formatter+异步写, Token级日志, FP8推理, 密度92→24.3 |

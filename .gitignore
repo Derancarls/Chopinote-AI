@@ -58,10 +58,13 @@ test_*.musicxml
 tests/output/
 *.mid
 
-# 所有 MusicXML 和 token 文件（防止测试数据入库）
+# 所有 MusicXML 和 token 文件（防止测试产物入库）
 *.musicxml
 *.tokens
 
-# 测试数据目录
+# 例外：seed 文件（项目配置，需追踪）
+!data/test_seeds/*.musicxml
+!data/test_seeds/*.tokens
+
+# 测试产物目录（不追踪）
 data/test_output/
-data/test_seeds/

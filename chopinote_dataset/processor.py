@@ -20,7 +20,7 @@ try:
     from .converter import MusicXMLToREMI, PDMXToREMI, MIDIToREMI
     from .tokenizer import REMITokenizer
 except ImportError:
-    from converter import MusicXMLToREMI, PDMXToREMI
+    from converter import MusicXMLToREMI, PDMXToREMI, MIDIToREMI
     from tokenizer import REMITokenizer
 
 logging.basicConfig(level=logging.INFO)

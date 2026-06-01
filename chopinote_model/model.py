@@ -577,8 +577,10 @@ class MusicTransformer(nn.Module):
 
         # ── 与 sec_bias δ 去重 ──
         if sec_bias is not None:
-            delta_strength = (sec_bias.abs() / (self.config.sec_bias_delta_init + 1e-8)).clamp(0, 1)
-            chord_bias = chord_bias * (1 - 0.5 * delta_strength)
+            # 用 torch.abs + inplace clamp 避免额外中间张量
+            divisor = self.config.sec_bias_delta_init + 1e-8
+            delta_strength = sec_bias.abs().div_(divisor).clamp_(0, 1)
+            chord_bias.mul_(1 - 0.5 * delta_strength)
 
         # KV cache: 只返回最后 query_slice 个 query 行
         if query_slice > 0 and query_slice < T_full:

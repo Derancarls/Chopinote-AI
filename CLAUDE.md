@@ -18,7 +18,7 @@ python -m pytest tests/test_tokenizer.py -v
 python -m pytest tests/test_tokenizer.py::TestVocabSize -v
 
 # CLI inference
-chopin checkpoints/step_X.pt input.musicxml
+chopin checkpoints/step_47000.pt input.musicxml
 
 # launch control (点火控制台)
 python scripts/train/launch_control.py check          # 预检清单
@@ -42,29 +42,56 @@ python scripts/chord_annotator.py \
     --file-list /root/autodl-tmp/data/processed/train.txt \
     --output-suffix .chord.json
 
-# curriculum training (manual)
+# ABC Engine full cycle generation test
+python scripts/generate/test_abc_full_cycle.py
+
+# batch evaluation (fill reward_log for DPO)
+python scripts/train/batch_evaluate.py \
+    --checkpoint /root/autodl-tmp/chopinote/checkpoints/step_50000.pt \
+    --seeds /root/Chopinote-AI/data/eval_seeds.txt \
+    --temperatures 0.9,1.1 --samples-per-seed 1 --max-bars 32
+
+# DPO training (standalone)
+python scripts/train/dpo_train.py \
+    --checkpoint /root/autodl-tmp/chopinote/checkpoints/step_50000.pt \
+    --reward-dir /root/autodl-tmp/chopinote/rewards \
+    --epochs 3
+
+# curriculum training with DPO auto-loop
 python scripts/train/run_curriculum_training.py \
-    --midi-train-list /root/autodl-tmp/data/processed/train.txt \
-    --musicxml-train-list /root/autodl-tmp/data/processed/train.txt \
-    --val-list /root/autodl-tmp/data/processed/val.txt \
-    --data-dir /root/autodl-tmp/data/processed \
+    --resume /root/autodl-tmp/chopinote/checkpoints/step_50000.pt \
+    --dpo-enabled --dpo-interval 5000 --dpo-min-entries 20 \
+    --eval-enabled --eval-interval 5000 \
+    --eval-seeds /root/Chopinote-AI/data/eval_seeds.txt \
     --phase1-steps 120000 --phase2-steps 50000 \
     --batch-size 8 \
     --output-dir /root/autodl-tmp/chopinote/checkpoints \
-    --log-dir /root/autodl-tmp/chopinote/tensorboard \
-    --resume /root/autodl-tmp/chopinote/checkpoints/step_X.pt
+    --log-dir /root/autodl-tmp/chopinote/tensorboard
 ```
 
 ## Architecture
 
+### Six-Layer ABC Engine v2
+
+```
+A1 (框架记忆) → A2 (动机提取) → A3 (统计画像) → B1 (硬约束) → B2 (决策调参) → C (评价层)
+```
+
+- **A1** — 段落规划、和声进行、框架回退
+- **A2** — 种子分析、动机 DNA 提取（contour/rhythm/scale_degrees/ambitus）、地标管理
+- **A3** — 基线统计、逐 bar 密度/rest_ratio/b1_score、段快照、趋势检测
+- **B1** — 上下文禁令（Program/Tempo/TimeSig/Tuplet/GraceNote）、逐 bar 动态禁令、声部音域/平行禁止、硬约束通过状态
+- **B2** — 温区退火（冷→热→冷）、创新预算管理、致命信号检测（reharmonize/abort）、参数调节
+- **C** — 段对比（PC_sim/density_sim）、MusicXML 快速审查、Token↔XML 保真度对比、C→B 结构化反馈、最终评分
+
 ### Packages
 
 - **`chopinote_model/`** — Decoder-only Transformer:
-  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, **QK-Norm** (per-head RMSNorm), **per-head Q/K scaling**, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), **voice_count_embedding** (同位置声部计数), **measure_in_section_embedding** (节内相对位置), SectionPredictionHead (bars/key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear, **attention logit soft-capping** (manual fallback)
-  - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig (FP8 enabled by default, **Z-loss**, **EMA β=0.999**, **dropout schedule** 0.15→0.10→0.08, token-level weighted CE loss), PhaseConfig, TokenLossMask
-  - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred + **Z-loss**), **EMA weight tracking** (saved in ckpt), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation, **dropout step-based scheduling**
+  - `model.py` — MusicTransformer, 24 layers, RoPE positional encoding, **QK-Norm** (per-head RMSNorm), **per-head Q/K scaling**, section-aware attention (sec_bias: α/β/γ/δ learnable + bar distance decay), chord-aware attention (chord_bias: γ/ε/ζ + δ sec_bias dedup), **voice_count_embedding** (同位置声部计数), **measure_in_section_embedding** (节内相对位置), SectionPredictionHead (key/type), ChordPredictionHead (func/inv), weight tying, gradient checkpointing, FP8 Linear, **attention logit soft-capping** (manual fallback)
+  - `config.py` — ModelConfig (vocab_size=929, d_model=2048, n_layers=24, n_heads=32, d_ff=8192, ~1.21B params), TrainingConfig (FP8 enabled by default, **Z-loss**, **EMA β=0.999**, **dropout schedule** 0.15→0.10→0.08, token-level weighted CE loss, **DPO 自动微调配置**, **自动评估生成配置**), PhaseConfig, TokenLossMask
+  - `train.py` — Trainer class, multi-task loss (next_token + sec_pred + chord_pred + **Z-loss**), **EMA weight tracking** (saved in ckpt), single/multi-phase curriculum, AMP bf16, AdamW, cosine LR, TensorBoard, per-token-type accuracy evaluation, **dropout step-based scheduling**, **DPO auto-trigger**: `_check_dpo_trigger()` → `_run_dpo_phase()`, **eval auto-trigger**: `_run_eval_generation()` → fills reward_log
   - `dataset.py` — TokenDataset (token_lengths.json index, LRU cache 128), auto-loads `.sec.json` and `.chord.json` sidecars, **voice_count_ids** + **measure_in_section_ids** per-token, collate_fn (dynamic padding for all fields)
-  - `generate.py` — Three-stage generation: Stage 1 (structure plan) → Stage 2 (harmony skeleton, Chord→Inv state machine) → Stage 3 (note filling with sec_bias+chord_bias), KV cache, section-aware context tracking
+  - `generate.py` — **ABC Engine full pipeline**: `stage3_iterative_generate()` — Stage 1 (structure plan) → Stage 2 (harmony skeleton) → Stage 3 (note filling with sec_bias+chord_bias, B1 hard bans, B2 zone temperature), `_c_evaluate()` with MusicXML review + Token↔XML comparison + C→B feedback, per-section `_apply_section_c_feedback()`, KV cache, context token bans (Program seed-preserving)
 
 - **`chopinote_dataset/`** — Data processing:
   - `tokenizer.py` — REMITokenizer (fixed vocab 929, grid_size=16, velocity_levels=8), 16 chord functions + Chord7 + 4 inversions, build_vocab() is deterministic
@@ -73,36 +100,54 @@ python scripts/train/run_curriculum_training.py \
   - `processor.py` — batch preprocessor base classes
   - `splitter.py` — dataset train/val/test split
 
-- **`chopinote_abc/`** — ABC Engine (A/B/C 三位一体认知架构):
-  - `feedback_controller.py` — APerceptor (A: 感知提取蓝图), BReasoner (B: 推理控制采样), CReflector (C: 复盘打分进化)
-  - `registry.py` — 指标注册表 (B/C 共用)
-  - `score.py` — 乐谱评分入口 (C 专用)
-  - `report.py` — 诊断报告生成
-  - `general/` — 通用指标 (统计/理论/和声/合法性)
-  - `specific/` — 专用指标 (连贯性/一致性/模型评分)
+- **`chopinote_abc/`** — ABC Engine v2 (六层架构):
+  - `database.py` — A1DB (框架记忆库: SectionPlan, ChordAtBar, SeedContext, and声回退), A2DB (动机摘要库: MotifDNA, MotifRecord, 地标管理), A3DB (统计画像库: BarStats, 基线/baseline/趋势, write_reward_log with seed_bars+total_score), StructuralFix dataclass
+  - `planner.py` — Stage 1/2 规则规划器 (plan_structure: sonata/binary/theme_variations/free 曲式, plan_harmony: 功能和声模板+终止式, reharmonize_from_bar: 和声回退 with seed_bar_offset)
+  - `motif.py` — A2 动机提取 (identify_landmarks, purify_tokens, extract_dna: contour/rhythm/scale_degrees/ambitus, contour_similarity, invert_contour)
+  - `decision.py` — B1 (BHardBans: 上下文禁令+声部音域+平行禁止) + B2 (BFeedback: 致命信号/创新预算/发展配方, apply_zone_temperature: 冷→热→冷曲线, InnovationEntry)
+  - `metrics.py` — 27+ token 级指标 (pitch_class_kl, interval_kl, key_consistency, max_polyphony_check, voice_crossing, compute_all_metrics 等)
+  - `constraints.py` — Token 级 + Score 级规则检查 (parallel_fifths, voice_crossing_ tokens, out_of_range, harmony_progression, evaluate_theory)
+  - `scoring.py` — C 评价层: EvalReport, evaluate_generation (合法性+理论+一致性+连贯性), **MusicXML 快速审查** (BarInspection: 逐 bar 声部沉默/音域违规/声部交错/平行五八度), **Token↔XML 对比** (compare_tokens_to_xml: roundtrip 保真度), **C→B 结构化反馈** (CFeedback: ban_pitches/part_bias/temperature_delta/complexity_delta/fatal, c_review_to_feedback, apply_c_feedback_to_bans)
+  - `parser.py` — MusicXML → Score 中间表示 (Note/Measure/Score dataclasses, parse_musicxml via music21)
+  - `logging.py` — ABCGenerationLogger: 每次生成大循环一个独立日志文件 (logs/generate/), 六层全覆盖 (A1/A2/A3/B1/B2/C), 双输出 (DEBUG 全量文件 + WARNING+ 控制台), JSON 汇总 (.summary.json)
+  - `__init__.py` — 统一导出
 
 - **`chopinote_cli/`** — CLI entry (`chopin` command):
-  - `main.py` — inference CLI with preset + feedback mode + interactive retry
+  - `main.py` — inference CLI with preset + ABC Engine integration (calls stage3_iterative_generate), save_to_musicxml helper
   - `presets.py` — generation style presets (baroque, romantic, jazz, etc.)
 
 - **`scripts/`** — Utility scripts, organized by function:
   - `preprocess/` — data preprocessing (MIDI/PDMX/MusicXML → REMI): `run_fast_preprocess.py`, `rerun_musicxml.py`, `rerun_pdmx.py`, `rerun_all_v3.py`, `dedup_and_split.py`, `generate_token_lengths.py`
-  - `train/` — training: `run_curriculum_training.py` (two-phase, argparse, TF32), `dpo_train.py` (DPO fine-tune), `launch_control.py` (点火控制台, preflight → launch → monitor → abort)
-  - `generate/` — generation & testing: `batch_roundtrip.py`, `roundtrip_test.py`, `validate_generation.py`, seed utilities
+  - `train/` — training: `run_curriculum_training.py` (two-phase, argparse, TF32, DPO CLI args, eval CLI args), `dpo_train.py` (DPO standalone: build_preference_dataset, LoRALinear, dpo_loss, compute_log_probs, DPODataLoader), `batch_evaluate.py` (批量生成+评价: run_batch_evaluation for train.py inline or standalone CLI), `launch_control.py` (点火控制台, preflight → launch → monitor → abort)
+  - `generate/` — generation & testing: `test_abc_full_cycle.py` (sonata 48bar with ABCGenerationLogger), `batch_roundtrip.py`, `roundtrip_test.py`, `validate_generation.py`
   - `analysis/` — analysis & verification: `align_converter.py`, `verify_e2e.py`, `analyze_tokens.py`, `analyze_notations.py`
   - `structure_annotator.py` — section boundary detection + type inference (Sonata/Theme/Fallback)
   - `chord_annotator.py` — chord function annotation via template matching + key context + confidence > 0.8
 
+### DPO Auto-Optimization Loop
+
+```
+训练 step N → save_checkpoint
+  → _run_eval_generation(): 批量生成 (seed×temp×samples) → C 评分 → write_reward_log
+  → _check_dpo_trigger(): reward_log 新增 ≥ dpo_min_new_entries?
+    → 否 → 跳过
+    → 是 → build_preference_dataset() → LoRA(QKV only, rank=8) → DPO train 3 epoch → merge → continue
+```
+
+All eval/DPO flags default **off**. Enable with `--eval-enabled --dpo-enabled`.
+
 ### Hardware & Training Setup
 
-- **GPU**: RTX 5090 32GB, bf16 training
-- **Batch**: batch_size=8, grad_accum=1 (effective batch=8)
+- **GPU**: RTX 4090 48GB, bf16 training
+- **Batch**: batch_size=8, grad_accum=2 (effective batch=16)
 - **Data**: `/root/autodl-tmp/data/processed/` (~1.37M token files, 13.7B tokens, 400G disk)
 - **Checkpoints**: `/root/autodl-tmp/chopinote/checkpoints/`
+- **Reward log**: `/root/autodl-tmp/chopinote/rewards/reward_log.jsonl`
 - **Logs/TensorBoard**: `/root/autodl-tmp/chopinote/tensorboard/` (also symlinked at `/root/tf-logs`)
+- **ABC Engine logs**: `/root/Chopinote-AI/logs/generate/` (per-session .log + .summary.json)
 - **Memory-critical**: manual attention path when sec_bias present (avoids SDPA), padding mask shares first sample, SDPA sdpa_kernel restricts to flash/mem_efficient
 
-### Memory Optimization (RTX 4080 32GB)
+### Memory Optimization (RTX 4090 48GB)
 
 - `torch.set_float32_matmul_precision('high')` — TF32 matmul
 - `torch.backends.cudnn.benchmark = True`
@@ -123,3 +168,4 @@ python scripts/train/run_curriculum_training.py \
 - Padding across batch is always identical (same file list), so single-sample padding mask suffices
 - **`docs/` directory is NEVER to be deleted from disk** — it contains local design notes, gitignored but must stay on filesystem
 - **Git commits** — 必须用 `Derancarls <derancarls@foxmail.com>` 名义，**禁止**加 `Co-Authored-By` 行，所有代码贡献只以用户名义记录
+- **`chopinote_evaluator/` has been deleted** — all evaluation logic absorbed into `chopinote_abc/`. Do NOT recreate it.

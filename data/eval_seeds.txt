@@ -1,0 +1,4 @@
+# DPO eval seeds — 一行一个 MusicXML 路径
+# 评论行以 # 开头，会被忽略
+/root/Chopinote-AI/data/test_seeds/lucy_seed_C_major_4bar.musicxml
+/root/Chopinote-AI/data/test_seeds/lucy_seed_Gb_major_4bar.musicxml
