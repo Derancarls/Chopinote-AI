@@ -112,9 +112,9 @@ def _get_tokenizer() -> REMITokenizer:
 # ── Token 解析工具 ───────────────────────────────────────────────────────────
 
 def _parse_key(token_str: str) -> Optional[str]:
-    """从 '<Key C>' 等 token 提取调名。"""
-    if token_str.startswith('<Key ') and token_str.endswith('>'):
-        return token_str[5:-1]
+    """从 '<Tonic C>' token 提取主音名 (v0.3.0)。"""
+    if token_str.startswith('<Tonic ') and token_str.endswith('>'):
+        return token_str[7:-1]
     return None
 
 

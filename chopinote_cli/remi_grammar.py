@@ -28,7 +28,7 @@ def _classify_token(token_str: str) -> str:
     if token_str.startswith('<Program'):
         return 'program'
     if token_str.startswith('<Key'):
-        return 'key'
+        return 'tonic'
     if token_str.startswith('<TimeSig'):
         return 'timesig'
     if token_str.startswith('<Tempo'):
@@ -40,9 +40,9 @@ def _classify_token(token_str: str) -> str:
     if token_str.startswith('<Bass'):
         return 'bass'
     if token_str.startswith('<Chord '):
-        return 'chord'
+        return 'unknown'  # v0.3.0: chord removed
     if token_str.startswith('<Inv '):
-        return 'inv'
+        return 'unknown'  # v0.3.0: inv removed
     if token_str.startswith('<Section'):
         return 'section'
     if token_str.startswith('<Dynamic'):
@@ -68,7 +68,7 @@ def _classify_token(token_str: str) -> str:
     if token_str.startswith('<Tie'):
         return 'tie'
     if token_str.startswith('<Anticipate'):
-        return 'anticipate'
+        return 'unknown'  # v0.3.0: anticipate removed
     if token_str in ('<PAD>', '<BOS>', '<EOS>', '<MASK>', '<SecSum>'):
         return 'special'
     return 'unknown'
@@ -88,7 +88,7 @@ def _classify_token(token_str: str) -> str:
 _ALWAYS_ALLOWED = {'bar', 'eos', 'pad', 'bos', 'mask', 'unknown',
                    'dynamic', 'artic', 'ornament', 'pedal', 'hairpin',
                    'octave', 'slur', 'tuplet', 'grace', 'arpeggio', 'tie',
-                   'beat', 'bass', 'anticipate', 'section', 'inv'}
+                   'beat', 'bass', 'section'}
 
 # 这些 token 几乎任何位置都可以出现（表情记号等）
 _GRAMMAR_NEXT: dict[Optional[str], set[str]] = {
@@ -100,17 +100,17 @@ _GRAMMAR_NEXT: dict[Optional[str], set[str]] = {
 
     # 刚生成 Duration → 可以是新位置、新音符、新小节、结束等
     'duration': {'note_on', 'rest', 'position', 'bar', 'program',
-                 'key', 'timesig', 'tempo', 'clef', 'dynamic',
+                 'tonic', 'timesig', 'tempo', 'clef', 'dynamic',
                  'pedal', 'hairpin', 'octave', 'slur', 'arpeggio',
-                 'anticipate', 'eos'},
+                 'eos'},
 
     # 刚生成 Rest → 必须有 Duration
     'rest': {'duration'},
 
     # 刚生成 Bar → 新小节的开始
-    'bar': {'note_on', 'rest', 'position', 'program', 'key',
-            'timesig', 'tempo', 'clef', 'beat', 'bass', 'anticipate',
-            'section', 'chord', 'inv'},
+    'bar': {'note_on', 'rest', 'position', 'program', 'tonic',
+            'timesig', 'tempo', 'clef', 'beat', 'bass',
+            'section'},
 
     # 刚生成 Position → 该位置的内容
     'position': {'note_on', 'rest', 'beat'},
@@ -118,24 +118,23 @@ _GRAMMAR_NEXT: dict[Optional[str], set[str]] = {
     # 刚生成 Program → 通常是 Clef 或直接开始内容
     'program': {'clef', 'position', 'bar', 'note_on', 'rest', 'beat'},
 
-    'key': {'note_on', 'rest', 'position', 'bar', 'program', 'timesig',
-            'tempo', 'clef', 'beat', 'anticipate', 'section', 'chord', 'inv'},
-    'timesig': {'note_on', 'rest', 'position', 'bar', 'program', 'key',
+    'tonic': {'note_on', 'rest', 'position', 'bar', 'program', 'timesig',
+            'tempo', 'clef', 'beat', 'section'},
+    'timesig': {'note_on', 'rest', 'position', 'bar', 'program', 'tonic',
                 'tempo', 'clef', 'beat', 'section'},
-    'tempo': {'note_on', 'rest', 'position', 'bar', 'program', 'key',
+    'tempo': {'note_on', 'rest', 'position', 'bar', 'program', 'tonic',
               'timesig', 'clef', 'beat'},
-    'clef': {'note_on', 'rest', 'position', 'bar', 'program', 'key',
+    'clef': {'note_on', 'rest', 'position', 'bar', 'program', 'tonic',
              'timesig', 'tempo', 'beat'},
 
-    # Section/Chord/Inv token (结构/和声规划用)
-    'section': {'section', 'chord', 'inv', 'note_on', 'rest', 'bar',
-                'program', 'key', 'timesig', 'tempo', 'position'},
-    'chord': {'inv', 'chord', 'section', 'bar'},
-    'inv': {'chord', 'section', 'bar', 'note_on', 'rest'},
+    # Section token (结构规划用, v0.3.0: chord/inv 已移除)
+    'section': {'note_on', 'rest', 'bar',
+                'program', 'tonic', 'timesig', 'tempo', 'position'},
+    # v0.3.0: chord/inv grammar removed
 
-    # 起始：生成从 seed 后面开始，seed 最后可能是 Bar 或 Duration
-    None: {'note_on', 'rest', 'position', 'bar', 'key', 'timesig',
-           'tempo', 'program', 'beat', 'section', 'chord'},
+    # 起始
+    None: {'note_on', 'rest', 'position', 'bar', 'tonic', 'timesig',
+           'tempo', 'program', 'beat', 'section'},
 }
 
 

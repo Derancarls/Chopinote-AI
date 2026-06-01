@@ -234,8 +234,8 @@ def annotate_chords(token_ids: list[int], sec_data: Optional[dict] = None,
     for pos, tid in enumerate(token_ids):
         ts = tokenizer.decode_token(tid)
 
-        if ts.startswith('<Key '):
-            current_key = ts[len('<Key') + 1:-1]
+        if ts.startswith('<Tonic '):
+            current_key = ts[len('<Tonic') + 1:-1]
             seen_key_token = True
         elif not seen_key_token and sec_data:
             current_key = _get_current_key(pos, sec_data)

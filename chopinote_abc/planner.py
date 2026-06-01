@@ -299,3 +299,89 @@ def reharmonize_from_bar(A1: A1DB, from_bar: int, seed_bar_offset: int = 0) -> l
             new_chords.append(c)
 
     return new_chords
+
+
+# ═══════════════════════════════════════════════════════════════
+# SSF 和弦 → 12 维向量转换 (推理用)
+# ═══════════════════════════════════════════════════════════════
+
+# 功能和声 → 距主音半音数 (scale degree → semitones from tonic, 大调参照)
+_DEG_ROOT_SEMITONES: dict[str, int] = {
+    'I': 0,  'i': 0,
+    'II': 2, 'ii': 2, 'ii°': 2,
+    'III': 4, 'iii': 4,
+    'IV': 5, 'iv': 5,
+    'V': 7,  'v': 7, 'V7': 7, 'V/V': 2, 'V/vi': 11, 'V/ii': 9,
+    'VI': 9, 'vi': 9,
+    'VII': 11, 'vii': 11, 'vii°': 11, 'vii°7': 11,
+    'N': 1, 'It6': 6, 'Fr6': 6, 'Ger6': 6,
+}
+
+# 和弦性质 → 根音上方的半音间隔
+_QUALITY_INTERVALS: dict[str, list[int]] = {
+    'major':      [0, 4, 7],
+    'minor':      [0, 3, 7],
+    'dim':        [0, 3, 6],
+    'dim7':       [0, 3, 6, 9],
+    'hdim7':      [0, 3, 6, 10],
+    'aug':        [0, 4, 8],
+    'dom7':       [0, 4, 7, 10],
+    'min7':       [0, 3, 7, 10],
+    'maj7':       [0, 4, 7, 11],
+}
+
+# 功能 → 性质
+def _func_quality(func: str) -> str:
+    if '°7' in func or func == 'vii°7':
+        return 'dim7'
+    if '°' in func or func.startswith('vii'):
+        return 'dim'
+    if '7' in func:
+        if func[0].islower() or func.startswith('ii') or func.startswith('vi'):
+            return 'min7'
+        return 'dom7'
+    if func[0].islower() or func == 'N':
+        return 'minor' if func != 'N' else 'major'
+    if func in ('It6', 'Fr6', 'Ger6'):
+        return 'aug'
+    return 'major'
+
+
+def chord_func_to_ssf(func: str, tonic_name: str = 'C') -> list[float]:
+    """和弦功能名 → 12 维 SSF 向量 (主音锚定, tonic 在 pos 0)。
+
+    Examples:
+        chord_func_to_ssf('I', 'C')  → [1,0,1,0,1,0,0,1,0,0,0,0]  (C E G)
+        chord_func_to_ssf('V', 'C')  → [0,0,1,0,0,0,0,1,0,0,0,1]  (G B D)
+        chord_func_to_ssf('vi', 'C') → [1,0,0,0,1,0,0,0,1,0,0,0]  (A C E)
+        chord_func_to_ssf('V7', 'C') → [0,0,1,0,1,0,0,1,0,0,1,0]  (G B D F)
+    """
+    from chopinote_dataset.tokenizer import _TONIC_PC_MAP
+
+    root_offset = _DEG_ROOT_SEMITONES.get(func)
+    if root_offset is None:
+        return [0.5] * 12
+
+    quality = _func_quality(func)
+    intervals = _QUALITY_INTERVALS.get(quality, [0, 4, 7])
+
+    ssf = [0.0] * 12
+    for interval in intervals:
+        pos = (root_offset + interval) % 12
+        ssf[pos] = 1.0
+    return ssf
+
+
+def harmony_to_ssf(
+    chords: list, tonic_name: str = 'C'
+) -> list[list[float]]:
+    """ChordAtBar 列表 → per-bar SSF 向量序列。
+
+    Args:
+        chords: ChordAtBar 列表 (.func 字段)
+        tonic_name: 主音名
+
+    Returns:
+        list[list[float]]: 每个和弦一个 12 维向量
+    """
+    return [chord_func_to_ssf(c.func, tonic_name) for c in chords]

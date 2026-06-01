@@ -65,43 +65,41 @@ def _compute_measure_in_section(tokens: list[int],
 
 
 # ── Key token → key_id 映射（从 token 序列追踪调性，避免用 sec.json 的聚合值）──
-_KEY_TOKEN_MAP: Optional[dict[int, int]] = None
-_KEY_NAME_TO_ID = {
-    'C': 1, 'C#': 2, 'Db': 2, 'D': 3, 'D#': 4, 'Eb': 4,
-    'E': 5, 'F': 6, 'F#': 7, 'Gb': 7, 'G': 8, 'G#': 9, 'Ab': 9,
-    'A': 10, 'A#': 11, 'Bb': 11, 'B': 12, 'Cb': 12,
-    'Am': 13, 'A#m': 14, 'Bbm': 14, 'Bm': 15, 'Cm': 16,
-    'C#m': 17, 'Dm': 18, 'D#m': 19, 'Ebm': 19, 'Em': 20,
-    'Fm': 21, 'F#m': 22, 'Gbm': 22, 'Gm': 23, 'G#m': 24, 'Abm': 24,
+_TONIC_TOKEN_MAP: Optional[dict[int, int]] = None
+
+# 12 个主音 → ID (1-12, 0=未知)
+_TONIC_NAME_TO_ID = {
+    'C': 1, 'C#': 2, 'D': 3, 'D#': 4, 'E': 5,
+    'F': 6, 'F#': 7, 'G': 8, 'G#': 9, 'A': 10, 'A#': 11, 'B': 12,
 }
 
 
-def _get_key_token_map() -> dict[int, int]:
-    """预计算 token_id → key_id 映射（模块级缓存，只初始化一次）。"""
-    global _KEY_TOKEN_MAP
-    if _KEY_TOKEN_MAP is not None:
-        return _KEY_TOKEN_MAP
+def _get_tonic_token_map() -> dict[int, int]:
+    """预计算 token_id → tonic_id 映射 (v0.3.0: <Tonic X> tokens)。"""
+    global _TONIC_TOKEN_MAP
+    if _TONIC_TOKEN_MAP is not None:
+        return _TONIC_TOKEN_MAP
 
     from chopinote_dataset.tokenizer import REMITokenizer
     tk = REMITokenizer(grid_size=16, velocity_levels=8)
     mapping = {}
     for token_str, token_id in tk._token_to_id.items():
-        if token_str.startswith('<Key ') and token_str.endswith('>'):
-            key_name = token_str[5:-1]
-            kid = _KEY_NAME_TO_ID.get(key_name)
-            if kid is not None:
-                mapping[token_id] = kid
-    _KEY_TOKEN_MAP = mapping
+        if token_str.startswith('<Tonic ') and token_str.endswith('>'):
+            tonic_name = token_str[7:-1]
+            tid = _TONIC_NAME_TO_ID.get(tonic_name)
+            if tid is not None:
+                mapping[token_id] = tid
+    _TONIC_TOKEN_MAP = mapping
     return mapping
 
 
 def _key_ids_from_tokens(tokens: list[int]) -> list[int]:
-    """扫描 token 序列，返回每个位置对应的 key_id（-1 = 未知）。"""
-    key_map = _get_key_token_map()
+    """扫描 token 序列，返回 per-position tonic_id (v0.3.0: <Tonic X> tokens)。"""
+    tonic_map = _get_tonic_token_map()
     result = [-1] * len(tokens)
     current = -1
     for i, tid in enumerate(tokens):
-        kid = key_map.get(tid)
+        kid = tonic_map.get(tid)
         if kid is not None:
             current = kid
         if current >= 0:
@@ -249,6 +247,18 @@ class TokenDataset(Dataset):
         except Exception:
             return None
 
+    def _load_ssf_data(self, file_idx: int) -> Optional[dict]:
+        """加载 SSF (Sliding Scale Field) 标注 (v0.3.0)。"""
+        path = self._resolve_path(self.file_paths[file_idx])
+        ssf_path = path.with_suffix('.ssf.json')
+        if not ssf_path.exists():
+            return None
+        try:
+            with open(ssf_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     def __getitem__(self, idx: int) -> dict:
         file_idx = self.valid_indices[idx % len(self.valid_indices)]
         tokens = self._load_tokens(file_idx)
@@ -381,10 +391,42 @@ class TokenDataset(Dataset):
             chord_func_targets = torch.full((T,), -1, dtype=torch.long)
             chord_inv_targets = torch.full((T,), -1, dtype=torch.long)
 
+        # ── SSF field 构建 (v0.3.0) ────────────────────────────
+        ssf_data = self._load_ssf_data(file_idx)
+        if ssf_data is not None:
+            n_total_ssf = len(tokens)
+            ssf_full = torch.full((n_total_ssf, 12), 0.5, dtype=torch.float)
+            tonic_fields = ssf_data.get('tonic_fields', [])
+            boundaries = ssf_data.get('section_boundaries', [0])
+            # 填充段落级 TonicField
+            for i in range(len(boundaries)):
+                b_start = boundaries[i]
+                b_end = (boundaries[i + 1]
+                         if i + 1 < len(boundaries)
+                         else n_total_ssf)
+                if i < len(tonic_fields):
+                    tf = torch.tensor(tonic_fields[i], dtype=torch.float)
+                    ssf_full[b_start:b_end] = tf
+            # 叠加小节级 LocalField delta
+            local_fields = ssf_data.get('local_fields', {})
+            for bar_str, delta in local_fields.items():
+                bar = int(bar_str)
+                if bar < n_total_ssf:
+                    ssf_full[bar] += torch.tensor(delta, dtype=torch.float)
+            ssf_full = ssf_full.clamp(0.0, 1.0)
+            # 对齐裁剪窗口
+            if start > 0:
+                ssf_fields = ssf_full[start:start + T + 1][:-1]
+            else:
+                ssf_fields = ssf_full[:T]
+        else:
+            ssf_fields = torch.full((T, 12), 0.5, dtype=torch.float)
+
         return {
             'input_ids': input_ids,
             'labels': labels,
             'attention_mask': attention_mask,
+            'ssf_fields': ssf_fields,
             'voice_count_ids': voice_count_ids,
             'measure_in_section_ids': measure_in_section_ids,
             'section_ids': sec_ids,
@@ -418,6 +460,12 @@ def collate_fn(batch: list[dict]) -> dict:
         'labels': labels,
         'attention_mask': attention_mask,
     }
+
+    # ── SSF 字段 padding (v0.3.0) ──────────────────────────────
+    if 'ssf_fields' in batch[0]:
+        ssf_fields = [b['ssf_fields'] for b in batch]
+        result['ssf_fields'] = torch.nn.utils.rnn.pad_sequence(
+            ssf_fields, batch_first=True, padding_value=0.5)
 
     # ── 声部计数字段 padding ────────────────────────────────────
     if 'voice_count_ids' in batch[0]:
