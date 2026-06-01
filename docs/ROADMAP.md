@@ -576,14 +576,19 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 ### v0.3.0 — SSF 统一编码 + 多轨 + 训练
 
 > Tokenizer 改造、数据迁移、模型架构、训练管线。交付一个可训练的新模型。
+> Commits: `v0.3.0-ssf1` (架构) `v0.3.0-ssf2` (标注+适配)
 
-| # | 内容 | 设计文档 |
-|---|------|---------|
-| 1 | **词表重构**: 30 Key→12 Tonic, 512 Program→43+4 Voice, +12 Fig, +5 Cadence, 移除 Anticipate/Chord, 929→~400 | ssf + voice + fig + cadence |
-| 2 | **数据迁移**: migrate_to_v4.py ID 重映射, generate_ssf.py .ssf.json 生成, generate_fig.py .fig.json 生成 | ssf + fig |
-| 3 | **模型架构**: +ssf_proj +SSFReconstructionHead +voice_embedding +voice_bias +fig_embedding +cadence_embedding, -chord全家, key_head→12维 | ssf + voice + fig + cadence |
-| 4 | **训练管线**: SSF 重建 loss, 加权 CE 适配, checkpoint 行映射, 纯钢琴数据 | ssf |
-| 5 | **从头训练**: Phase 1 80K MIDI + Phase 2 40K MusicXML | — |
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **词表重构**: 30 Key→12 Tonic, 512 Program→43+4 Voice, +12 Fig, +5 Cadence, 移除 Anticipate/Chord, 929→542 | ✅ |
+| 2 | **数据迁移**: migrate_to_v4.py (ID重映射+降号调修复), generate_ssf.py (SSF标注), generate_fig.py (织体标注) | ✅ |
+| 3 | **模型架构**: +ssf_proj +SSFReconstructionHead +voice_embedding +voice_bias +fig_embedding +cadence_embedding, -chord全家, key_head→12dim, voice/fig/cadence ID builders | ✅ |
+| 4 | **训练管线**: SSF 重建 loss, key_head MSE, ssf_loss_val 追踪, sec/ssf eval 适配, param_groups 更新 | ✅ |
+| 5 | **周边适配**: converter (Key→Tonic, Program→Program+Voice), dataset (SSF加载+collate_fn), remi_grammar (key→tonic, -chord), planner (harmony_to_ssf) | ✅ |
+| 6 | **从头训练**: 数据迁移运行 + Phase 1 80K MIDI + Phase 2 40K MusicXML | ❌ 待数据迁移后启动 |
+| 7 | **generate.py 重写**: 框架-内容分离 (v0.3.1) | ❌ 待 v0.3.1 |
+
+> **审计修复 (2026-06-02)**: 全局审查发现 10+ bug 已修复 — voice/fig/cadence ID builder 全零/越界、embedding 零初始化被覆盖、ssf_loss_val 未追踪、key_head MSE 未计算、migrate 降号调映射到 MASK、config 过时注释等。
 
 ### v0.3.1 — 生成框架重构
 
@@ -595,6 +600,7 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 | 2 | **内容槽采样**: Position 后模型只采样 content token, 禁采样框架 token | framework |
 | 3 | **B1 禁令精简**: 570→4 条规则 (音域+平行五度+声部交错+极端跳跃) | framework |
 | 4 | **训练-推理 gap**: 框架 token loss 降权 (×0.1), 不 mask | framework |
+| 5 | **generate.py 旧引用清理**: tokenizer.KEY→TONIC, CHORD_FUNCTIONS→移除 等 13 处 | — |
 
 ### v0.3.2 — 终止式 + 乐句层
 

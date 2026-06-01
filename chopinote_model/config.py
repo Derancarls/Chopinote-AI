@@ -198,8 +198,8 @@ class TrainingConfig:
     use_fp8: bool = True                       # FP8 Linear 加速（BF16 warmup 后自动切换）
     fp8_warmup_steps: int = 500                # BF16 warmup 步数后切换 FP8（恢复训练时 global_step >= warmup 立即切换）
     gradient_checkpointing: bool = True  # False = 关闭 checkpointing 提速（耗更多 VRAM）
-    aux_head_lr_mult: float = 0.5        # section_head / chord_head LR 乘数
-    attn_bias_lr_mult: float = 0.1       # sec_bias_* / chord_bias_* 标量参数 LR 乘数
+    aux_head_lr_mult: float = 0.5        # section_head / ssf_* LR 乘数
+    attn_bias_lr_mult: float = 0.1       # sec_bias_* / voice_same* 标量参数 LR 乘数
     logging_steps: int = 10
     save_steps: int = 1000
     eval_steps: int = 1000

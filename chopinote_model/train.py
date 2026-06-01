@@ -455,7 +455,7 @@ class Trainer:
                     sec_loss_val = 0.0
                     ssf_loss_val = 0.0
 
-                    # Section prediction loss (v0.3.0: key→MSE, type→CE)
+                    # Section prediction loss (v0.3.0: key=MSE, type=CE)
                     if sec_head_logits is not None:
                         sec_types_target = batch['sec_types_target'].to(self.device)
                         has_sec_targets = (sec_types_target != -1).any()
@@ -466,19 +466,31 @@ class Trainer:
                             )
                             sec_loss_val = types_loss.item()
                             loss = loss + model.config.sec_loss_weight * types_loss
+                        # key_head → MSE regression on SSF TonicField
+                        if (model.config.use_ssf and ssf_pred is not None
+                                and 'ssf_fields' in batch):
+                            ssf_tgt = batch['ssf_fields'].to(self.device)
+                            key_pred = sec_head_logits['key'].float()
+                            valid_m = (labels != -100).unsqueeze(-1).float()
+                            key_loss = nn.functional.mse_loss(
+                                key_pred * valid_m, ssf_tgt[:, -key_pred.size(1):].float() * valid_m,
+                                reduction='sum',
+                            ) / max(1, valid_m.sum())
+                            sec_loss_val += key_loss.item()
+                            loss = loss + model.config.sec_loss_weight * key_loss
                         else:
                             sec_loss_val = 0.0
 
                     # SSF reconstruction loss (12-dim MSE regression)
                     if ssf_pred is not None and model.config.use_ssf_reconstruction:
                         ssf_target = batch['ssf_fields'].to(self.device)
-                        # Mask: only compute loss on valid (non-padded) tokens
                         valid_mask = (labels != -100).unsqueeze(-1).float()
                         ssf_loss = nn.functional.mse_loss(
                             ssf_pred.float() * valid_mask,
                             ssf_target.float() * valid_mask,
                             reduction='sum',
                         ) / max(1, valid_mask.sum())
+                        ssf_loss_val = ssf_loss.item()
                         loss = loss + model.config.ssf_loss_weight * ssf_loss
 
                 total_loss += loss.item()
@@ -647,7 +659,7 @@ class Trainer:
         for name, _ in prefixes:
             if name not in seen:
                 seen.append(name)
-        type_names = ['special', 'bar', *seen, 'rest', 'arpeggio', 'voice', 'fig', 'cadence', 'unknown']
+        type_names = ['special', 'bar', *seen, 'rest', 'arpeggio', 'unknown']
 
         # 构建 vocab_size 大小的 index 张量
         num_types = len(type_names)

@@ -142,9 +142,14 @@ class OldTokenizer:
 
 # ── 映射逻辑 ──────────────────────────────────────────────
 
+# 降号→升号映射 (新 Tonic 词表只用升号拼写)
+_FLAT_TO_SHARP = {'Bb': 'A#', 'Eb': 'D#', 'Ab': 'G#', 'Db': 'C#', 'Gb': 'F#', 'Cb': 'B'}
+
+
 def key_to_tonic(key_name: str) -> str:
-    """<Key C> → 'C', <Key Am> → 'A'"""
-    return key_name[:-1] if key_name.endswith('m') else key_name
+    """<Key C> → 'C', <Key Am> → 'A', <Key Bb> → 'A#'"""
+    tonic = key_name[:-1] if key_name.endswith('m') else key_name
+    return _FLAT_TO_SHARP.get(tonic, tonic)
 
 
 def migrate_tokens(old_ids: list[int], old_tok: OldTokenizer, new_tok: REMITokenizer) -> list[int]:

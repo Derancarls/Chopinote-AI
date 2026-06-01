@@ -343,18 +343,22 @@ class MusicTransformer(nn.Module):
             if p.dim() > 1:
                 nn.init.normal_(p, mean=0.0, std=0.02)
             elif 'bias' in name and not name.startswith('sec_bias') \
-                 and not name.startswith('chord_bias'):
+                 and not name.startswith('voice_same'):
                 nn.init.zeros_(p)
-        # section_embedding 的 NO_SECTION_ID 为零向量（无段落）
+        # section_embedding 的 NO_SECTION_ID 为零向量
         if self.config.use_section_attention:
             with torch.no_grad():
                 self.section_embedding.weight[NO_SECTION_ID].zero_()
-        # chord_embedding[0] 为零向量（padding）
-        if self.config.use_chord_attention:
+        # v0.3.0: voice/fig/cadence embeddings 零初始化
+        if self.config.use_voice_identity:
             with torch.no_grad():
-                self.chord_embedding.weight[0].zero_()
-                self.chord_inv_embedding.weight[0].zero_()
-        # voice_count_embedding / measure_in_section_embedding 零初始化（不冲击已有训练）
+                self.voice_embedding.weight.zero_()
+        if self.config.use_figuration:
+            with torch.no_grad():
+                self.fig_embedding.weight.zero_()
+        if self.config.use_cadence:
+            with torch.no_grad():
+                self.cadence_embedding.weight.zero_()
         if self.config.use_voice_count:
             with torch.no_grad():
                 self.voice_count_embedding.weight.zero_()
@@ -489,34 +493,69 @@ class MusicTransformer(nn.Module):
         return cad_ids
 
     def _init_token_maps(self):
-        """缓存 token ID 集合, 用于快速查找。"""
+        """缓存 Voice/Fig/Cadence token ID 集合, 按前缀扫描 vocab。"""
+        # 用临时的 tokenizer 实例来获取 token ID
+        from chopinote_dataset.tokenizer import REMITokenizer
+        tk = REMITokenizer()
         if self.config.use_voice_identity:
-            self.voice_token_to_idx = {}
+            self.voice_tids: list[int] = [-1] * 4
             for v in range(4):
-                t = f'<Voice {v}>'
-                tid = self.tokenizer.encode_token(t) if hasattr(self, 'tokenizer') else -1
-                if tid >= 0:
-                    self.voice_token_to_idx[v] = tid
+                self.voice_tids[v] = tk.encode_token(f'<Voice {v}>')
         if self.config.use_figuration:
-            self.fig_token_ids_set = set()
-            # Fig tokens are at the end of vocab, find them by prefix
-            for tid in range(self.config.vocab_size):
-                tok = self._id_to_token_safe(tid)
-                if tok.startswith('<Fig '):
-                    self.fig_token_ids_set.add(tid)
+            self.fig_tids: list[int] = []
+            for fname in range(len(tk.FIGURATION_NAMES)):
+                self.fig_tids.append(tk.encode_token(f'<Fig {tk.FIGURATION_NAMES[fname]}>'))
         if self.config.use_cadence:
-            self.cadence_token_ids_set = set()
-            for tid in range(self.config.vocab_size):
-                tok = self._id_to_token_safe(tid)
-                if tok.startswith('<Cad '):
-                    self.cadence_token_ids_set.add(tid)
+            self.cadence_tids: list[int] = []
+            for cname in range(len(tk.CADENCE_NAMES)):
+                self.cadence_tids.append(tk.encode_token(f'<Cad {tk.CADENCE_NAMES[cname]}>'))
 
-    def _id_to_token_safe(self, tid):
-        """安全地查找 token ID → string（兼容 tokenizer 可能未初始化）。"""
-        try:
-            return self.tokenizer.decode_token(tid)
-        except Exception:
-            return '<MASK>'
+    # ── v0.3.0: Voice / Fig / Cadence per-token ID builders ──
+
+    def _build_voice_ids(self, input_ids):
+        """扫描 token 序列, 返回每个位置的 voice_id (0=structural, 1-4=Voice 0-3)。"""
+        B, T = input_ids.shape
+        voice_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+        for b in range(B):
+            current = 0
+            for t in range(T):
+                tid = input_ids[b, t].item()
+                for v in range(4):
+                    if tid == self.voice_tids[v]:
+                        current = v + 1
+                        break
+                voice_ids[b, t] = current
+        return voice_ids
+
+    def _build_fig_ids(self, input_ids):
+        """扫描 token 序列, 返回每个位置的 fig_type_id (0=none, 1-11=fig types)。"""
+        B, T = input_ids.shape
+        fig_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+        for b in range(B):
+            current = 0
+            for t in range(T):
+                tid = input_ids[b, t].item()
+                for fi, ftid in enumerate(self.fig_tids):
+                    if tid == ftid:
+                        current = fi  # 0-based
+                        break
+                fig_ids[b, t] = current
+        return fig_ids
+
+    def _build_cadence_ids(self, input_ids):
+        """扫描 token 序列, 返回每个位置的 cadence_type_id (0=none, 1-5=PAC/IAC/HC/DC/PC)。"""
+        B, T = input_ids.shape
+        cad_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+        for b in range(B):
+            current = 0
+            for t in range(T):
+                tid = input_ids[b, t].item()
+                for ci, ctid in enumerate(self.cadence_tids):
+                    if tid == ctid:
+                        current = ci  # 0-based
+                        break
+                cad_ids[b, t] = current
+        return cad_ids
 
     def _build_chord_group_map(self):
         """构建和弦功能 ID → 功能组 ID 映射 (buffer, 不可训练)。
