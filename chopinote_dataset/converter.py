@@ -14,7 +14,12 @@ from music21 import (
     instrument,
 )
 
-from .tokenizer import REMITokenizer, key_name_to_tonic_midi
+from .tokenizer import REMITokenizer, tonic_name_to_midi
+
+
+def _key_name_to_tonic(key_name: str) -> str:
+    """从旧 Key 名提取主音名 (e.g. 'C'→'C', 'Am'→'A', 'F#m'→'F#')."""
+    return key_name[:-1] if key_name.endswith('m') else key_name
 
 logger = logging.getLogger(__name__)
 
@@ -83,21 +88,21 @@ class _BaseREMI:
 
         for m, pos, prog, sub, _priority, kind, data in merged:
             if m != cur_measure:
-                if cur_measure >= 0 and m in key_change_map:
-                    events.append((REMITokenizer.ANTICIPATE, key_change_map[m]))
                 events.append((REMITokenizer.BAR, None))
                 cur_measure = m
                 cur_pos = -1
                 cur_program = -1
 
                 # ── 每小节起始注入继承的上下文 ──────────────
-                # 调号
+                # 主音 (v0.3.0: Tonic 替代 Key)
                 if m in key_change_map:
-                    events.append((REMITokenizer.KEY, key_change_map[m]))
-                    current_tonic_midi = key_name_to_tonic_midi(key_change_map[m])
+                    tonic_name = _key_name_to_tonic(key_change_map[m])
+                    events.append((REMITokenizer.TONIC, tonic_name))
+                    current_tonic_midi = tonic_name_to_midi(tonic_name)
                     current_key_name = key_change_map[m]
                 else:
-                    events.append((REMITokenizer.KEY, current_key_name))
+                    tonic_name = _key_name_to_tonic(current_key_name)
+                    events.append((REMITokenizer.TONIC, tonic_name))
                 # 拍号
                 if current_timesig is not None:
                     events.append((REMITokenizer.TIMESIG, current_timesig))
@@ -120,10 +125,8 @@ class _BaseREMI:
                     events.append((REMITokenizer.BASS, bass_pc % 12))
 
             if prog != cur_program or sub != cur_subtrack:
-                if sub == 0:
-                    events.append((REMITokenizer.PROGRAM, str(prog)))
-                else:
-                    events.append((REMITokenizer.PROGRAM, f'{prog}_{sub}'))
+                events.append((REMITokenizer.PROGRAM, str(prog)))
+                events.append((REMITokenizer.VOICE, str(sub)))
                 cur_program = prog
                 cur_subtrack = sub
 
@@ -228,7 +231,7 @@ class MusicXMLToREMI(_BaseREMI):
             if ks_objs:
                 k = ks_objs[0].asKey()
                 key_name = k.tonic.name.replace('-', 'b') + ('m' if k.mode == 'minor' else '')
-        tonic_midi = key_name_to_tonic_midi(key_name)
+        tonic_midi = tonic_name_to_midi(key_name)
         # ──────────────────────────────────────────────────────
 
         # ── 分段调性检测（Anticipate 用）───────────────────
@@ -632,7 +635,7 @@ class PDMXToREMI(_BaseREMI):
                 root = 'C'
             root = root.replace('-', 'b').replace('♭', 'b').replace('♯', '#')
             key_name = root + ('m' if first.get('mode') == 'minor' else '')
-        tonic_midi = key_name_to_tonic_midi(key_name)
+        tonic_midi = tonic_name_to_midi(key_name)
         # ──────────────────────────────────────────────────────
 
         # ── 分段调性检测（Anticipate 用）───────────────────
@@ -980,7 +983,7 @@ class MIDIToREMI(_BaseREMI):
         if key_objs:
             k = key_objs[0]
             key_name = k.tonic.name.replace('-', 'b') + ('m' if k.mode == 'minor' else '')
-        tonic_midi = key_name_to_tonic_midi(key_name)
+        tonic_midi = tonic_name_to_midi(key_name)
         # ──────────────────────────────────────────────────────
 
         # ── 分段调性检测（Anticipate 用）───────────────────

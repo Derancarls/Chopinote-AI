@@ -573,32 +573,61 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 ## 规划中
 
-### 待排期
+### v0.3.0 — SSF 统一编码 + 多轨 + 训练
 
-| 方向 | 优先级 | 说明 | 依赖 |
-|------|--------|------|------|
-| **训练完成 → 效果评估** | **P0** | Phase 1 预训练完成后全面评估（loss 曲线、per-token-type accuracy、生成样本人工听评）。决定 Phase 2 微调是否继续或调整超参 | 当前训练 (step ~51000/166000) |
-| **Phase 2 MusicXML 微调** | **P1** | Phase 1 结束后用 MusicXML 数据微调 50k steps，lr=1e-4, warmup=2000，提升乐谱语法规范性 | Phase 1 完成 |
-| **生成质量验证 + 渲染器回归** | **P1** | 用最新 checkpoint 生成样本，跑 roundtrip_test 13 维同度检测，人工听评判断可听性 | 训练 loss < 0.5 |
-| **C 进化层：DPO 接入训练循环** | **P1** ✅ v0.2.6-abc2 | DPO 自动闭环已完成：eval → reward_log → trigger → LoRA DPO → merge，train.py 内置 | 训练基本可用 |
-| **分层迭代生成（长序列）** | **P1** ✅ v0.2.6-abc1 | Stage 3 逐段循环生成已完成。当前限制：模型 Bar token 生成不稳定 | 需 Bar 结构预规划 |
-| **小节线架构重构** | **P1** | `<Bar>` token 从模型采样移除，A1 预规划 Bar 位置，模型只填音符。目标：确定性 bar 结构 + 密度可控 | v0.3.x |
-| **A 感知层：主题发展 (Motif Bank)** | 中 | A 感知层从 seed 提取核心动机，生成时约束模型引用/变形（倒影/增值/减值/转调） | 训练完成 |
-| **A 感知层：乐句结构 (Phrase Grammar)** | 中 | antecedent/consequent/sentence/period 模板，B 决策层在乐句边界检查终止式合理性 | 训练完成 |
-| **A 感知层：SSF 调性编码** | 中 | 12-dim PC mask 替代离散 key token，支持调式混合。Phase 1: 段落级 TonicField；Phase 2: 小节级 LocalField delta | 需新增标注 pipeline |
-| **B1 硬约束增强** | 中 ✅ v0.2.6-abc2 | B1/B2 已六层拆分，Par/Fifth/Octave/VoiceCrossing 硬约束已完成 | 生成质量可接受 |
-| **B1 段落边界感知** | 中 | 在段落分割位置强化 B 决策层处理逻辑：边界前按前段风格约束、边界后快速切换，B1 局部 + B2 全局联合判断 | 训练基本可用 |
-| **B2 段落级灵活漂移** | 中 | 允许段落间风格差异，但约束段落内风格稳定。B2 评分窗口按段落边界划分 | 训练基本可用 |
-| **C 多轨复盘优化** | 中 | 多轨生成加入轨间指标：声部独立性、节奏互补性、音区避让。退回重写支持单轨回滚 | 训练基本可用 |
-| **相对音高编码（音程制）** | 中 | 替代绝对半音程 NOTE_ON，提升移调泛化 | 训练完成（破坏性变更） |
-| **B 决策层升级为蓝图驱动** | 中 | A 感知层给完整 blueprint + 风格目标，B 决策层主动设定每段理想参数区间，段落切换时主动改变参数姿态 | 训练基本可用 |
-| **P2: 手动 attention 性能优化** | 低 | sec_bias 手动 attention 比 SDPA 慢 15-22x。等待 PyTorch 原生 custom attention bias API 或改 sdpa_kernel 后端。当前不影响训练，但推理速度受限于此 | torch.compile 兼容性 |
-| **Voice-Stream Transformer** | 低 | 基于声部分流（Voice 而非 Track 划分）的多轨生成架构。每个 stream 是纯旋律线，piano reduction 后处理合并为 Track。解决巴赫赋格/爱之梦等声部跨手、单轨多声部场景 | 训练完成 + 不限轨方案 |
-| **MuseScore 插件版** | 低 | 完整验证通过后，抽轻量版做 MuseScore 插件。用户可在 MuseScore 内一键调用模型续写/生成，实时渲染乐谱 | 训练完成 + 效果达标 |
-| **不限轨方案（Program + Voice）** | 低 | 突破 4 subtrack 限制 | — |
-| **条件嵌入层（路径 B）** | 低 | key/time/tempo/style/program 嵌入注入 Transformer，支持 CFG 引导生成 | — |
-| **FC-Attention / 超长序列** | 低 | 突破 4096 max_seq_len | — |
-| **序列并行 / 多卡训练** | 低 | 支持更大模型 | — |
+> Tokenizer 改造、数据迁移、模型架构、训练管线。交付一个可训练的新模型。
+
+| # | 内容 | 设计文档 |
+|---|------|---------|
+| 1 | **词表重构**: 30 Key→12 Tonic, 512 Program→43+4 Voice, +12 Fig, +5 Cadence, 移除 Anticipate/Chord, 929→~400 | ssf + voice + fig + cadence |
+| 2 | **数据迁移**: migrate_to_v4.py ID 重映射, generate_ssf.py .ssf.json 生成, generate_fig.py .fig.json 生成 | ssf + fig |
+| 3 | **模型架构**: +ssf_proj +SSFReconstructionHead +voice_embedding +voice_bias +fig_embedding +cadence_embedding, -chord全家, key_head→12维 | ssf + voice + fig + cadence |
+| 4 | **训练管线**: SSF 重建 loss, 加权 CE 适配, checkpoint 行映射, 纯钢琴数据 | ssf |
+| 5 | **从头训练**: Phase 1 80K MIDI + Phase 2 40K MusicXML | — |
+
+### v0.3.1 — 生成框架重构
+
+> 框架/内容分离：A1 预插入框架 token，模型只填音符内容。
+
+| # | 内容 | 设计文档 |
+|---|------|---------|
+| 1 | **框架预插入**: A1 build_framework() 输出 Bar/Tonic/TimeSig/Tempo/Clef/Section/Voice/Cad/Fig | framework |
+| 2 | **内容槽采样**: Position 后模型只采样 content token, 禁采样框架 token | framework |
+| 3 | **B1 禁令精简**: 570→4 条规则 (音域+平行五度+声部交错+极端跳跃) | framework |
+| 4 | **训练-推理 gap**: 框架 token loss 降权 (×0.1), 不 mask | framework |
+
+### v0.3.2 — 终止式 + 乐句层
+
+> ABC Engine 集成终止式感知和乐句结构。
+
+| # | 内容 | 设计文档 |
+|---|------|---------|
+| 1 | **终止式 zone**: `<Cad PAC>` token 注入, 终止区温区降温, SSF boost | cadence |
+| 2 | **cadence_match 修复**: 从硬编码 0.5 改为实际检测 | cadence |
+| 3 | **PhraseState 集成**: 乐句进度追踪, 终止式趋近 bias, 呼吸点引导 | phrase |
+| 4 | **乐句级温区**: 段级 × 乐句级温度微调 (开头-0.9, 中段-1.0, 终止-0.7) | phrase |
+
+### v0.3.3 — 审计修复 + 打磨
+
+> v0.2.6 审计发现的 14 项 bug 修复 + 清理。
+
+| # | 内容 |
+|---|------|
+| 1 | **训练前必修**: KV cache mismatch, NaN 根因, weight tying 重复参数, bare except 吞错 |
+| 2 | **开发中顺手修**: fast_converter 死循环, DPO merge bug, Section head 维度, EMA 线程安全, 死代码清理 |
+| 3 | **长期跟进**: structure_annotator 质量评估, attention 性能, renderer 增强 |
+
+### 待排期 (v0.3.4+)
+
+| 方向 | 版本 | 说明 |
+|------|------|------|
+| **Voice-Stream Transformer** | v0.4.0 | 声部分流独立架构，共享底层 + 分流上层 + cross-attention |
+| **动机发展执行器** | v0.3.4+ | A2 从 seed 提取核心动机，生成时约束模型引用/变形 |
+| **B2 蓝图驱动升级** | v0.3.4+ | A 给完整 blueprint，B2 主动设定每段理想参数区间 |
+| **MuseScore 插件版** | v0.5.0+ | 轻量版做 MuseScore 插件，一键调用模型续写/生成 |
+| **和声色彩编码** | 搁置 | 先看 SSF 能否隐式学到功能和声 |
+| **P2: 手动 attention 性能优化** | 搁置 | 等 PyTorch 原生 custom bias API |
+| **序列并行 / 多卡训练** | 搁置 | 单卡 48GB 当前够用 |
 
 ### 已完成
 

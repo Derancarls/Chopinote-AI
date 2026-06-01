@@ -13,7 +13,7 @@ NO_SECTION_TYPE_ID: int = 0
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
-    vocab_size: int = 929
+    vocab_size: int = 542                     # v0.3.0: 929 → 542
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 32
@@ -28,44 +28,57 @@ class ModelConfig:
 
     # --- 段落感知（paragraph-aware） ---
     use_section_attention: bool = True
-    n_section_types: int = 22          # 21 section types + padding
-    n_section_bars_classes: int = 128  # 段落持续小节数分类数 (0~128, 90.3%数据≤128)
-    max_sections: int = 64             # 每曲最多 64 个段落实例
-    sec_bias_decay_len: int = 16       # 偏置距离衰减半衰期（小节）
-    sec_bias_alpha_init: float = 0.5   # 同实例偏置
-    sec_bias_beta_init: float = 0.15   # 同类型跨实例偏置
-    sec_bias_gamma_init: float = 0.05  # 跨类型偏置
-    sec_bias_delta_init: float = 0.2   # 边界桥接偏置
+    n_section_types: int = 22
+    n_section_bars_classes: int = 128
+    max_sections: int = 64
+    sec_bias_decay_len: int = 16
+    sec_bias_alpha_init: float = 0.5
+    sec_bias_beta_init: float = 0.15
+    sec_bias_gamma_init: float = 0.05
+    sec_bias_delta_init: float = 0.2
     sec_loss_weight: float = 0.03
-    sec_bars_loss_weight: float = 0.0  # bars_head loss weight (0=disabled, 因 n_section_bars_classes 变动权重已损坏)
-    sec_bias_param_max: float = 2.0   # sec_bias 标量参数上限，防止梯度爆炸
+    sec_bars_loss_weight: float = 0.0
+    sec_bias_param_max: float = 2.0
 
-    # --- 和弦感知（chord-aware / functional harmony） ---
-    use_chord_attention: bool = True
-    n_chord_funcs: int = 17            # 16 功能 + 1 padding
-    n_chord_inversions: int = 5        # 4 转位 (Root/1st/2nd/3rd) + 1 padding
-    chord_gamma_init: float = 0.3      # 同和弦凝聚
-    chord_epsilon_init: float = 0.1    # 切换桥接
-    chord_zeta_init: float = 0.08      # 同功能组弱正偏置
-    chord_decay_len: int = 8           # γ/ζ 衰减半衰期（小节）
-    chord_epsilon_bar_window: int = 2  # ε 作用窗口（小节）
-    chord_loss_weight: float = 0.05
-    chord_bias_param_max: float = 2.0  # chord_bias 标量参数上限，防止梯度爆炸
+    # --- 和弦感知（v0.3.0: 已移除, 由 SSF 替代） ---
+    use_chord_attention: bool = False
+
+    # --- SSF (Sliding Scale Field) 调性编码 ---
+    use_ssf: bool = True
+    ssf_dim: int = 12
+    use_ssf_reconstruction: bool = True
+    ssf_loss_weight: float = 0.1
+    ssf_tonic_weight: float = 1.0
+    ssf_local_weight: float = 0.5
 
     # --- 声部感知（voice-aware） ---
-    use_voice_count: bool = True       # 声部计数嵌入：告诉模型当前 Position 下已生成第几个音
-    n_voices: int = 16                 # 最大同位置声部计数（0-16）
+    use_voice_count: bool = True
+    n_voices: int = 16
+    # v0.3.0 新增: per-voice identity embedding
+    use_voice_identity: bool = True
+    n_voice_ids: int = 5                    # 0=structural, 1-4=Voice 0-3 (SATB)
+    use_voice_bias: bool = True
+    voice_same_init: float = 0.3            # 同声部历史吸引
+    voice_samepos_init: float = 0.1         # 同位置跨声部协调
+
+    # --- 织体感知（figuration） ---
+    use_figuration: bool = True
+    n_fig_types: int = 12
+
+    # --- 终止式感知（cadence） ---
+    use_cadence: bool = True
+    n_cadence_types: int = 6                # 0=none, 1-5=PAC/IAC/HC/DC/PC
 
     # --- QK-Norm（稳定注意力） ---
-    use_qk_norm: bool = True           # Q/K 进入 attention 前做 per-head RMSNorm
-    use_head_scale: bool = True        # 每头可学习 Q/K 缩放（替代空间偏置头特异化）
+    use_qk_norm: bool = True
+    use_head_scale: bool = True
 
     # --- 节内位置感知 ---
-    use_measure_in_section: bool = True  # 小节在段落内的相对位置嵌入
-    max_measures_in_section: int = 32    # 最大节内位置（0-32，32+ clamp）
+    use_measure_in_section: bool = True
+    max_measures_in_section: int = 32
 
     # --- Attention 软上限 ---
-    attn_logit_cap: float = 50.0         # tanh 软上限 (Gemma 风格)，0=禁用
+    attn_logit_cap: float = 50.0
 
     @property
     def head_dim(self) -> int:

@@ -245,19 +245,11 @@ class TransformerBlock(nn.Module):
                  kv_cache: Optional[list] = None,
                  sec_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         # ── 训练路径: 从 raw 数据重建 bias ──────────────
-        # checkpoint 保存的 tuple ~1 MiB, 重建的中间张量在 forward 后释放
         if isinstance(sec_bias, tuple):
-            sec_ids, sec_types, chord_fids, bar_pos, qslice = sec_bias
+            sec_ids, sec_types, bar_pos, qslice = sec_bias
             m = self._model_ref()
             sec_b = m._compute_sec_bias(sec_ids, sec_types, bar_pos, qslice)
-            chord_b = m._compute_chord_bias(
-                chord_fids, bar_pos, sec_b.detach() if sec_b is not None else None, qslice)
-            if sec_b is not None and chord_b is not None:
-                sec_bias = (sec_b + chord_b).detach()
-            elif sec_b is not None:
-                sec_bias = sec_b.detach()
-            else:
-                sec_bias = chord_b.detach()
+            sec_bias = sec_b.detach() if sec_b is not None else None
         x = x + self.attn(self.ln1(x), mask, kv_cache, sec_bias)
         x = x + self.ffn(self.ln2(x))
         return x
@@ -269,30 +261,15 @@ class SectionPredictionHead(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_model = config.d_model
-        # 段落主调预测（30 keys + padding）
-        self.key_head = nn.Linear(config.d_model, 31)
-        # 段落类型预测（22 types + padding）
-        self.type_head = nn.Linear(config.d_model, 23)
+        # 主音预测 (12-dim SSF TonicField regression)
+        self.key_head = nn.Linear(config.d_model, config.ssf_dim)
+        # 段落类型预测
+        self.type_head = nn.Linear(config.d_model, config.n_section_types + 1)
 
     def forward(self, x: torch.Tensor) -> dict:
         return {
             'key': self.key_head(x),
             'type': self.type_head(x),
-        }
-
-
-class ChordPredictionHead(nn.Module):
-    """和弦预测头（功能和声辅助任务）。只返回 logits，loss 在 trainer 中计算。"""
-
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.func_head = nn.Linear(config.d_model, config.n_chord_funcs)       # 16 + 1 padding
-        self.inv_head = nn.Linear(config.d_model, config.n_chord_inversions)   # 4 + 1 padding
-
-    def forward(self, x: torch.Tensor) -> dict:
-        return {
-            'func': self.func_head(x),
-            'inv': self.inv_head(x),
         }
 
 
@@ -309,38 +286,40 @@ class MusicTransformer(nn.Module):
 
         # ── 段落感知组件 ──────────────────────────────────────
         if config.use_section_attention:
-            # section_id = 0 表示无段落，embedding 为零向量
             self.section_embedding = nn.Embedding(config.max_sections + 1, config.d_model)
             self.section_type_embedding = nn.Embedding(config.n_section_types, config.d_model)
-            # 段落偏置可学习参数
             self.sec_bias_alpha = nn.Parameter(torch.tensor(config.sec_bias_alpha_init))
             self.sec_bias_beta = nn.Parameter(torch.tensor(config.sec_bias_beta_init))
             self.sec_bias_gamma = nn.Parameter(torch.tensor(config.sec_bias_gamma_init))
             self.sec_bias_delta = nn.Parameter(torch.tensor(config.sec_bias_delta_init))
             self.register_buffer('sec_bias_decay_len', torch.tensor(config.sec_bias_decay_len, dtype=torch.float))
-            # 段落预测头
             self.section_head = SectionPredictionHead(config)
 
-        # ── 和弦感知组件 ──────────────────────────────────────
-        if config.use_chord_attention:
-            self.chord_embedding = nn.Embedding(config.n_chord_funcs, config.d_model)
-            self.chord_inv_embedding = nn.Embedding(config.n_chord_inversions, config.d_model)
-            # 和弦偏置可学习参数
-            self.chord_bias_gamma = nn.Parameter(torch.tensor(config.chord_gamma_init))
-            self.chord_bias_epsilon = nn.Parameter(torch.tensor(config.chord_epsilon_init))
-            self.chord_bias_zeta = nn.Parameter(torch.tensor(config.chord_zeta_init))
-            self.register_buffer('chord_decay_len',
-                               torch.tensor(config.chord_decay_len, dtype=torch.float))
-            self.register_buffer('chord_epsilon_bar_window',
-                               torch.tensor(config.chord_epsilon_bar_window, dtype=torch.float))
-            # 和弦功能 → 功能组映射 (16 → 3 组: Tonic=0, Subdominant=1, Dominant=2)
-            self._build_chord_group_map()
-            # 和弦预测头
-            self.chord_head = ChordPredictionHead(config)
+        # ── SSF (Sliding Scale Field) 调性编码 ────────────────
+        if config.use_ssf:
+            self.ssf_proj = nn.Linear(config.ssf_dim, config.d_model, bias=False)
+            self.ssf_reconstruction_head = nn.Linear(config.d_model, config.ssf_dim)
 
-        # ── 声部感知组件 ──────────────────────────────────────
+        # ── 声部感知 (voice identity + bias) ──────────────────
+        if config.use_voice_identity:
+            self.voice_embedding = nn.Embedding(config.n_voice_ids, config.d_model)
+            nn.init.zeros_(self.voice_embedding.weight)
+        if config.use_voice_bias:
+            self.voice_same_bonus = nn.Parameter(torch.tensor(config.voice_same_init))
+            self.voice_samepos_bonus = nn.Parameter(torch.tensor(config.voice_samepos_init))
+
         if config.use_voice_count:
             self.voice_count_embedding = nn.Embedding(config.n_voices + 1, config.d_model)
+
+        # ── 织体感知 ──────────────────────────────────────────
+        if config.use_figuration:
+            self.fig_embedding = nn.Embedding(config.n_fig_types, config.d_model)
+            nn.init.zeros_(self.fig_embedding.weight)
+
+        # ── 终止式感知 ────────────────────────────────────────
+        if config.use_cadence:
+            self.cadence_embedding = nn.Embedding(config.n_cadence_types, config.d_model)
+            nn.init.zeros_(self.cadence_embedding.weight)
 
         # ── 节内位置感知 ────────────────────────────────────
         if config.use_measure_in_section:
@@ -357,7 +336,7 @@ class MusicTransformer(nn.Module):
 
         self.token_embedding.weight = self.lm_head.weight
         self._init_weights()
-        self._init_chord_token_sets()
+        self._init_token_maps()
 
     def _init_weights(self):
         for name, p in self.named_parameters():
@@ -466,6 +445,78 @@ class MusicTransformer(nn.Module):
         boundary_mask = left_boundary * near_boundary
 
         return boundary_mask  # (B, T, T)
+
+    # ── v0.3.0: Voice / Fig / Cadence ID builders ──────────────
+
+    def _build_voice_ids(self, input_ids):
+        """从 token 序列追踪当前 Voice: <Voice N> 之后属于声部 N+1。"""
+        B, T = input_ids.shape
+        voice_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+        # Voice token IDs 0-3 → voice embedding indices 1-4
+        for v in range(4):
+            vid = self.voice_token_to_idx.get(v, -1)
+            if vid < 0:
+                continue
+            current = 0
+            for t in range(T):
+                if input_ids[0, t] == vid:
+                    current = v + 1
+                voice_ids[:, t] = current
+        return voice_ids
+
+    def _build_fig_ids(self, input_ids):
+        """从 token 序列追踪当前 Figuration type。"""
+        B, T = input_ids.shape
+        fig_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+        for fid in self.fig_token_ids_set:
+            current = 0
+            for t in range(T):
+                if input_ids[0, t] == fid:
+                    current = fid - min(self.fig_token_ids_set) + 1 if self.fig_token_ids_set else 0
+                fig_ids[:, t] = current
+        return fig_ids
+
+    def _build_cadence_ids(self, input_ids):
+        """从 token 序列追踪当前 Cadence type。"""
+        B, T = input_ids.shape
+        cad_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+        for cid in self.cadence_token_ids_set:
+            current = 0
+            for t in range(T):
+                if input_ids[0, t] == cid:
+                    current = cid - min(self.cadence_token_ids_set) + 1 if self.cadence_token_ids_set else 0
+                cad_ids[:, t] = current
+        return cad_ids
+
+    def _init_token_maps(self):
+        """缓存 token ID 集合, 用于快速查找。"""
+        if self.config.use_voice_identity:
+            self.voice_token_to_idx = {}
+            for v in range(4):
+                t = f'<Voice {v}>'
+                tid = self.tokenizer.encode_token(t) if hasattr(self, 'tokenizer') else -1
+                if tid >= 0:
+                    self.voice_token_to_idx[v] = tid
+        if self.config.use_figuration:
+            self.fig_token_ids_set = set()
+            # Fig tokens are at the end of vocab, find them by prefix
+            for tid in range(self.config.vocab_size):
+                tok = self._id_to_token_safe(tid)
+                if tok.startswith('<Fig '):
+                    self.fig_token_ids_set.add(tid)
+        if self.config.use_cadence:
+            self.cadence_token_ids_set = set()
+            for tid in range(self.config.vocab_size):
+                tok = self._id_to_token_safe(tid)
+                if tok.startswith('<Cad '):
+                    self.cadence_token_ids_set.add(tid)
+
+    def _id_to_token_safe(self, tid):
+        """安全地查找 token ID → string（兼容 tokenizer 可能未初始化）。"""
+        try:
+            return self.tokenizer.decode_token(tid)
+        except Exception:
+            return '<MASK>'
 
     def _build_chord_group_map(self):
         """构建和弦功能 ID → 功能组 ID 映射 (buffer, 不可训练)。
@@ -616,12 +667,10 @@ class MusicTransformer(nn.Module):
                 measure_ids: Optional[torch.Tensor] = None,
                 section_ids: Optional[torch.Tensor] = None,
                 section_types: Optional[torch.Tensor] = None,
-                chord_func_ids: Optional[torch.Tensor] = None,
-                chord_inv_ids: Optional[torch.Tensor] = None,
+                ssf_fields: Optional[torch.Tensor] = None,
                 voice_count_ids: Optional[torch.Tensor] = None,
                 measure_in_section_ids: Optional[torch.Tensor] = None,
-                return_sec_head: bool = False,
-                return_chord_head: bool = False) -> torch.Tensor:
+                return_sec_head: bool = False) -> torch.Tensor:
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, \
             f'序列长度 {T} 超过 max_seq_len {self.config.max_seq_len}'
@@ -681,65 +730,47 @@ class MusicTransformer(nn.Module):
             voice_ids_clamped = voice_count_ids[:, -T:].clamp(0, self.config.n_voices)
             x = x + self.voice_count_embedding(voice_ids_clamped)
 
-        # ── Chord embedding ──────────────────────────────────────
-        chord_bias = None
-        use_chord = self.config.use_chord_attention
-        if use_chord:
-            # 构建 chord_embedding 索引: 0=padding, 1-16=function
-            chord_emb_idx = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
-            for tid, func_idx in self._chord_func_map.items():
-                chord_emb_idx = torch.where(input_ids == tid, func_idx, chord_emb_idx)
-            x = x + self.chord_embedding(chord_emb_idx)
+        # ── SSF conditioning ────────────────────────────────────
+        if self.config.use_ssf and ssf_fields is not None:
+            if ssf_fields.ndim == 2:
+                ssf_fields = ssf_fields.unsqueeze(0)
+            ssf_emb = self.ssf_proj(ssf_fields[:, -T:].to(x.dtype))
+            x = x + ssf_emb
 
-            # 构建 chord_inv_embedding 索引: 0=padding, 1-4=inversion
-            inv_emb_idx = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
-            for tid, inv_idx in self._chord_inv_map.items():
-                inv_emb_idx = torch.where(input_ids == tid, inv_idx, inv_emb_idx)
-            x = x + self.chord_inv_embedding(inv_emb_idx)
+        # ── Voice identity embedding ────────────────────────────
+        if self.config.use_voice_identity:
+            voice_ids = self._build_voice_ids(input_ids[:, -T:])
+            x = x + self.voice_embedding(voice_ids)
 
-            # 计算和弦偏置（仅当有真实和弦标注时）
-            has_chord_data = (chord_func_ids is not None
-                              and chord_func_ids.ndim >= 1
-                              and chord_func_ids.ne(0).any())
-            if has_chord_data:
-                if chord_func_ids.ndim == 1:
-                    chord_func_ids = chord_func_ids.unsqueeze(0)
-                chord_ids_full = chord_func_ids
-                in_kv_decode = kv_caches is not None and len(kv_caches) > 0 and kv_caches[0] is not None and kv_caches[0][0] is not None
-                if in_kv_decode:
-                    chord_bias = self._compute_chord_bias(
-                        chord_ids_full, measure_ids_full, sec_bias, query_slice=T)
-                else:
-                    chord_bias = self._compute_chord_bias(
-                        chord_ids_full[:, -T:], measure_ids_full[:, -T:], sec_bias, query_slice=0)
-                # 合并偏置
-                if sec_bias is not None:
-                    sec_bias = sec_bias + chord_bias
-                else:
-                    sec_bias = chord_bias
+        # ── Figuration embedding ─────────────────────────────────
+        if self.config.use_figuration:
+            fig_ids = self._build_fig_ids(input_ids[:, -T:])
+            x = x + self.fig_embedding(fig_ids)
+
+        # ── Cadence embedding ────────────────────────────────────
+        if self.config.use_cadence:
+            cadence_ids = self._build_cadence_ids(input_ids[:, -T:])
+            x = x + self.cadence_embedding(cadence_ids)
 
         x = self.dropout(x)
 
-        # ── 构建 bias 原始数据 tuple（训练时替代 256 MiB 成品 bias）──
-        # checkpoint 存 ~1 MiB raw tensors 而非 256 MiB → 24 层省 6 GiB
+        # ── bias_data for checkpoint recompute ──────────────────
         in_kv_decode = (kv_caches is not None and len(kv_caches) > 0
                        and kv_caches[0] is not None and kv_caches[0][0] is not None)
         bias_data = None
-        if use_sec or (use_chord and has_chord_data):
+        if use_sec:
             zeros2d = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
             if in_kv_decode:
                 bias_data = (
                     section_ids_full if use_sec else zeros2d,
                     section_types_full if use_sec else zeros2d,
-                    chord_ids_full if (use_chord and has_chord_data) else zeros2d,
                     measure_ids_full,
-                    T,  # query_slice: 只取最后 T 个 query 行
+                    T,
                 )
             else:
                 bias_data = (
                     section_ids_full[:, -T:] if use_sec else zeros2d,
                     section_types_full[:, -T:] if use_sec else zeros2d,
-                    chord_ids_full[:, -T:] if (use_chord and has_chord_data) else zeros2d,
                     measure_ids_full[:, -T:],
                     0,   # query_slice: 取全部 query 行
                 )
@@ -752,16 +783,10 @@ class MusicTransformer(nn.Module):
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
-        # ── 段落/和弦预测头（多任务训练）───────────────────────
-        if return_chord_head and use_chord and chord_func_ids is not None:
-            chord_head_logits = self.chord_head(x)
-            if return_sec_head and use_sec:
-                sec_head_logits = self.section_head(x)
-                return logits, sec_head_logits, chord_head_logits
-            return logits, chord_head_logits
-
+        # ── SSF reconstruction + Section head ─────────────────────
+        result = [logits]
         if return_sec_head and use_sec:
-            sec_head_logits = self.section_head(x)
-            return logits, sec_head_logits
-
-        return logits
+            result.append(self.section_head(x))
+        if self.config.use_ssf and self.config.use_ssf_reconstruction:
+            result.append(self.ssf_reconstruction_head(x))
+        return result[0] if len(result) == 1 else tuple(result)
