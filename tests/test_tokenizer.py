@@ -56,9 +56,9 @@ class TestEncodeDecodeRoundtrip:
                 t_sub = f'<Program {p}_{sub}>'
                 assert tokenizer.decode_token(tokenizer.encode_token(t_sub)) == t_sub
 
-    def test_key(self, tokenizer):
-        for k in ['C', 'Am', 'F#', 'Bb', 'Ebm']:
-            t = f'<Key {k}>'
+    def test_tonic(self, tokenizer):
+        for k in ['C', 'F#', 'A', 'A#', 'D#']:
+            t = f'<Tonic {k}>'
             assert tokenizer.decode_token(tokenizer.encode_token(t)) == t
 
     def test_tempo(self, tokenizer):

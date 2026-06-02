@@ -763,8 +763,8 @@ class Trainer:
                     else:
                         run_len = 1
 
-        # ── 和弦上限过滤：同 Position > max 个 note → mask 整 bar ─
-        if note_type_idx >= 0 and cfg.max_chord_notes_per_position > 0:
+        # ── 音符密度过滤：同 Position > max 个 note → mask 整 bar ─
+        if note_type_idx >= 0 and cfg.max_notes_per_position > 0:
             note_ids_flat = input_ids.view(-1)
             for b in range(B):
                 bar_start = 0
@@ -782,13 +782,13 @@ class Trainer:
                     elif ltype == note_type_idx and current_pos >= 0:
                         cnt = pos_note_counts.get(current_pos, 0) + 1
                         pos_note_counts[current_pos] = cnt
-                # Mask bars where any position has > max_chord_notes_per_position notes
+                # Mask bars where any position has > max_notes_per_position notes
                 bar_boundaries.append(T)  # end marker
                 for i in range(len(bar_boundaries) - 1):
                     b_start = bar_boundaries[i]
                     b_end = bar_boundaries[i + 1]
                     too_dense = any(
-                        pos >= b_start and pos < b_end and cnt > cfg.max_chord_notes_per_position
+                        pos >= b_start and pos < b_end and cnt > cfg.max_notes_per_position
                         for pos, cnt in pos_note_counts.items()
                     )
                     if too_dense:
@@ -798,7 +798,7 @@ class Trainer:
                         if i == 0 and (b_end - b_start) > 0:
                             logger.debug(
                                 f'{prefix}B{b} bar {i}: masked '
-                                f'(>={cfg.max_chord_notes_per_position} chord notes)')
+                                f'(>={cfg.max_notes_per_position} notes/pos)')
 
         per_token = per_token * weights
         n_valid = (valid_mask & (weights > 0)).sum()

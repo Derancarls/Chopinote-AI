@@ -123,7 +123,7 @@ class Config:
             if field.name == 'target_key' and isinstance(val, str):
                 from chopinote_dataset.tokenizer import REMITokenizer
 
-                if val not in REMITokenizer.KEY_NAMES:
+                if val not in REMITokenizer.TONIC_NAMES:
                     errors.append(
                         f'target_key: "{val}" 不是有效调性'
                     )

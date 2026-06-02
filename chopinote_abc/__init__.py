@@ -4,8 +4,9 @@ A1DB: 框架库（结构 + 和声 + 运行时覆盖）
 A2DB: 动机摘要库（提纯 token + MotifDNA）
 A3DB: 统计库（每 bar 实时统计 + 段快照 + 基线 + 创新日志）
 
-Phase 2: 和声回退 + C→A1 闭环 + 创新预算 + 发展配方 + 新颖性加分
-Phase 3: 吸收 chopinote_evaluator/ — metrics + constraints + scoring + parser
+B1: 硬约束（声部音域、平行禁止、时值溢出、音符密度）
+B2: 调参（温区退火、创新预算、致命信号检测）
+C:  进化（MusicXML 审查、Token↔XML 对比、DPO 偏好学习）
 """
 
 from .database import (

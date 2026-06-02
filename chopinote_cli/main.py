@@ -162,8 +162,8 @@ def _extract_intro_info(tokens: list[int], tokenizer: REMITokenizer) -> dict:
     info = {}
     for tid in tokens[:40]:
         token = tokenizer.decode_token(tid)
-        if token.startswith(REMITokenizer.KEY):
-            info['key'] = token[len(REMITokenizer.KEY) + 1:-1]
+        if token.startswith(REMITokenizer.TONIC):
+            info['key'] = token[len(REMITokenizer.TONIC) + 1:-1]
         elif token.startswith(REMITokenizer.TIMESIG):
             info['time_sig'] = token[len(REMITokenizer.TIMESIG) + 1:-1]
         elif token.startswith(REMITokenizer.TEMPO):
@@ -404,7 +404,7 @@ def generate_with_progress(
     _lock_ids = []
     if lock_key:
         _lock_ids.extend(
-            tokenizer.encode_token(f'<Key {k}>') for k in REMITokenizer.KEY_NAMES
+            tokenizer.encode_token(f'{tokenizer.TONIC} {k}>') for k in REMITokenizer.TONIC_NAMES
         )
     if lock_time:
         _lock_ids.extend(
@@ -619,7 +619,7 @@ def generate_with_progress(
                     )
             # ────────────────────────────────────────────────
 
-            # ── B 阶段反馈（每小节结束后调整参数） ──────
+            # ── ABC Engine B 层干预（每小节后调参） ──────
             if feedback_callback is not None and gen_params is not None:
                 full_list = generated[0].tolist()
                 adjustments = feedback_callback(full_list, bar_count, gen_params)
@@ -1047,7 +1047,7 @@ def interactive_retry_loop(model, tokenizer, seed_tensor, device,
 # -- 评价模式 ----------------------------------------------------
 
 def _run_evaluate(args):
-    """评价模式入口：对输入乐谱做广义/狭义评价。"""
+    """评价模式入口：对输入乐谱做内在/一致性评价（C 层）。"""
     from chopinote_abc.scoring import evaluate_generation
     from chopinote_abc.parser import parse_musicxml
 
@@ -1076,7 +1076,7 @@ def _run_evaluate(args):
 
     print(f'  综合评分: {report.total_score:.4f}')
     print(f'  合法性: {"通过" if report.legality_passed else "失败"}')
-    print(f'  广义分: {report.general_score:.4f}')
+    print(f'  内在分: {report.intrinsic_score:.4f}')
     print(f'  理论违规: {report.theory.get("n_violations", 0)}')
 
     # JSON 输出
@@ -1086,7 +1086,7 @@ def _run_evaluate(args):
             json.dump({
                 'total_score': report.total_score,
                 'legality_passed': report.legality_passed,
-                'general_score': report.general_score,
+                'intrinsic_score': report.intrinsic_score,
                 'theory': report.theory,
             }, f, indent=2, ensure_ascii=False)
         print()
@@ -1124,8 +1124,8 @@ def _parse_structure_tokens(structure_tokens: list[int], tokenizer) -> list[dict
                 current_bars = 8  # reset to default
                 break
 
-        if ts.startswith('<Key '):
-            current_key = ts[len('<Key') + 1:-1]
+        if ts.startswith(tokenizer.TONIC):
+            current_key = ts[len(tokenizer.TONIC) + 1:-1]
         elif ts.startswith('<Bar_'):
             try:
                 current_bars = int(ts[len('<Bar_'):-1])
@@ -1314,21 +1314,21 @@ def main():
     parser.add_argument('--feedback-level',
                         choices=['off', 'light', 'normal', 'strict'],
                         default='normal',
-                        help='反馈强度: off=纯推理 light=A+C normal=A+B+C(默认) strict=A+B+C+自动重试')
+                        help='ABC 引擎强度: off=纯推理 light=A+C normal=A+B+C(默认) strict=A+B+C+自动重试')
     parser.add_argument('--feedback', action='store_true',
-                        help='[已弃用] 反馈现在默认启用，请使用 --no-feedback 关闭或 --feedback-level 调整')
+                        help='[已弃用] ABC Engine 现在默认启用，请使用 --no-feedback 关闭或 --feedback-level 调整')
     parser.add_argument('--local-weight', type=float, default=0.5,
-                        help='B1 局部反馈权重 (0~1, 默认 0.5)')
+                        help='B1 硬约束权重 (0~1, 默认 0.5)')
     parser.add_argument('--global-weight', type=float, default=0.5,
-                        help='B2 全局反馈权重 (0~1, 默认 0.5)')
+                        help='B2 调参权重 (0~1, 默认 0.5)')
     parser.add_argument('--retry-threshold', type=float, default=0.55,
-                        help='C 阶段重试阈值 (0~1, 低于此值重试, 默认 0.55)')
+                        help='C 层重试阈值 (0~1, 低于此值重试, 默认 0.55)')
     parser.add_argument('--max-retries', type=int, default=3,
-                        help='C 阶段最大重试次数 (默认 3)')
+                        help='C 层最大重试次数 (默认 3)')
     parser.add_argument('--seed-path', type=str, default=None,
                         help='种子乐谱文件路径（续写场景评价）')
     parser.add_argument('--alpha', type=float, default=0.3,
-                        help='场景权重 0~1（1=纯广义评价，0.3=续写评价）')
+                        help='场景权重 0~1（1=纯内在评价，0.3=续写评价）')
     parser.add_argument('--group', type=str, default='all',
                         help='对比基准组名（all, timesig_4_4, source_musescore 等）')
     args = parser.parse_args()
@@ -1537,7 +1537,7 @@ def main():
         conds['tempo'] = args.condition_tempo
 
     if 'key' in conds:
-        condition_tokens.append(tokenizer.encode_token(f'<Key {conds["key"]}>'))
+        condition_tokens.append(tokenizer.encode_token(f'{tokenizer.TONIC} {conds["key"]}>'))
         condition_labels.append(f'调性 {conds["key"]}')
     if 'time' in conds:
         condition_tokens.append(tokenizer.encode_token(f'<TimeSig {conds["time"]}>'))
@@ -1554,15 +1554,15 @@ def main():
         print(f'      [条件] {" | ".join(condition_labels)}')
     # ────────────────────────────────────────────────────
 
-    # ── 目标调性（Anticipate token）─────────────────────
+    # ── 目标调性（v0.3.0: 通过 Tonic token 置于 prefix）─────
     if args.target_key:
-        if args.target_key in REMITokenizer.KEY_NAMES:
-            anticipate_tid = tokenizer.encode_token(f'<Anticipate {args.target_key}>')
-            if anticipate_tid < model_vocab_size:
-                seed_tokens.append(anticipate_tid)
-                print(f'      [Anticipate] 目标调性 {args.target_key}')
+        if args.target_key in REMITokenizer.TONIC_NAMES:
+            tonic_tid = tokenizer.encode_token(f'{tokenizer.TONIC} {args.target_key}>')
+            if tonic_tid < model_vocab_size:
+                seed_tokens.append(tonic_tid)
+                print(f'      [Tonic] 目标调性 {args.target_key}')
             else:
-                print(f'  [!] Anticipate token 超出模型词表 (vocab_size={model_vocab_size})，忽略')
+                print(f'  [!] Tonic token 超出模型词表 (vocab_size={model_vocab_size})，忽略')
         else:
             print(f'  [!] 无效目标调性: {args.target_key}，忽略')
     # ────────────────────────────────────────────────────
@@ -1615,11 +1615,11 @@ def main():
                          save_tokens=True)
         print(f'  [✓] 已保存: {output_path}')
 
-        # ── C 阶段：生成后评价 ──
+        # ── C 层：进化评价 ──
         novelty = abc_report.get('novelty_score', 0.0) if abc_report else 0.0
         diversity = abc_report.get('diversity_score', 0.0) if abc_report else 0.0
 
-        print(f'  [C 阶段] 评价: {os.path.basename(output_path)}')
+        print(f'  [C 层] 评价: {os.path.basename(output_path)}')
         try:
             eval_report = evaluate_generation(
                 all_tokens, tokenizer,
@@ -1632,7 +1632,7 @@ def main():
             )
             print(f'      | 综合评分: {eval_report.total_score:.4f} | '
                   f'合法性: {"通过" if eval_report.legality_passed else "失败"}')
-            print(f'      | 广义分: {eval_report.general_score:.4f} | '
+            print(f'      | 内在分: {eval_report.intrinsic_score:.4f} | '
                   f'理论违规: {eval_report.theory.get("n_violations", 0)}')
 
             if eval_report.structural_fixes:

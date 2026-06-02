@@ -1,7 +1,7 @@
-"""B 规则后端 — 从 chopinote_evaluator/general/ 移植的音乐理论规则。
+"""B1 硬约束后端 — 音乐理论规则。
 
 分为两层:
-  - Token 级: 生成时实时检查（B 层使用），不依赖 MusicXML 解析
+  - Token 级: 生成时实时检查（B1 层使用），不依赖 MusicXML 解析
   - Score 级: 生成后完整评估（C 层使用），依赖 parser.py 的 Score 对象
 """
 

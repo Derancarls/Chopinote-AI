@@ -1,4 +1,4 @@
-"""A2 动机提取 — Phase 1 纯规则驱动，零模型依赖。
+"""A2 动机提取 — 纯规则驱动，零模型依赖。
 
 提供:
   identify_landmarks()   → 从 A3 bar_log 选地标 bar
@@ -118,7 +118,7 @@ def extract_dna(tokens: list[int], tokenizer,
     _PREFIX_NOTE = tokenizer.NOTE_ON
     _PREFIX_DUR = tokenizer.DURATION
     _PREFIX_POS = tokenizer.POSITION
-    _PREFIX_CHORD = tokenizer.CHORD
+    _PREFIX_TONIC = tokenizer.TONIC  # v0.3.0: Tonic 替代 Chord 作和声上下文化理
 
     for i, tid in enumerate(tokens):
         ts = tokenizer.decode_token(tid)
@@ -151,13 +151,13 @@ def extract_dna(tokens: list[int], tokenizer,
             # Position 0 = 强拍
             strong_beats.append(pos == 0)
 
-        elif ts.startswith(_PREFIX_CHORD):
+        elif ts.startswith(_PREFIX_TONIC):
             try:
-                func_name = ts.split(' ')[1].rstrip('>')
+                tonic_name = ts.split(' ')[1].rstrip('>')
             except IndexError:
-                func_name = ''
-            # 简化：用 hash 映射到 int
-            current_chord = hash(func_name) % 1000 if func_name else 0
+                tonic_name = 'C'
+            # 用 tonic_name → tonic_id (0-11) 作和声上下文
+            current_chord = hash(tonic_name) % 1000 if tonic_name else 0
 
     # contour: 相邻 Note_ON 的半音差
     if len(note_pitches) >= 2:

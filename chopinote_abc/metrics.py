@@ -1,13 +1,12 @@
 """A3 统计后端 — 45+ token 级音乐指标。
 
-从 chopinote_evaluator/registry.py 移植，作为 ABC Engine A3 层的计算核心。
-每个指标是纯函数: (tokens, tokenizer, **kwargs) -> float，返回 0~1 分数（1=最好）。
+ABC Engine A3 层的计算核心 — 每个指标是纯函数: (tokens, tokenizer, **kwargs) -> float，返回 0~1 分数（1=最好）。
 
-阶段标识（仅供参考，实际调用由 A3/B/C 各自决定）:
-    A  = 生成前 seed 评估
-    B1 = 生成中局部（最近 N 节流畅性）
-    B2 = 生成中全局（窗口 vs seed 基线）
-    C  = 生成后全量评价
+ABC Engine 层归属标识（实际调用由各层自行调度）:
+    A3 = 生成前 seed 评估 + 生成中统计分析
+    B1 = 硬约束监测（密度、同度、休止链）
+    B2 = 趋势检测（窗口 vs seed 基线漂移）
+    C  = 生成后全量评价 + 进化触发
 """
 
 from __future__ import annotations
@@ -348,7 +347,7 @@ def empty_measure_check(tokens: list[int], tokenizer) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  B1 局部专用指标
+#  B1 硬约束指标（密度/同度/休止链/单节奏/极密度）
 # ═══════════════════════════════════════════════════════════════
 
 def unison_chain_check(tokens: list[int], tokenizer) -> float:
@@ -802,7 +801,7 @@ METRIC_FUNCTIONS: dict[str, Callable] = {
     # 合法性
     'pitch_range': pitch_range_check,
     'empty_measure': empty_measure_check,
-    # B1 局部
+    # B1 硬约束
     'unison_chain': unison_chain_check,
     'rest_streak': rest_streak_check,
     'mono_rhythm': mono_rhythm_check,

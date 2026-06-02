@@ -1,8 +1,12 @@
-"""C 评分后端 — 吸收 chopinote_evaluator/score.py + specific/* 的评分逻辑。
+"""C 层评分后端 — intrinsic（内在）+ consistency（一致性）双维度评价。
 
 提供统一的生成后评价入口:
   - evaluate_generation(): 完整评分（合法性 + 统计 + 理论 + 一致性 + 连贯性）
   - 支持 token 级指标（metrics.py）和 Score 级规则（constraints.py）
+
+ABC Engine C 层评分维度:
+  - intrinsic_score  (内在评分): 生成乐谱自身质量 — token 指标 + 理论规则
+  - consistency_score (一致性评分): 与 seed 的匹配度 — 仅续写场景有值
 """
 
 from __future__ import annotations
@@ -24,8 +28,8 @@ class EvalReport:
     alpha: float = 0.3
     legality_passed: bool = True
     legality_issues: int = 0
-    general_score: float = 0.0
-    specific_score: float = 0.0
+    intrinsic_score: float = 0.0    # 内在评分：乐谱自身质量（不依赖 seed）
+    consistency_score: float = 0.0  # 一致性评分：与 seed 的匹配度（仅续写场景）
     token_metrics: dict = field(default_factory=dict)
     theory: dict = field(default_factory=dict)
     structural_fixes: list = field(default_factory=list)
@@ -107,28 +111,28 @@ def evaluate_generation(
         report.theory = evaluate_theory(score_obj)
         theory_score = report.theory.get('score', 0.0)
 
-        # 广义评分: token 指标 + 理论
-        report.general_score = token_mean * 0.6 + theory_score * 0.4
+        # 内在评分: token 指标 + 理论
+        report.intrinsic_score = token_mean * 0.6 + theory_score * 0.4
 
-        # 狭义评分（有种子时）
+        # 一致性评分（有种子时）
         if seed_tokens is not None:
             try:
-                specific = _evaluate_specific(score_obj, seed_tokens, tokenizer)
-                report.specific_score = specific.get('score', 0.0)
+                consistency = _evaluate_specific(score_obj, seed_tokens, tokenizer)
+                report.consistency_score = consistency.get('score', 0.0)
             except Exception:
-                report.specific_score = 0.0
+                report.consistency_score = 0.0
     else:
         # 无 MusicXML — 仅 token 级指标
-        report.general_score = token_mean
+        report.intrinsic_score = token_mean
 
     # ── 3. 综合打分 ──
-    general = report.general_score
-    specific = report.specific_score
+    intrinsic = report.intrinsic_score
+    consistency = report.consistency_score
 
-    if specific > 0:
-        total = general * alpha + specific * (1 - alpha)
+    if consistency > 0:
+        total = intrinsic * alpha + consistency * (1 - alpha)
     else:
-        total = general
+        total = intrinsic
 
     # 加上创新/多样性加成（最多 +0.1）
     total = min(1.0, total + novelty_bonus * 0.03 + diversity_bonus * 0.02)
@@ -187,7 +191,7 @@ def _check_legality(score: Score) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  狭义评价 — 一致性 + 连贯性（简化版）
+#  一致性评价 — 对比生成与种子的关键特征（C 层 seed-relative）
 # ═══════════════════════════════════════════════════════════════
 
 # ── Cadence 相似度矩阵 ──────────────────────────────
@@ -256,7 +260,7 @@ def _compute_cadence_match(target: str | None,
 
 def _evaluate_specific(score: Score, seed_tokens: list[int],
                        tokenizer) -> dict[str, float]:
-    """简化版狭义评价 — 对比生成与种子的关键特征。
+    """一致性评价 — 对比生成与种子的关键特征。
 
     从 seed_tokens 计算参考分布，再评估 Score 与参考的一致性。
     """

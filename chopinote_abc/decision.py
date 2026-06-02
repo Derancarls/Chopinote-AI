@@ -1,4 +1,4 @@
-"""B 决策层硬约束 + 温区退火 + 创新预算 + 发展配方 — Phase 2 完整实现。
+"""B 决策层 — 硬约束 + 温区退火 + 创新预算 + 发展配方。
 
 提供:
   BHardBans — B 的硬约束 token 屏蔽
@@ -379,7 +379,7 @@ def _compute_deviation_surprise(
     bar_stats,
     baselines: dict,
 ) -> float:
-    """Phase 1 创新判定：用 A3 统计量近似"意外度"。
+    """创新判定：用 A3 统计量近似"意外度"。
 
     意外度 ≈ KL(token_type_dist || baseline) / max_kl
     纯统计计算，不需要模型 forward。

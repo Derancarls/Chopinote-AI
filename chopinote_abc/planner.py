@@ -63,12 +63,12 @@ def plan_structure(seed_tokens: list[int], tokenizer,
         bar_id = tokenizer.bar_token_id
         seed_bar_count = sum(1 for t in seed_tokens if t == bar_id)
 
-    # 2. 检测 seed 的调性（取最后一个 Key token）
+    # 2. 检测 seed 的调性（取最后一个 Tonic token，v0.3.0 废弃 Key）
     seed_key = 'C'
     for tid in reversed(seed_tokens):
         ts = tokenizer.decode_token(tid)
-        if ts.startswith('<Key ') and ts.endswith('>'):
-            seed_key = ts[5:-1]
+        if ts.startswith(tokenizer.TONIC) and ts.endswith('>'):
+            seed_key = ts[len(tokenizer.TONIC) + 1:-1]
             break
 
     # 3. 计算需要生成的小节数

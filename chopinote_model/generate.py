@@ -1,4 +1,10 @@
-"""推理生成模块：自回归采样 → MusicXML 导出。"""
+"""推理生成模块：自回归采样 → MusicXML 导出。
+
+.. deprecated::
+    v0.2.x 架构残留，v0.3.1 将被完全重写为框架-内容分离架构。
+    包含已废弃的 KEY/CHORD/ANTICIPATE token 引用，当前仅作参考。
+    请勿直接使用此模块的 v0.2.x 生成逻辑。
+"""
 from __future__ import annotations
 
 import logging
@@ -18,7 +24,7 @@ from chopinote_dataset.tokenizer import REMITokenizer, key_name_to_tonic_midi
 
 @dataclass
 class SeedProfile:
-    """A 阶段输出：seed 的结构画像。"""
+    """A1 感知输出：seed 的结构画像（⚠ deprecated, v0.3.1 重写）。"""
     n_bars: int
     bar_density: float
     tonic_key: str | None = None

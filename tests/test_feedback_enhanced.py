@@ -1,6 +1,5 @@
-"""ABC Engine v2 测试：A3 指标 + B 决策 + C 评分。
+"""ABC Engine v2 回归测试：A3 指标 + B 决策 + C 评分。
 
-从 chopinote_evaluator 迁移到 chopinote_abc 后的回归测试。
 不需要 GPU，所有测试基于合成 token 序列和 rule-based 逻辑。
 """
 import pytest

@@ -45,8 +45,8 @@ class TestTokenizerSmoke:
             '<Hairpin cresc>', '<Artic staccato>', '<Ornament trill>',
             '<Pedal start>', '<Slur start>', '<Rest>', '<GraceNote acciaccatura>',
             '<Repeat start>', '<Jump dal_segno>', '<Tempo 120>',
-            '<TupletStart 3:2>', '<TupletEnd>', '<TimeSig 4/4>', '<Key C>', '<Beat 1>',
-            '<Octave 8va>', '<Arpeggio>', '<Bass 0>', '<Anticipate C>',
+            '<TupletStart 3:2>', '<TupletEnd>', '<TimeSig 4/4>', '<Tonic C>', '<Beat 1>',
+            '<Octave 8va>', '<Arpeggio>', '<Bass 0>',
         ]
         for token_str in samples:
             tid = tokenizer.encode_token(token_str)
@@ -195,8 +195,7 @@ class TestModelSmoke:
 
     CONFIG_KWARGS = dict(d_model=128, n_heads=2, n_layers=2, d_ff=512,
                          vocab_size=100, max_seq_len=64,
-                         use_section_attention=False,
-                         use_chord_attention=False)
+                         use_section_attention=False)
 
     def _make_model(self):
         from chopinote_model.model import MusicTransformer
@@ -417,8 +416,7 @@ class TestFP8Smoke:
 
         config = ModelConfig(d_model=128, n_heads=2, n_layers=2, d_ff=512,
                              vocab_size=100, max_seq_len=64,
-                             use_section_attention=False,
-                             use_chord_attention=False)
+                             use_section_attention=False)
         model = MusicTransformer(config).cuda()
         model.eval()
         model.set_fp8_mode(True)

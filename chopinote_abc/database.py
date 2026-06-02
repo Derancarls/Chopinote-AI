@@ -168,8 +168,8 @@ class A1DB:
             type_token = f'<Section {sec.type}>'
             tid = tokenizer.encode_token(type_token)
             tokens.append(tid)
-            key_token = f'<Key {sec.key}>'
-            kid = tokenizer.encode_token(key_token)
+            tonic_token = f'{tokenizer.TONIC} {sec.key}>'
+            kid = tokenizer.encode_token(tonic_token)
             tokens.append(kid)
         # <SecSum> 收尾
         secsum_tid = tokenizer.encode_token('<SecSum>')

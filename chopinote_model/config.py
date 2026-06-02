@@ -40,9 +40,6 @@ class ModelConfig:
     sec_bars_loss_weight: float = 0.0
     sec_bias_param_max: float = 2.0
 
-    # --- 和弦感知（v0.3.0: 已移除, 由 SSF 替代） ---
-    use_chord_attention: bool = False
-
     # --- SSF (Sliding Scale Field) 调性编码 ---
     use_ssf: bool = True
     ssf_dim: int = 12
@@ -140,7 +137,6 @@ class TokenLossMask:
     mask_jump: bool = True
     mask_tuplet: bool = True
     mask_bass: bool = False
-    mask_anticipate: bool = False
 
     def get_masked_token_ids(self, tokenizer) -> Set[int]:
         """预计算需要屏蔽的 token ID 集合。"""
@@ -160,7 +156,6 @@ class TokenLossMask:
             'mask_jump': REMITokenizer.JUMP,
             'mask_tuplet': REMITokenizer.TUPLET_START,
             'mask_bass': REMITokenizer.BASS,
-            'mask_anticipate': REMITokenizer.ANTICIPATE,
         }
         masked_ids: Set[int] = set()
         for attr, prefix in prefix_map.items():
@@ -209,10 +204,9 @@ class TrainingConfig:
     eval_steps: int = 1000
     max_eval_batches: int = 100  # 限制验证批次数，100 batch × 8 = 800 样本，~6min
     # ── Token 级 loss 加权 ──
-    chord_token_loss_weight: float = 0.5       # chord token 预测 loss 乘数（降权抑制和弦爆炸）
     position_token_loss_weight: float = 2.0    # Position token 预测 loss 乘数（提权强调换位）
     repetition_penalty: float = 1.2            # 连续 ≥4 同类型 token 的 loss 乘数
-    max_chord_notes_per_position: int = 8      # 训练时同 Position 和弦音 > 此值 → mask 该 bar
+    max_notes_per_position: int = 8            # 训练时同 Position 音符数 > 此值 → mask 该 bar
     # ── 训练稳定化 ──
     z_loss_weight: float = 1e-4                # Z-loss 权重（压制 logit 漂移），0=禁用
     ema_beta: float = 0.999                    # 权重 EMA 衰减率，0=禁用
