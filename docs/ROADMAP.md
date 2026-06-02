@@ -588,7 +588,7 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | # | 内容 | 状态 |
 |---|------|------|
-| 1 | **Converter 四声部拆分**: `split_piano_hands_to_four_voices()` — 右手高音→Voice0(主), 其余→Voice1(次); 左手低音→Voice3(主), 其余→Voice2(次); 单音不拆分 | ❌ |
+| 1 | **Converter 四声部拆分**: `_voice_split_piano()` — converter.py + fast_converter.py, 右手高音→Voice0(主), 其余→Voice1(次); 左手低音→Voice3(主), 其余→Voice2(次); 单音不拆分 | ✅ |
 | 2 | **非钢琴数据映射**: 弦乐四重奏 1:1, 钢琴三重奏 Pno→V0/V3, 管弦按音区归类 | ❌ |
 | 3 | **数据重转换**: 全部 1.62M 文件用新 converter 重新生成 tokens_v4 | ❌ |
 | 4 | **验证**: 抽样 100 首检查 Voice 分布、和弦密集处四声部全活跃、单音处仅主轨 | ❌ |
@@ -599,15 +599,15 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | # | 内容 | 状态 |
 |---|------|------|
-| 1 | **classify_complexity.py**: 扫全部 tokens，F1-F5 质量过滤 | ❌ |
-| 2 | **F1 调性清晰度**: TonicField peakiness < 1.3 → 丢弃 (~3-5%) | ❌ |
-| 3 | **F2 调性稳定性**: 主音变化率 > 0.5/bar → 丢弃 (~1-2%) | ❌ |
-| 4 | **F3 结构合理性**: 无音符/note:dur 偏差>30%/bar 密度极端 → 丢弃 (~2-3%) | ❌ |
-| 5 | **F4 长度异常**: <50 或 >16384 tokens → 丢弃 (~1-2%) | ❌ |
-| 6 | **F5 Duration 越界**: >5% 事件越界 → 丢弃 (~1-2%) | ❌ |
-| 7 | **四指标自动分类**: Texture(1-3) + Structure(1-5) + Rhythm(1-3) + Instr(1-4) | ❌ |
-| 8 | **五级分类 + 训练集拆分**: train_L1~L5.txt, val_L1~L5.txt | ❌ |
-| 9 | **验证**: 抽样 500 个文件人工检查指标合理性 | ❌ |
+| 1 | **classify_complexity.py** (734行): F1-F5 质量过滤 + 四指标分类 + 五级训练集拆分, ID范围直接扫描免 tokenizer 逐 token 查表 | ✅ |
+| 2 | **F1 调性清晰度**: TonicField peakiness < 1.3 → 丢弃 (~3-5%) | ✅ |
+| 3 | **F2 调性稳定性**: 主音变化率 > 0.5/bar → 丢弃 (~1-2%) | ✅ |
+| 4 | **F3 结构合理性**: 无音符/note:dur 偏差>30%/bar 密度极端 → 丢弃 (~2-3%) | ✅ |
+| 5 | **F4 长度异常**: <50 或 >16384 tokens → 丢弃 (~1-2%) | ✅ |
+| 6 | **F5 Duration 越界**: >5% 事件越界 → 丢弃 (~1-2%) | ✅ |
+| 7 | **四指标自动分类**: Texture(1-3) + Structure(1-5) + Rhythm(1-3) + Instr(1-4) | ✅ |
+| 8 | **五级分类 + 训练集拆分**: `classify` + `split` 子命令, train_L1~L5.txt, val_L1~L5.txt | ✅ |
+| 9 | **验证**: dry-run 抽样 + 人工检查指标合理性 (待数据重转换后执行) | ❌ |
 
 ---
 
