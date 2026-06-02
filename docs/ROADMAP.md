@@ -3,9 +3,7 @@
 > 已实现功能按版本号记录。Y 增量为大版本（架构/能力升级），Z 增量为小版本（优化/修复）。
 > 每个版本对应的已知问题见 `known_issues_<version>.md`。
 >
-> **当前训练状态**：Phase 1 预训练中（2026-05-31，step 50000 恢复，当前 step ~51000+/166000，bs=8, grad_accum=2, effective_bs=16）
-> train loss ~0.67, ~5.8s/step, GPU RTX 4090 48GB, VRAM 22.7G
-> Phase 2 微调 50k steps 待启动
+> **当前状态 (2026-06-02)**：v0.2.x 训练已放弃 (step ~51000/166000)。v0.3.x 全部设计方案完成 (11 篇)，代码部分实现 (词表/模型/SSF/Voice/Fig)，数据管线/时值饱和度/终止式感知/框架分离/乐句层/课程训练待实现。全设计一次到位后启动从头训练。
 
 ---
 
@@ -573,64 +571,191 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 ## 规划中
 
-### v0.3.0 — SSF 统一编码 + 多轨 + 训练
+> 以下按依赖顺序排列。**所有设计在训练启动前一次实现到位**，不设中间版本训练。
+> 当前阶段：设计完成 → 代码实现 → 数据重处理 → 从头训练。
 
-> Tokenizer 改造、数据迁移、模型架构、训练管线。交付一个可训练的新模型。
-> Commits: `v0.3.0-ssf1` (架构) `v0.3.0-ssf2` (标注+适配)
+---
+
+### 第一阶段：数据管线 + 模型信号（v0.3.1）
+
+> 依赖链：Voice Splitting → Data Filtering → Classification → 训练集拆分。
+> 同时补齐模型侧两个新信号注入层（DurSat + Cadence），与数据管线并行。
+> 产出：四声部 SATB tokens + 清洗后的五级分级训练集 + 完整模型架构。
+
+#### v0.3.1-data1 — 声部拆分（Converter 改造）
+
+> 设计文档: `docs/voice_splitting_v0.3.x.md`
 
 | # | 内容 | 状态 |
 |---|------|------|
-| 1 | **词表重构**: 30 Key→12 Tonic, 512 Program→43+4 Voice, +12 Fig, +5 Cadence, 移除 Anticipate/Chord, 929→542 | ✅ |
-| 2 | **数据迁移**: migrate_to_v4.py (ID重映射+降号调修复), generate_ssf.py (SSF标注), generate_fig.py (织体标注) | ✅ |
-| 3 | **模型架构**: +ssf_proj +SSFReconstructionHead +voice_embedding +voice_bias +fig_embedding +cadence_embedding, -chord全家, key_head→12dim, voice/fig/cadence ID builders | ✅ |
-| 4 | **训练管线**: SSF 重建 loss, key_head MSE, ssf_loss_val 追踪, sec/ssf eval 适配, param_groups 更新 | ✅ |
-| 5 | **周边适配**: converter (Key→Tonic, Program→Program+Voice), dataset (SSF加载+collate_fn), remi_grammar (key→tonic, -chord), planner (harmony_to_ssf) | ✅ |
-| 6 | **从头训练**: 数据迁移运行 + Phase 1 80K MIDI + Phase 2 40K MusicXML | ❌ 待数据迁移后启动 |
-| 7 | **generate.py 重写**: 框架-内容分离 (v0.3.1) | ❌ 待 v0.3.1 |
+| 1 | **Converter 四声部拆分**: `split_piano_hands_to_four_voices()` — 右手高音→Voice0(主), 其余→Voice1(次); 左手低音→Voice3(主), 其余→Voice2(次); 单音不拆分 | ❌ |
+| 2 | **非钢琴数据映射**: 弦乐四重奏 1:1, 钢琴三重奏 Pno→V0/V3, 管弦按音区归类 | ❌ |
+| 3 | **数据重转换**: 全部 1.62M 文件用新 converter 重新生成 tokens_v4 | ❌ |
+| 4 | **验证**: 抽样 100 首检查 Voice 分布、和弦密集处四声部全活跃、单音处仅主轨 | ❌ |
 
-> **审计修复 (2026-06-02)**: 全局审查发现 10+ bug 已修复 — voice/fig/cadence ID builder 全零/越界、embedding 零初始化被覆盖、ssf_loss_val 未追踪、key_head MSE 未计算、migrate 降号调映射到 MASK、config 过时注释等。
+#### v0.3.1-data2 — 数据过滤 + 分级
 
-### v0.3.1 — 生成框架重构
+> 设计文档: `docs/curriculum_training_v0.3.x.md` (第〇章 + 第一章)
 
-> 框架/内容分离：A1 预插入框架 token，模型只填音符内容。
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **classify_complexity.py**: 扫全部 tokens，F1-F5 质量过滤 | ❌ |
+| 2 | **F1 调性清晰度**: TonicField peakiness < 1.3 → 丢弃 (~3-5%) | ❌ |
+| 3 | **F2 调性稳定性**: 主音变化率 > 0.5/bar → 丢弃 (~1-2%) | ❌ |
+| 4 | **F3 结构合理性**: 无音符/note:dur 偏差>30%/bar 密度极端 → 丢弃 (~2-3%) | ❌ |
+| 5 | **F4 长度异常**: <50 或 >16384 tokens → 丢弃 (~1-2%) | ❌ |
+| 6 | **F5 Duration 越界**: >5% 事件越界 → 丢弃 (~1-2%) | ❌ |
+| 7 | **四指标自动分类**: Texture(1-3) + Structure(1-5) + Rhythm(1-3) + Instr(1-4) | ❌ |
+| 8 | **五级分类 + 训练集拆分**: train_L1~L5.txt, val_L1~L5.txt | ❌ |
+| 9 | **验证**: 抽样 500 个文件人工检查指标合理性 | ❌ |
 
-| # | 内容 | 设计文档 |
-|---|------|---------|
-| 1 | **框架预插入**: A1 build_framework() 输出 Bar/Tonic/TimeSig/Tempo/Clef/Section/Voice/Cad/Fig | framework |
-| 2 | **内容槽采样**: Position 后模型只采样 content token, 禁采样框架 token | framework |
-| 3 | **B1 禁令精简**: 570→4 条规则 (音域+平行五度+声部交错+极端跳跃) | framework |
-| 4 | **训练-推理 gap**: 框架 token loss 降权 (×0.1), 不 mask | framework |
-| 5 | **generate.py 旧引用清理**: tokenizer.KEY→TONIC, CHORD_FUNCTIONS→移除 等 13 处 | — |
+---
 
-### v0.3.2 — 终止式 + 乐句层
+#### v0.3.0 已实现（SSF + Voice + Fig）— tag v0.3.0
 
-> ABC Engine 集成终止式感知和乐句结构。
+> 设计文档: `docs/ssf_encoding_v0.3.x.md`, `docs/voice_time_slicing_v0.3.x.md`, `docs/figuration_encoding_v0.3.x.md`
 
-| # | 内容 | 设计文档 |
-|---|------|---------|
-| 1 | **终止式 zone**: `<Cad PAC>` token 注入, 终止区温区降温, SSF boost | cadence |
-| 2 | **cadence_match 修复**: 从硬编码 0.5 改为实际检测 | cadence |
-| 3 | **PhraseState 集成**: 乐句进度追踪, 终止式趋近 bias, 呼吸点引导 | phrase |
-| 4 | **乐句级温区**: 段级 × 乐句级温度微调 (开头-0.9, 中段-1.0, 终止-0.7) | phrase |
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **词表重构**: 30 Key→12 Tonic, 512 Program→43+4 Voice, +12 Fig, +5 Cadence, 929→542 | ✅ |
+| 2 | **SSF 注入**: ssf_proj (12→d_model) + SSFReconstructionHead + key_head→12dim MSE | ✅ |
+| 3 | **Voice 注入**: voice_embedding (5×d_model) + voice_bias (2 scalar) + _build_voice_ids() | ✅ |
+| 4 | **Fig 注入**: fig_embedding (12×d_model) + _build_fig_ids() | ✅ |
+| 5 | **周边适配**: converter Key→Tonic, dataset SSF加载, planner harmony_to_ssf() | ✅ |
+| 6 | **审计修复** (2026-06-02): ID builder 全零/越界、embedding 覆盖、key_head MSE 等 10+ fixes | ✅ |
 
-### v0.3.3 — 审计修复 + 打磨
+#### v0.3.1-model1 — 时值饱和度编码（DurSat）
 
-> v0.2.6 审计发现的 14 项 bug 修复 + 清理。
+> 设计文档: `docs/duration_saturation_v0.3.x.md`
 
-| # | 内容 |
-|---|------|
-| 1 | **训练前必修**: KV cache mismatch, NaN 根因, weight tying 重复参数, bare except 吞错 |
-| 2 | **开发中顺手修**: fast_converter 死循环, DPO merge bug, Section head 维度, EMA 线程安全, 死代码清理 |
-| 3 | **长期跟进**: structure_annotator 质量评估, attention 性能, renderer 增强 |
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **dur_sat_embedding**: nn.Embedding(17, d_model) zero-init, Position-only 注入 | ❌ |
+| 2 | **_build_dur_sat_ids()**: 按声部独立追踪 cum_dur[4], 兼容 Voice→Position 顺序 | ❌ |
+| 3 | **DataLoader 动态算**: collate_fn 中 O(T) 一遍扫完, 不要侧文件 | ❌ |
+| 4 | **config.py**: +use_dur_sat: bool = True | ❌ |
+| 5 | **B1 硬约束 Rule 1+2**: Duration 越界禁止 + Note_ON 全面禁止 | ❌ |
+| 6 | **B1 硬约束 Rule 3**: Bar 提前禁止（仅检查活跃声部；框架分离模式下由 A1 validate_bar_completion() 替代） | ❌ |
+| 7 | **A3/C 监控**: BarStats +total_duration/+bar_fill_ratio/+duration_overflow, 溢出→fatal | ❌ |
 
-### 待排期 (v0.3.4+)
+#### v0.3.1-model2 — 终止式感知（Cadence）
 
-| 方向 | 版本 | 说明 |
-|------|------|------|
-| **Voice-Stream Transformer** | v0.4.0 | 声部分流独立架构，共享底层 + 分流上层 + cross-attention |
-| **动机发展执行器** | v0.3.4+ | A2 从 seed 提取核心动机，生成时约束模型引用/变形 |
-| **B2 蓝图驱动升级** | v0.3.4+ | A 给完整 blueprint，B2 主动设定每段理想参数区间 |
-| **MuseScore 插件版** | v0.5.0+ | 轻量版做 MuseScore 插件，一键调用模型续写/生成 |
+> 设计文档: `docs/cadence_awareness_v0.3.x.md`
+
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **cadence_embedding**: nn.Embedding(6, d_model) zero-init, `<Cad PAC>` 后持久到 `<SecSum>` | ❌ |
+| 2 | **_build_cadence_ids()**: 从 `<Cad X>` token 追踪, 终止区 token 继承该类型 | ❌ |
+| 3 | **cadence_ssf_boost()**: PAC/IAC→boost pos7(pos5)+pos11, PC→boost pos5 | ❌ |
+| 4 | **cadence_match 修复**: 从硬编码 0.5 改为实际检测 | ❌ |
+| 5 | **cadence 标注增强**: chord_annotator PAC/IAC 真正区分（检查高音落点） | ❌ |
+
+---
+
+### 第二阶段：生成引擎（v0.3.2）
+
+> 依赖链：Framework-Content Separation → VoicePlan → Cadence Zone → Phrase Layer。
+> 全部在 generate.py / ABC Engine 中实现，不涉及训练。
+
+#### v0.3.2-gen1 — 框架-内容分离
+
+> 设计文档: `docs/framework_content_separation_v0.3.x.md`
+
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **A1 build_framework()**: 预插入 Bar/Tonic/TimeSig/Tempo/Clef/Position/Section/Voice/Fig/Cadence | ❌ |
+| 2 | **内容槽采样**: 模型只在 Position 后的内容槽采样; 禁采样框架 token | ❌ |
+| 3 | **B1 禁令精简**: ~570→6 条 (音域+平行+交错+跳跃+DurSat Rule1/2) | ❌ |
+| 4 | **训练-推理 gap**: 框架 token CE loss ×0.1; 训练序列不变 | ❌ |
+| 5 | **generate.py 旧引用清理**: tokenizer.KEY→TONIC, CHORD_FUNCTIONS→移除 等 13 处 | ❌ |
+| 6 | **BarFramework + VoicePlan 集成**: A1 框架含活跃声部 mask | ❌ |
+
+#### v0.3.2-gen2 — 声部配置（VoicePlan）
+
+> 设计文档: `docs/voice_splitting_v0.3.x.md` (声部配置章节)
+
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **Seed 声部检测**: detect_active_voices() — 扫描 seed 出现 ≥3 次的 Voice | ❌ |
+| 2 | **用户 CLI**: --voices 2/3/4 覆盖 seed 检测 | ❌ |
+| 3 | **A1 VoicePlan 预填**: inactive 声部不插框架 token; B1 兜底禁止 inactive Voice token | ❌ |
+
+#### v0.3.2-gen3 — 终止式 Zone 生成
+
+> 设计文档: `docs/cadence_awareness_v0.3.x.md`
+
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **终止区检测**: 段末 N bar 进入终止区, 自动插入 `<Cad X>` token | ❌ |
+| 2 | **终止区温区**: PAC -0.2, IAC -0.1, HC/DC 不变, PC -0.15 | ❌ |
+| 3 | **终止区 SSF boost**: 推理时可选增强（训练时不改 SSF） | ❌ |
+
+#### v0.3.2-gen4 — 乐句层集成
+
+> 设计文档: `docs/phrase_layer_design_v0.3.x.md`
+
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **PhrasePlan + PhraseState**: A1 规划 + B 运行时追踪 | ❌ |
+| 2 | **终止式趋近 SSF boost**: bar-2→predominant, bar-1→dominant, bar-0→target | ❌ |
+| 3 | **乐句级温度微调**: 开头×0.9, 中段×1.0, 终止×0.7 | ❌ |
+| 4 | **C 乐句评估**: 终止式强度 + 前句-后句匹配 + 连贯性 + 呼吸点 | ❌ |
+
+---
+
+### 第三阶段：训练（v0.3.3）
+
+> 前面所有阶段的产出汇总后启动训练。不设中间训练版本。
+
+#### v0.3.3-train — 课程训练
+
+> 设计文档: `docs/curriculum_training_v0.3.x.md` (第二~五章)
+
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **CurriculumSampler**: 按 phase 从指定 Level 池均匀采样, 数据池叠加不退出 | ❌ |
+| 2 | **CurriculumConfig**: phase1/2/3_steps, min_phase_steps, gate_eval_interval | ❌ |
+| 3 | **Gate 机制**: check_phase_advance() — Phase 1: empty_bar<1%/overflow=0; Phase 2: cadence>0.7/voice_crossing<2% | ❌ |
+| 4 | **三阶段训练**: 语法期 40K(L1+L2 纯钢琴) → 结构期 50K(L1-L4) → 精炼期 30K(L1-L5) | ❌ |
+| 5 | **DPO 闭环**: 每 5000 步 eval generation + C 评分 + DPO 自动触发 | ❌ |
+| 6 | **灾难性遗忘防护**: 简单数据永不退出, Phase 升级时数据池叠加 | ❌ |
+
+---
+
+### 版本依赖拓扑
+
+```
+v0.3.0 (已 tag)        v0.3.1 (数据+模型)       v0.3.2 (生成)           v0.3.3 (训练)
+─────────────────      ─────────────────       ─────────────────      ────────
+SSF + Voice + Fig      Voice Splitting ──→ Framework-C.S. ──→ 课程训练启动
+✅ 已实现                   │                    │
+                           ├→ 数据过滤 F1-F5     VoicePlan
+                           ├→ 五级分类            │
+                           ├→ DurSat             Cadence Zone
+                           └→ Cadence             │
+                                                 Phrase Layer
+```
+
+### 当前状态
+
+- **设计**: 11 篇设计文档全部完成，已交叉审查修复逻辑矛盾
+- **代码**: v0.3.0 (词表/模型/SSF/Voice/Fig) 已实现并 tag
+- **数据**: v0.2.x 旧 tokens 可用但需重转换（voice splitting + SSF 标注）
+- **训练**: 未启动，等 v0.3.1 + v0.3.2 全部代码实现 + 数据重处理完成后启动 v0.3.3 课程训练
+
+---
+
+### 待排期（远期 / 备选 / 搁置）
+
+| 方向 | 优先级 | 说明 |
+|------|--------|------|
+| **Figuration per-voice** | P0 | 当前全局 Fig 不支持 per-voice 独立织体；四声部拆分后需升级为 `<Fig Voice0=X Voice2=Y>` |
+| **SSF pairwise bias 备选** | P1 | 如果 SSF per-token 注入后和弦连贯性不足，启用 pairwise 余弦相似度 attention bias |
+| **REMI-z 轨内连续备选** | P1 | 如果旋律连贯性明显不足，converter 排序改为轨内连续 |
+| **动机发展执行器** | P2 | A2 从 seed 提取核心动机，生成时约束模型引用/变形 |
+| **B2 蓝图驱动升级** | P2 | A 给完整 blueprint，B2 主动设定每段理想参数区间 |
+| **Voice-Stream Transformer** | P3 | 声部分流独立架构，共享底层 + 分流上层 + cross-attention |
+| **MuseScore 插件版** | P4 | 轻量版做 MuseScore 插件，一键调用模型续写/生成 |
 | **和声色彩编码** | 搁置 | 先看 SSF 能否隐式学到功能和声 |
 | **P2: 手动 attention 性能优化** | 搁置 | 等 PyTorch 原生 custom bias API |
 | **序列并行 / 多卡训练** | 搁置 | 单卡 48GB 当前够用 |

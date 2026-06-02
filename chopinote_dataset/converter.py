@@ -51,6 +51,65 @@ class _BaseREMI:
             return token_ids, metadata
         return token_ids
 
+    def _voice_split_piano(self, merged: list) -> list:
+        """v0.3.1: 钢琴 2-track → 四声部拆分。
+
+        Right hand (sub=0) → Voice 0 (highest pitch) + Voice 1 (remaining)
+        Left hand  (sub=1) → Voice 3 (lowest pitch) + Voice 2 (remaining)
+        Single note per hand → only main voice, secondary voice silent.
+
+        只处理纯钢琴 (prog=0, exactly 2 subtracks) 数据。
+        非钢琴数据直接原样返回。
+        """
+        # 检查是否纯钢琴 2-track
+        programs = set()
+        subs = set()
+        for item in merged:
+            if item[5] in ('n', 'g'):
+                programs.add(item[2])
+                subs.add(item[3])
+        if programs != {0} or subs != {0, 1}:
+            return merged
+
+        # 收集每个 (measure, pos) 下的音符项索引
+        from collections import defaultdict
+        pos_groups: dict = defaultdict(list)  # (m, pos) → [(idx, sub, pitch), ...]
+
+        for i, item in enumerate(merged):
+            if item[5] not in ('n', 'g'):
+                continue
+            _m, _pos, _prog, _sub, _pri, kind, data = item
+            pitch = data[0] if kind == 'n' else data[1]
+            pos_groups[(_m, _pos)].append((i, _sub, pitch))
+
+        # 逐位置拆分
+        for (_m, _pos), notes in pos_groups.items():
+            right = [(i, s, p) for i, s, p in notes if s == 0]
+            left  = [(i, s, p) for i, s, p in notes if s == 1]
+
+            # 右手: 最高音 → Voice 0 (保持不变), 其余 → Voice 1
+            if right:
+                right.sort(key=lambda x: x[2], reverse=True)
+                for i, _s, _p in right[1:]:
+                    item = merged[i]
+                    merged[i] = (item[0], item[1], item[2], 1, item[4], item[5], item[6])
+
+            # 左手: 最低音 → Voice 3, 其余 → Voice 2
+            if left:
+                left.sort(key=lambda x: x[2])  # 低→高
+                # 最低音 → Voice 3
+                i, _s, _p = left[0]
+                item = merged[i]
+                merged[i] = (item[0], item[1], item[2], 3, item[4], item[5], item[6])
+                # 其余 → Voice 2
+                for i, _s, _p in left[1:]:
+                    item = merged[i]
+                    merged[i] = (item[0], item[1], item[2], 2, item[4], item[5], item[6])
+
+        # 重排序 (sub 值变更后 key 顺序需同步)
+        merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+        return merged
+
     def _assemble_events(self, merged: list, tonic_midi: int,
                          key_changes: list, key_name: str | None
                          ) -> List[Tuple[str, Optional[int]]]:
@@ -570,6 +629,7 @@ class MusicXMLToREMI(_BaseREMI):
             merged.append((m_idx, pos, prog, sub, 1.5, 'g', (gn_type, gn_pitch, gn_vel, gn_dur)))
 
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+        merged = self._voice_split_piano(merged)
         return self._assemble_events(merged, tonic_midi, key_changes, key_name)
 
 
@@ -922,6 +982,7 @@ class PDMXToREMI(_BaseREMI):
 
         # ── 6. 排序 ──────────────────────────────────────────
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+        merged = self._voice_split_piano(merged)
         return self._assemble_events(merged, tonic_midi, key_changes, key_name)
 
 
@@ -1146,4 +1207,5 @@ class MIDIToREMI(_BaseREMI):
                            (gn_type, gn_pitch, gn_vel, gn_dur)))
 
         merged.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+        merged = self._voice_split_piano(merged)
         return self._assemble_events(merged, tonic_midi, key_changes, key_name)

@@ -461,6 +461,12 @@ class FastMIDIToREMI:
             for pos in pos_notes:
                 pos_notes[pos].sort(key=lambda x: (x[0], x[1]))
 
+            # ── v0.3.1: 钢琴 2-track → 四声部拆分 ──────────────────
+            # 在每个 Position 内，右手最高音→Voice0, 其余→Voice1
+            # 左手最低音→Voice3, 其余→Voice2。单音不拆分。
+            pos_notes = self._voice_split_piano_notes(pos_notes)
+            # ───────────────────────────────────────────────────────
+
             all_positions = sorted(set(list(pos_notes.keys()) +
                                        [b[0] for b in beats_in_m]))
 
@@ -516,6 +522,56 @@ class FastMIDIToREMI:
                         events.append((self.DURATION, dur_pos))
 
         return events
+
+    @staticmethod
+    def _voice_split_piano_notes(pos_notes: dict) -> dict:
+        """v0.3.1: 钢琴 2-track → 四声部拆分。
+
+        Right hand (sub=0) → Voice 0 (highest) + Voice 1 (remaining)
+        Left hand  (sub=1) → Voice 3 (lowest) + Voice 2 (remaining)
+        Single note per hand → only main voice, secondary voice silent.
+
+        只处理纯钢琴 (prog=0, exactly 2 subtracks) 数据。
+        """
+        # 检测：是否纯钢琴 2-track
+        programs = set()
+        subs = set()
+        for notes in pos_notes.values():
+            for prog, sub, *_ in notes:
+                programs.add(prog)
+                subs.add(sub)
+        if programs != {0} or subs != {0, 1}:
+            return pos_notes
+
+        # 逐位置拆分
+        for pos, notes in pos_notes.items():
+            right = [(i, n) for i, n in enumerate(notes) if n[1] == 0]
+            left  = [(i, n) for i, n in enumerate(notes) if n[1] == 1]
+            new_notes = list(notes)
+
+            # 右手: 最高音 → Voice 0 (保持不变), 其余 → Voice 1
+            if right:
+                right.sort(key=lambda x: x[1][2], reverse=True)  # 音高降序
+                for i, _n in right[1:]:
+                    prog, sub, pitch, vl, dur, gr = new_notes[i]
+                    new_notes[i] = (prog, 1, pitch, vl, dur, gr)
+
+            # 左手: 最低音 → Voice 3, 其余 → Voice 2
+            if left:
+                left.sort(key=lambda x: x[1][2])  # 音高升序
+                # 最低音 → Voice 3
+                i, _n = left[0]
+                prog, sub, pitch, vl, dur, gr = new_notes[i]
+                new_notes[i] = (prog, 3, pitch, vl, dur, gr)
+                # 其余 → Voice 2
+                for i, _n in left[1:]:
+                    prog, sub, pitch, vl, dur, gr = new_notes[i]
+                    new_notes[i] = (prog, 2, pitch, vl, dur, gr)
+
+            new_notes.sort(key=lambda x: (x[0], x[1]))
+            pos_notes[pos] = new_notes
+
+        return pos_notes
 
 
 # ── Fast file processing helper ──────────────────────────────
