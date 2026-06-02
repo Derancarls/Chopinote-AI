@@ -226,6 +226,10 @@ class BarStats:
     b1_score: float | None = None
     b2_score: float | None = None
     innovation_meta: dict | None = None  # B 记录创新信息（可选）
+    # ── DurSat 时值饱和度字段 ──
+    total_duration: float = 0.0           # 本小节累计时长 (四个声部 max)
+    bar_fill_ratio: float = 0.0           # total_duration / grid_size
+    duration_overflow: bool = False       # 溢出标志
 
 
 @dataclass
@@ -267,12 +271,9 @@ class A3DB:
         velocity_sum = 0.0
         velocity_count = 0
         pc_counts = [0] * 12
-        chord_changes = 0
-        last_chord = None
 
         _PREFIX_NOTE = tokenizer.NOTE_ON
         _PREFIX_VEL = tokenizer.VELOCITY
-        _PREFIX_CHORD = tokenizer.CHORD
         _PREFIX_REST = tokenizer.REST
 
         for tid in tokens:
@@ -293,24 +294,48 @@ class A3DB:
                     velocity_count += 1
                 except (IndexError, ValueError):
                     pass
-            elif ts.startswith(_PREFIX_CHORD):
-                chord_id = ts.split(' ')[1].rstrip('>') if ' ' in ts else ''
-                if chord_id != last_chord:
-                    chord_changes += 1
-                    last_chord = chord_id
 
         total = note_count + rest_count
         stats.density = note_count
         stats.note_count = note_count
         stats.rest_count = rest_count
         stats.rest_ratio = rest_count / max(1, total)
-        stats.harmonic_rhythm = note_count / max(1, chord_changes) if chord_changes > 0 else note_count
+        stats.harmonic_rhythm = 0.0  # v0.3.0: chord tokens removed, computed via SSF instead
         stats.velocity_mean = velocity_sum / max(1, velocity_count)
-        stats.chord_change = chord_changes > 0
+        stats.chord_change = False
         stats.pitch_class_dist = [c / max(1, sum(pc_counts)) for c in pc_counts]
 
         if note_pitches:
             stats.pitch_range = (min(note_pitches), max(note_pitches))
+
+        # ── DurSat: 时值饱和度统计 ────────────────
+        _VOICE_PREFIX = tokenizer.VOICE
+        _DUR_PREFIX = tokenizer.DURATION
+        _BAR_STR = tokenizer.BAR
+        grid_size = tokenizer.grid_size
+        cum_dur = [0, 0, 0, 0]
+        current_voice = 0
+        overflows = 0
+        for tid in tokens:
+            ts = tokenizer.decode_token(tid)
+            if ts == _BAR_STR:
+                cum_dur = [0, 0, 0, 0]
+            elif ts.startswith(_VOICE_PREFIX):
+                try:
+                    current_voice = int(ts.split(' ')[1].rstrip('>'))
+                except (IndexError, ValueError):
+                    pass
+            elif ts.startswith(_DUR_PREFIX):
+                try:
+                    dur_val = int(ts.split(' ')[1].rstrip('>'))
+                except (IndexError, ValueError):
+                    dur_val = 0
+                cum_dur[current_voice] += dur_val
+                if cum_dur[current_voice] > grid_size + 2:
+                    overflows += 1
+        stats.total_duration = float(max(cum_dur))
+        stats.bar_fill_ratio = stats.total_duration / grid_size if grid_size > 0 else 0.0
+        stats.duration_overflow = overflows > 0
 
         self.bar_log.append(stats)
 

@@ -42,6 +42,15 @@ class BHardBans:
     contour_violation: set[int] = field(default_factory=set)
         # 发展部 contour 严重偏离 target_contour 的 token
 
+    # ── DurSat 时值饱和度违规 ──
+
+    duration_overflow: set[int] = field(default_factory=set)
+        # 会导致 cum_dur + dur > grid_size 的 Duration token
+    note_on_banned: bool = False
+        # True = 该声部剩余空间连 Dur 1 都放不下，禁止所有 Note_ON
+    bar_early: bool = False
+        # True = 小节活跃声部未满，禁止 Bar token
+
     def ban_context_tokens(self, tokenizer):
         """Block global context tokens during note-filling (ABC prefix provides them)."""
         for prefix in ('<Program', '<Tempo', '<TimeSig'):
@@ -54,7 +63,8 @@ class BHardBans:
         all_banned = set(self.banned_tokens)
         for attr in ('parallel_fifths', 'parallel_octaves', 'voice_crossing',
                      'out_of_range', 'extreme_leap',
-                     'unresolved_leading_tone', 'contour_violation'):
+                     'unresolved_leading_tone', 'contour_violation',
+                     'duration_overflow'):
             all_banned.update(getattr(self, attr, set()))
         return all_banned
 
@@ -68,6 +78,78 @@ class BHardBans:
         self.extreme_leap.clear()
         self.unresolved_leading_tone.clear()
         self.contour_violation.clear()
+        self.duration_overflow.clear()
+        self.note_on_banned = False
+        self.bar_early = False
+
+    # ── DurSat 硬约束 ──────────────────────────────────────
+
+    def ban_overflow_durations(self, voice_id: int, cur_pos: int,
+                               tokenizer, grid_size: int = 16,
+                               cum_dur: list[int] | None = None):
+        """Rule 1: 禁用会导致 cum_dur + dur > grid_size 的 Duration 值。
+
+        Args:
+            voice_id: 当前声部索引 (0-3)
+            cur_pos: 当前 Position 值
+            tokenizer: REMITokenizer 实例（用于获取 Duration token ID）
+            grid_size: 小节格位数（默认 16）
+            cum_dur: 四声部累计时长列表，voice_id 为 None 时忽略（向后兼容）
+        """
+        self.duration_overflow.clear()
+        remaining = grid_size - (cum_dur[voice_id] if cum_dur else 0)
+        for dur_val in range(1, grid_size + 1):
+            if cur_pos + dur_val > grid_size:
+                dur_tid = tokenizer.encode_token(f'<Duration {dur_val}>')
+                self.duration_overflow.add(dur_tid)
+
+    def ban_note_on_if_full(self, voice_id: int, cur_pos: int,
+                            tokenizer, grid_size: int = 16,
+                            cum_dur: list[int] | None = None) -> bool:
+        """Rule 2: 当前剩余空间连 Duration 1 都放不下时，禁止该声部所有 Note_ON。
+
+        Returns:
+            True 如果 Note_ON 应被全面禁止
+        """
+        remaining = grid_size - (cum_dur[voice_id] if cum_dur else 0)
+        if cur_pos + 1 > grid_size or remaining <= 0:
+            self.note_on_banned = True
+            return True
+        self.note_on_banned = False
+        return False
+
+    def ban_bar_if_not_full(self, active_voices: set[int],
+                            cum_dur: list[int] | None = None,
+                            grid_size: int = 16) -> bool:
+        """Rule 3: 小节活跃声部未满时禁止 Bar token。
+
+        只检查当前 bar 内实际出现过的声部（active_voices）。
+        从未发声的声部不参与检查——否则单旋律/两声部会永久卡住。
+
+        Returns:
+            True 如果 Bar token 应被禁止
+        """
+        if not active_voices:
+            self.bar_early = False
+            return False  # 空 bar — 不禁止，由 C 层事后检测
+        if cum_dur is None:
+            self.bar_early = False
+            return False
+        all_active_full = all(
+            cum_dur[v] >= grid_size - 1 for v in active_voices
+        )  # tolerance=1
+        if not all_active_full:
+            self.bar_early = True
+            return True
+        self.bar_early = False
+        return False
+
+    def get_note_on_banned_ids(self, tokenizer) -> set[int]:
+        """获取所有 Note_ON token ID（当 note_on_banned=True 时使用）。"""
+        banned = set()
+        for interval in range(-60, 61):
+            banned.add(tokenizer.encode_token(f'<Note_ON {interval}>'))
+        return banned
 
     def add_out_of_range(self, token_ids: set[int]):
         """批量添加超出音域的 token。"""

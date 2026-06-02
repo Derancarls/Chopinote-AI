@@ -69,6 +69,10 @@ class ModelConfig:
     use_cadence: bool = True
     n_cadence_types: int = 6                # 0=none, 1-5=PAC/IAC/HC/DC/PC
 
+    # --- 时值饱和度（DurSat） ---
+    use_dur_sat: bool = True
+    dur_sat_buckets: int = 17               # 0/16 ~ 16/16
+
     # --- QK-Norm（稳定注意力） ---
     use_qk_norm: bool = True
     use_head_scale: bool = True

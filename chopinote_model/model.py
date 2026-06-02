@@ -326,6 +326,11 @@ class MusicTransformer(nn.Module):
             self.measure_in_section_embedding = nn.Embedding(
                 config.max_measures_in_section + 1, config.d_model)
 
+        # ── 时值饱和度（DurSat） ──────────────────────────
+        if config.use_dur_sat:
+            self.dur_sat_embedding = nn.Embedding(config.dur_sat_buckets, config.d_model)
+            nn.init.zeros_(self.dur_sat_embedding.weight)
+
         self.blocks = nn.ModuleList([
             TransformerBlock(config, i) for i in range(config.n_layers)
         ])
@@ -365,6 +370,9 @@ class MusicTransformer(nn.Module):
         if self.config.use_measure_in_section:
             with torch.no_grad():
                 self.measure_in_section_embedding.weight.zero_()
+        if self.config.use_dur_sat:
+            with torch.no_grad():
+                self.dur_sat_embedding.weight.zero_()
 
     def _compute_sec_bias(self, section_ids: torch.Tensor,
                           section_types: torch.Tensor,
@@ -493,11 +501,11 @@ class MusicTransformer(nn.Module):
         return cad_ids
 
     def _init_token_maps(self):
-        """缓存 Voice/Fig/Cadence token ID 集合, 按前缀扫描 vocab。"""
+        """缓存 Voice/Fig/Cadence/Position/Duration token ID 集合, 按前缀扫描 vocab。"""
         # 用临时的 tokenizer 实例来获取 token ID
         from chopinote_dataset.tokenizer import REMITokenizer
         tk = REMITokenizer()
-        if self.config.use_voice_identity:
+        if self.config.use_voice_identity or self.config.use_dur_sat:
             self.voice_tids: list[int] = [-1] * 4
             for v in range(4):
                 self.voice_tids[v] = tk.encode_token(f'<Voice {v}>')
@@ -509,6 +517,14 @@ class MusicTransformer(nn.Module):
             self.cadence_tids: list[int] = []
             for cname in range(len(tk.CADENCE_NAMES)):
                 self.cadence_tids.append(tk.encode_token(f'<Cad {tk.CADENCE_NAMES[cname]}>'))
+        # DurSat: Position token ID 集合 + Duration token ID→value 映射
+        if self.config.use_dur_sat:
+            self.position_tids: set[int] = set()
+            for i in range(tk.grid_size):
+                self.position_tids.add(tk.encode_token(f'<Position {i}>'))
+            self.dur_tid_to_value: dict[int, int] = {}
+            for d in range(1, tk.grid_size + 1):
+                self.dur_tid_to_value[tk.encode_token(f'<Duration {d}>')] = d
 
     # ── v0.3.0: Voice / Fig / Cadence per-token ID builders ──
 
@@ -556,6 +572,35 @@ class MusicTransformer(nn.Module):
                         break
                 cad_ids[b, t] = current
         return cad_ids
+
+    def _build_dur_sat_ids(self, input_ids):
+        """扫描 token 序列, 返回每个位置的 dur_sat bucket (0-16)。
+
+        只在 Position token 位置填实际 bucket 值, 非 Position 填 0。
+        cum_dur 按四个声部独立追踪, Bar token 重置全部声部。
+        """
+        B, T = input_ids.shape
+        dur_sat_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+        for b in range(B):
+            cum_dur = [0, 0, 0, 0]
+            current_voice = 0
+            for t in range(T):
+                tid = input_ids[b, t].item()
+                if tid == self.config.bar_token_id:
+                    cum_dur = [0, 0, 0, 0]
+                elif tid in self.position_tids:
+                    bucket = min(cum_dur[current_voice], 16)
+                    dur_sat_ids[b, t] = bucket
+                # Voice token: 切换当前声部
+                for v in range(4):
+                    if tid == self.voice_tids[v]:
+                        current_voice = v
+                        break
+                # Duration token: 累计时值
+                dur_val = self.dur_tid_to_value.get(tid, 0)
+                if dur_val > 0:
+                    cum_dur[current_voice] += dur_val
+        return dur_sat_ids
 
     def _build_chord_group_map(self):
         """构建和弦功能 ID → 功能组 ID 映射 (buffer, 不可训练)。
@@ -709,6 +754,7 @@ class MusicTransformer(nn.Module):
                 ssf_fields: Optional[torch.Tensor] = None,
                 voice_count_ids: Optional[torch.Tensor] = None,
                 measure_in_section_ids: Optional[torch.Tensor] = None,
+                dur_sat_ids: Optional[torch.Tensor] = None,
                 return_sec_head: bool = False) -> torch.Tensor:
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, \
@@ -790,6 +836,15 @@ class MusicTransformer(nn.Module):
         if self.config.use_cadence:
             cadence_ids = self._build_cadence_ids(input_ids[:, -T:])
             x = x + self.cadence_embedding(cadence_ids)
+
+        # ── DurSat (Duration Saturation) embedding ────────────────
+        if self.config.use_dur_sat:
+            if dur_sat_ids is None:
+                dur_sat_ids = self._build_dur_sat_ids(input_ids[:, -T:])
+            elif dur_sat_ids.ndim == 1:
+                dur_sat_ids = dur_sat_ids.unsqueeze(0)
+            dur_sat_ids = dur_sat_ids[:, -T:]
+            x = x + self.dur_sat_embedding(dur_sat_ids)
 
         x = self.dropout(x)
 

@@ -28,6 +28,28 @@ def _init_voice_ids():
     _VOICE_INITIALIZED = True
 
 
+# ── 时值饱和度（DurSat）：预计算 Position/Voice/Duration token ID ──
+_DURSAT_POSITION_IDS: set[int] = set()
+_DURSAT_VOICE_TIDS: list[int] = [-1, -1, -1, -1]
+_DURSAT_DUR_TID_TO_VAL: dict[int, int] = {}
+_DURSAT_INITIALIZED = False
+
+
+def _init_dursat_ids():
+    global _DURSAT_POSITION_IDS, _DURSAT_VOICE_TIDS, _DURSAT_DUR_TID_TO_VAL, _DURSAT_INITIALIZED
+    if _DURSAT_INITIALIZED:
+        return
+    from chopinote_dataset.tokenizer import REMITokenizer
+    tk = REMITokenizer(grid_size=16, velocity_levels=8)
+    for i in range(tk.grid_size):
+        _DURSAT_POSITION_IDS.add(tk.encode_token(f'<Position {i}>'))
+    for v in range(4):
+        _DURSAT_VOICE_TIDS[v] = tk.encode_token(f'<Voice {v}>')
+    for d in range(1, tk.grid_size + 1):
+        _DURSAT_DUR_TID_TO_VAL[tk.encode_token(f'<Duration {d}>')] = d
+    _DURSAT_INITIALIZED = True
+
+
 def _compute_voice_counts(tokens: list[int]) -> list[int]:
     """实时计算每个 token 位置的声部计数（同 Position 下第几个 Note_ON）。"""
     _init_voice_ids()
@@ -42,6 +64,32 @@ def _compute_voice_counts(tokens: list[int]) -> list[int]:
         else:
             result[i] = counter
     return result
+
+def _compute_dur_sat_ids(tokens: list[int], bar_token_id: int = 4) -> list[int]:
+    """按声部独立追踪 cum_dur, 在 Position token 位置填 bucket (0-16)。
+
+    非 Position token 位置填 0。
+    """
+    _init_dursat_ids()
+    result = [0] * len(tokens)
+    cum_dur = [0, 0, 0, 0]
+    current_voice = 0
+    for i, tid in enumerate(tokens):
+        if tid == bar_token_id:
+            cum_dur = [0, 0, 0, 0]
+        elif tid in _DURSAT_POSITION_IDS:
+            result[i] = min(cum_dur[current_voice], 16)
+        # Voice token
+        for v in range(4):
+            if tid == _DURSAT_VOICE_TIDS[v]:
+                current_voice = v
+                break
+        # Duration token
+        dur_val = _DURSAT_DUR_TID_TO_VAL.get(tid, 0)
+        if dur_val > 0:
+            cum_dur[current_voice] += dur_val
+    return result
+
 
 def _compute_measure_in_section(tokens: list[int],
                                   section_data: Optional[dict] = None,
@@ -297,6 +345,14 @@ class TokenDataset(Dataset):
             ms_slice = ms_full[:T]
         measure_in_section_ids = torch.tensor(ms_slice, dtype=torch.long)
 
+        # ── 时值饱和度（DurSat） ──────────────────────────────
+        ds_full = _compute_dur_sat_ids(tokens)
+        if start > 0:
+            ds_slice = ds_full[start:start + T + 1][:-1]
+        else:
+            ds_slice = ds_full[:T]
+        dur_sat_ids = torch.tensor(ds_slice, dtype=torch.long)
+
         # attention mask: 1 表示有效 token
         attention_mask = torch.ones_like(input_ids)
 
@@ -429,6 +485,7 @@ class TokenDataset(Dataset):
             'ssf_fields': ssf_fields,
             'voice_count_ids': voice_count_ids,
             'measure_in_section_ids': measure_in_section_ids,
+            'dur_sat_ids': dur_sat_ids,
             'section_ids': sec_ids,
             'section_types': sec_types,
             'sec_bars_target': sec_bars_target,
@@ -478,6 +535,12 @@ def collate_fn(batch: list[dict]) -> dict:
         ms_ids = [b['measure_in_section_ids'] for b in batch]
         result['measure_in_section_ids'] = torch.nn.utils.rnn.pad_sequence(
             ms_ids, batch_first=True, padding_value=0)
+
+    # ── 时值饱和度量字段 padding ──────────────────────────────
+    if 'dur_sat_ids' in batch[0]:
+        dur_sat_ids = [b['dur_sat_ids'] for b in batch]
+        result['dur_sat_ids'] = torch.nn.utils.rnn.pad_sequence(
+            dur_sat_ids, batch_first=True, padding_value=0)
 
     # ── 段落字段 padding ────────────────────────────────────────
     if 'section_ids' in batch[0]:
