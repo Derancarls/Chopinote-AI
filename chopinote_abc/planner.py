@@ -385,3 +385,39 @@ def harmony_to_ssf(
         list[list[float]]: 每个和弦一个 12 维向量
     """
     return [chord_func_to_ssf(c.func, tonic_name) for c in chords]
+
+
+def cadence_ssf_boost(
+    cadence_type: str,
+    ssf_field: list[float],
+    strength: float = 0.2,
+) -> list[float]:
+    """终止区 SSF LocalField 增强 — 强化终止式和弦 chroma。
+
+    训练时不调用——让模型从数据中学。推理时可选增强。
+
+    Args:
+        cadence_type: 终止式类型 ('PAC', 'IAC', 'HC', 'DC', 'PC')
+        ssf_field: 12 维 SSF 向量 (TonicField 或 LocalField delta)
+        strength: boost 强度乘数 (默认 0.2)
+
+    Returns:
+        boosted 12 维向量 (不修改输入)
+
+    Boost 规则:
+        PAC/IAC: pos 7 (属音) +strength, pos 11 (导音) +0.75*strength
+        PC:      pos 5 (下属音) +strength
+        HC:      pos 7 (属音) +strength
+        DC:      不 boost (意外终止，保留原场)
+    """
+    import copy
+    result = copy.copy(ssf_field) if isinstance(ssf_field, list) else ssf_field.copy()
+    if cadence_type in ('PAC', 'IAC'):
+        result[7] = min(1.0, result[7] + strength)       # 属音
+        result[11] = min(1.0, result[11] + 0.75 * strength)  # 导音
+    elif cadence_type == 'HC':
+        result[7] = min(1.0, result[7] + strength)       # 属音
+    elif cadence_type == 'PC':
+        result[5] = min(1.0, result[5] + strength)       # 下属音
+    # DC: no boost — 意外终止保留原场
+    return result

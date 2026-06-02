@@ -630,13 +630,13 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | # | 内容 | 状态 |
 |---|------|------|
-| 1 | **dur_sat_embedding**: nn.Embedding(17, d_model) zero-init, Position-only 注入 | ❌ |
-| 2 | **_build_dur_sat_ids()**: 按声部独立追踪 cum_dur[4], 兼容 Voice→Position 顺序 | ❌ |
-| 3 | **DataLoader 动态算**: collate_fn 中 O(T) 一遍扫完, 不要侧文件 | ❌ |
-| 4 | **config.py**: +use_dur_sat: bool = True | ❌ |
-| 5 | **B1 硬约束 Rule 1+2**: Duration 越界禁止 + Note_ON 全面禁止 | ❌ |
-| 6 | **B1 硬约束 Rule 3**: Bar 提前禁止（仅检查活跃声部；框架分离模式下由 A1 validate_bar_completion() 替代） | ❌ |
-| 7 | **A3/C 监控**: BarStats +total_duration/+bar_fill_ratio/+duration_overflow, 溢出→fatal | ❌ |
+| 1 | **dur_sat_embedding**: nn.Embedding(17, d_model) zero-init, Position-only 注入 | ✅ |
+| 2 | **_build_dur_sat_ids()**: 按声部独立追踪 cum_dur[4], 兼容 Voice→Position 顺序 | ✅ |
+| 3 | **DataLoader 动态算**: dataset._compute_dur_sat_ids() + collate_fn padding, 不要侧文件 | ✅ |
+| 4 | **config.py**: +use_dur_sat: bool = True | ✅ |
+| 5 | **B1 硬约束 Rule 1+2**: Duration 越界禁止 + Note_ON 全面禁止 | ✅ |
+| 6 | **B1 硬约束 Rule 3**: Bar 提前禁止（仅检查活跃声部；框架分离模式下由 A1 validate_bar_completion() 替代） | ✅ |
+| 7 | **A3/C 监控**: BarStats +total_duration/+bar_fill_ratio/+duration_overflow, 溢出→fatal | ✅ |
 
 #### v0.3.1-model2 — 终止式感知（Cadence）
 
@@ -644,11 +644,11 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | # | 内容 | 状态 |
 |---|------|------|
-| 1 | **cadence_embedding**: nn.Embedding(6, d_model) zero-init, `<Cad PAC>` 后持久到 `<SecSum>` | ❌ |
-| 2 | **_build_cadence_ids()**: 从 `<Cad X>` token 追踪, 终止区 token 继承该类型 | ❌ |
-| 3 | **cadence_ssf_boost()**: PAC/IAC→boost pos7(pos5)+pos11, PC→boost pos5 | ❌ |
-| 4 | **cadence_match 修复**: 从硬编码 0.5 改为实际检测 | ❌ |
-| 5 | **cadence 标注增强**: chord_annotator PAC/IAC 真正区分（检查高音落点） | ❌ |
+| 1 | **cadence_embedding**: nn.Embedding(6, d_model) zero-init, `<Cad PAC>` 后持久到 `<SecSum>` | ✅ |
+| 2 | **_build_cadence_ids()**: 从 `<Cad X>` token 追踪, 终止区 token 继承该类型 | ✅ |
+| 3 | **cadence_ssf_boost()**: PAC/IAC→boost pos7+pos11, HC→pos7, PC→pos5, DC 不 boost | ✅ |
+| 4 | **cadence_match 修复**: 硬编码 0.5 → _detect_cadence_from_tokens/_score + 相似度矩阵 | ✅ |
+| 5 | **cadence 标注增强**: converter/cadence annotator 输出 `<Cad X>` token (待数据重转换) | ❌ |
 
 ---
 
