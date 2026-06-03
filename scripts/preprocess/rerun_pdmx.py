@@ -17,8 +17,8 @@ CACHE_DIR = '/root/Chopinote-AI/data/cache'
 
 def clean_old_pdmx():
     logger.info("清空旧 PDMX token 和缓存...")
-    token_dir = f'{DATA_DIR}/tokens_v3'
-    meta_dir = f'{DATA_DIR}/metadata_v3'
+    token_dir = f'{DATA_DIR}/tokens_v4'
+    meta_dir = f'{DATA_DIR}/metadata_v4'
     os.makedirs(token_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
 
@@ -97,7 +97,7 @@ def run_pdmx():
     converted = 0
     skipped = 0
     failed = 0
-    n_workers = min(16, cpu_count())
+    n_workers = min(25, cpu_count())
 
     with Pool(n_workers, initializer=init_worker) as pool:
         for i, (fpath, status, info) in enumerate(pool.imap_unordered(process_one, files, chunksize=200)):

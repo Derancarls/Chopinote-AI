@@ -10,8 +10,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 DATA_DIR = '/root/autodl-tmp/data/processed'
-TOKEN_DIR = f'{DATA_DIR}/tokens_v3'
-META_DIR = f'{DATA_DIR}/metadata_v3'
+TOKEN_DIR = f'{DATA_DIR}/tokens_v4'
+META_DIR = f'{DATA_DIR}/metadata_v4'
 
 # ── 1. 按 hash_md5 分组 ────────────────────────────────────
 logger.info("扫描 metadata 文件...")

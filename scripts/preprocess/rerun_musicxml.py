@@ -25,8 +25,8 @@ MUSICXML_DIRS = [
 
 def clean_old_musicxml():
     logger.info("清空旧 MusicXML token 和缓存...")
-    token_dir = f'{DATA_DIR}/tokens_v3'
-    meta_dir = f'{DATA_DIR}/metadata_v3'
+    token_dir = f'{DATA_DIR}/tokens_v4'
+    meta_dir = f'{DATA_DIR}/metadata_v4'
     os.makedirs(token_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
 
@@ -107,7 +107,7 @@ def run_musicxml():
         logger.warning("无 MusicXML 文件可处理")
         return
 
-    n_workers = min(cpu_count(), 8)
+    n_workers = min(cpu_count(), 25)
     logger.info(f"Worker: {n_workers}")
 
     converted = 0

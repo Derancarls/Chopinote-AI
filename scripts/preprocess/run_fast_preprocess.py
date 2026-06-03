@@ -38,11 +38,11 @@ logger = logging.getLogger(__name__)
 # ── Paths ──
 DATA_DISK = '/root/autodl-tmp'
 PROCESSED_DIR = os.path.join(DATA_DISK, 'data', 'processed')
-TOKEN_DIR = os.path.join(PROCESSED_DIR, 'tokens_v3')
-META_DIR = os.path.join(PROCESSED_DIR, 'metadata_v3')
-MANIFEST_DIR = os.path.join(PROCESSED_DIR, 'manifests_v3')
-STATE_FILE = os.path.join(PROCESSED_DIR, 'conversion_state_v3.json')
-PID_LOCK_PATH = os.path.join(PROCESSED_DIR, 'preprocess.lock')
+TOKEN_DIR = os.path.join(PROCESSED_DIR, 'tokens_v4')
+META_DIR = os.path.join(PROCESSED_DIR, 'metadata_v4')
+MANIFEST_DIR = os.path.join(PROCESSED_DIR, 'manifests_v4')
+STATE_FILE = os.path.join(PROCESSED_DIR, 'conversion_state_v4.json')
+PID_LOCK_PATH = os.path.join(PROCESSED_DIR, 'preprocess_v4.lock')
 os.makedirs(TOKEN_DIR, exist_ok=True)
 os.makedirs(META_DIR, exist_ok=True)
 os.makedirs(MANIFEST_DIR, exist_ok=True)
@@ -420,7 +420,7 @@ def main():
     processed_hashes = build_processed_hashes()
     logger.info(f"Existing token hashes: {len(processed_hashes)}")
 
-    n_workers = 24
+    n_workers = 25
     logger.info(f"Workers: {n_workers}, Timeout: {PER_FILE_TIMEOUT}s per file")
 
     overall_start = time.time()
