@@ -678,6 +678,9 @@ class Trainer:
                     type_index[token_id] = name_to_idx[name]
                     break
 
+        # ── v0.3.2: 框架 token ID 集合 (用于 loss 降权) ──
+        self._framework_token_ids = tokenizer.framework_token_ids
+
         return type_index, type_names
 
     @staticmethod
@@ -749,6 +752,14 @@ class Trainer:
         if pos_type_idx >= 0 and cfg.position_token_loss_weight != 1.0:
             is_pos = (label_types == pos_type_idx) & valid_mask
             weights[is_pos] = cfg.position_token_loss_weight
+
+        # ── v0.3.2: 框架 token CE loss 降权 (frame_weight=0.1) ──
+        if cfg.frame_weight != 1.0 and hasattr(self, '_framework_token_ids'):
+            labels_flat = labels.view(-1)
+            is_fw = torch.zeros(B * T, dtype=torch.bool, device=labels.device)
+            for fid in self._framework_token_ids:
+                is_fw |= (labels_flat == fid)
+            weights[is_fw & valid_mask] = cfg.frame_weight
 
         # ── 重复惩罚：连续 ≥4 同类型 token → loss × penalty ─
         if cfg.repetition_penalty > 1.0:

@@ -32,6 +32,15 @@ class SectionPlan:
     temperature_zone: tuple[float, float, float] | None = None
         # (冷区系数, 热区系数, 冷区系数)，如 (0.8, 1.3, 0.7)
         # None = B 根据段落类型自动推断
+    phrases: list = field(default_factory=list)
+        # v0.3.2: PhrasePlan 列表, 由 plan_phrases_for_section() 填充
+
+    def get_phrase_at_bar(self, bar_idx: int):
+        """查询 bar_idx (段内偏移) 属于哪个乐句。"""
+        for p in self.phrases:
+            if p.bar_start <= bar_idx < p.bar_end:
+                return p
+        return None
 
 
 @dataclass
@@ -40,6 +49,30 @@ class ChordAtBar:
     bar: int           # 全局 bar 号
     func: str          # 'I' / 'IV' / 'V' / 'vi' / ... （含斜线和弦如 'V/V'）
     inv: str = 'root'  # 'root' / '1st' / '2nd' / '3rd'
+
+
+# ═══════════════════════════════════════════════════════════════
+#  v0.3.2: 框架-内容分离 — BarFramework
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class BarFramework:
+    """单小节的框架骨架 — A1 预插入，模型不采样。
+
+    框架 token 按序排列，内容槽夹在 Position token 之后。
+    例如: <Bar> <Tonic C> <TimeSig 4/4> <Tempo 120> <Clef treble>
+          <Pos 0> ← 内容槽 → <Pos 4> ← 内容槽 → <Bar> ...
+    """
+    bar_index: int                          # 全局 bar 号
+    tonic: str = 'C'                        # 主音名, 如 'C', 'F#'
+    timesig: str = '4/4'                    # 拍号
+    tempo: int = 120                        # 速度 BPM
+    clefs: list[str] = field(default_factory=lambda: ['treble', 'bass'])
+    positions: int = 16                     # grid 位置数 (grid_size)
+    active_voices: list[int] = field(default_factory=lambda: [0, 1, 2, 3])
+    cadence: str = ''                       # 终止式类型 (PAC/IAC/HC/DC/PC), 空=非终止区
+    fig: int = 0                            # 织体类型索引 (0=none)
+    section_type: str = ''                  # 当前段落类型
 
 
 @dataclass
@@ -159,6 +192,84 @@ class A1DB:
         self.overrides.clear()
         self._reindex()
 
+    # ── v0.3.2: 框架-内容分离 ──────────────────
+
+    def build_framework(self, tokenizer,
+                        voice_plan: list[int] | None = None,
+                        seed_bar_count: int = 0) -> list[int]:
+        """构建完整框架骨架 token 序列，供 generate.py 逐槽填内容。
+
+        框架 token 直接追加到 token 流，不经模型采样。
+        内容槽位于 Position token 之后——模型只在这些槽内采样。
+
+        Args:
+            tokenizer: REMITokenizer 实例
+            voice_plan: 活跃声部列表，None=[0,1,2,3] 全开
+            seed_bar_count: seed 已有小节数 (用于 bar_index 偏移)
+
+        Returns:
+            完整框架 token ID 列表
+        """
+        if voice_plan is None:
+            voice_plan = [0, 1, 2, 3]
+
+        tokens = []
+        global_bar = seed_bar_count
+
+        for sec in self.sections:
+            for bar_offset in range(sec.bars):
+                # ── Bar ──
+                tokens.append(tokenizer.bar_token_id)
+
+                # ── Tonic ──
+                tonic_tid = tokenizer.encode_token(
+                    f'{tokenizer.TONIC} {sec.key}>')
+                tokens.append(tonic_tid)
+
+                # ── TimeSig (仅变化时输出) ──
+                # 简化：段级拍号固定 4/4
+                ts_tid = tokenizer.encode_token('<TimeSig 4/4>')
+                tokens.append(ts_tid)
+
+                # ── Tempo (仅变化时输出) ──
+                tempo_tid = tokenizer.encode_token('<Tempo 120>')
+                tokens.append(tempo_tid)
+
+                # ── Clefs (每 bar 活跃声部对应谱号) ──
+                for v in voice_plan:
+                    clef = 'treble' if v <= 1 else 'bass'
+                    clef_tid = tokenizer.encode_token(
+                        f'{tokenizer.CLEF} {clef}>')
+                    tokens.append(clef_tid)
+
+                # ── Cadence (终止区注入) ──
+                cadence_bars = 2 if sec.cadence in ('PAC', 'IAC', 'PC') else 1
+                in_cadence_zone = (
+                    bar_offset >= sec.bars - cadence_bars
+                    and sec.cadence != 'none'
+                )
+                if in_cadence_zone and sec.cadence:
+                    cad_tid = tokenizer.encode_token(
+                        f'{tokenizer.CADENCE} {sec.cadence}>')
+                    tokens.append(cad_tid)
+
+                # ── Position → 内容槽 ──
+                for pos in range(tokenizer.grid_size):
+                    pos_tid = tokenizer.encode_token(
+                        f'{tokenizer.POSITION} {pos}>')
+                    tokens.append(pos_tid)
+
+                    # ── Voice tokens (每个活跃声部) ──
+                    for v in voice_plan:
+                        voice_tid = tokenizer.encode_token(
+                            f'{tokenizer.VOICE} {v}>')
+                        tokens.append(voice_tid)
+                        # 内容槽开始 — 模型在此填 Note_ON/Rest/Velocity/Duration/...
+
+                global_bar += 1
+
+        return tokens
+
     # ── Prefix 序列化 ──────────────────────────
 
     def build_structure_tokens(self, tokenizer) -> list[int]:
@@ -203,6 +314,93 @@ class A1DB:
             tokens.append(inv_tid)
 
         return tokens
+
+
+# ═══════════════════════════════════════════════════════════════
+#  v0.3.2: 乐句层 — PhrasePlan + PhraseState
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class PhrasePlan:
+    """A1 规划的单个乐句。
+
+    乐句是有方向的音乐语句: [开始-动机陈述] → [过程-发展模进] → [终止-终止式收敛]。
+    乐句不是任意 N 个小节 — 它由终止式定义。
+    """
+    phrase_idx: int                        # 段内乐句索引
+    phrase_type: str = 'antecedent'        # antecedent/consequent/extension/closing/transition
+    bar_start: int = 0                     # 段内起始 bar
+    bar_end: int = 8                       # 段内结束 bar (不含)
+    cadence_target: str = 'HC'             # 目标终止式: PAC/IAC/HC/DC/PC
+    contour_shape: str = 'arch'            # arch/ascending/descending/wave/flat
+    motif_label: str | None = None         # A2 label
+    motif_variant: str = 'original'        # original/inverted/fragmented/diminished/augmented
+    harmonic_rhythm: str = 'normal'        # fast(half-bar)/normal(1-bar)/slow(2-4-bar)
+    relation_to_prev: str | None = None    # parallel/contrasting/sequential/answering
+    is_phantom: bool = False               # 幻影乐句（终止式不明确）
+    elide_with_next: bool = False          # 与下一乐句重叠（elision）
+
+    @property
+    def length(self) -> int:
+        return self.bar_end - self.bar_start
+
+
+@dataclass
+class PhraseState:
+    """B 层追踪的当前乐句运行时状态。"""
+    plan: PhrasePlan | None = None
+    bars_generated: int = 0
+    contour_so_far: list[int] = field(default_factory=list)
+
+    def progress(self) -> float:
+        """乐句完成进度 [0, 1]"""
+        if self.plan is None or self.plan.length <= 0:
+            return 0.0
+        return min(1.0, self.bars_generated / self.plan.length)
+
+    def bars_until_cadence(self) -> int:
+        """距离目标终止式还有多少 bar"""
+        if self.plan is None:
+            return 999
+        return max(0, self.plan.length - self.bars_generated)
+
+    def in_cadence_zone(self) -> bool:
+        """是否已进入终止式区域 (最后 2 bar)"""
+        return self.bars_until_cadence() <= 2
+
+    def is_complete(self) -> bool:
+        """当前乐句是否已完成"""
+        if self.plan is None:
+            return False
+        return self.bars_generated >= self.plan.length
+
+    def cadence_approach_boost(self) -> dict[int, float]:
+        """终止式趋近 SSF boost: 乐句末尾逐 bar 强化终止式和声。
+
+        bar-2: 引入 predominant (pos 5=下属音, pos 2=上主音)
+        bar-1: 强推 dominant (pos 7=属音, pos 11=导音)
+        bar-0: 目标终止和弦
+
+        Returns:
+            {pos: strength} 映射，用于 SSF LocalField delta
+        """
+        target = self.plan.cadence_target if self.plan else 'PAC'
+        bars_left = self.bars_until_cadence()
+
+        if bars_left == 2:
+            return {5: 0.3, 2: 0.15}               # predominant
+        elif bars_left == 1:
+            return {7: 0.4, 11: 0.2}               # dominant
+        elif bars_left == 0:
+            if target == 'PAC':
+                return {0: 0.5}                     # tonic
+            elif target == 'HC':
+                return {7: 0.5}                     # dominant
+            elif target == 'DC':
+                return {9: 0.5}                     # submediant
+            elif target == 'PC':
+                return {5: 0.3, 0: 0.3}             # subdominant→tonic
+        return {}
 
 
 # ═══════════════════════════════════════════════════════════════

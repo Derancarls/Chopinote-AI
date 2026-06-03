@@ -42,6 +42,52 @@ FORM_TEMPLATES: dict[str, list[tuple[str, float, list[str], float | None]]] = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════
+#  v0.3.2: VoicePlan — 声部配置
+# ═══════════════════════════════════════════════════════════════
+
+def detect_active_voices(seed_tokens: list[int], tokenizer) -> list[int]:
+    """扫描 seed，返回活跃声部列表。
+
+    统计 seed 中各 Voice token 出现次数，>=3 次视为活跃。
+    检测不到时默认返回 [0,1,2,3] (SATB 全开)。
+
+    Returns:
+        活跃声部索引列表，如 [0, 3] (两声部) 或 [0, 1, 2, 3] (四声部)
+    """
+    voice_counts: dict[int, int] = {}
+    _voice_prefix = tokenizer.VOICE
+    for tid in seed_tokens:
+        ts = tokenizer.decode_token(tid)
+        if ts.startswith(_voice_prefix):
+            try:
+                v = int(ts.split(' ')[1].rstrip('>'))
+            except (IndexError, ValueError):
+                continue
+            voice_counts[v] = voice_counts.get(v, 0) + 1
+
+    active = sorted([v for v, c in voice_counts.items() if c >= 3])
+    if not active:
+        return [0, 1, 2, 3]  # 检测不到默认 SATB
+    return active
+
+
+def voice_count_to_plan(count: int) -> list[int]:
+    """用户指定的声部数 → 活跃声部列表。
+
+    2 → [0, 3]  (主高音 + 主低音 = 旋律+贝斯骨架)
+    3 → [0, 1, 3] (主高+次高+主低)
+    4 → [0, 1, 2, 3] (SATB 全开)
+    """
+    if count >= 4:
+        return [0, 1, 2, 3]
+    if count == 3:
+        return [0, 1, 3]
+    if count == 2:
+        return [0, 3]
+    return [0, 1, 2, 3]
+
+
 def plan_structure(seed_tokens: list[int], tokenizer,
                    target_bars: int = 64,
                    form: str = 'free',
@@ -385,6 +431,159 @@ def harmony_to_ssf(
         list[list[float]]: 每个和弦一个 12 维向量
     """
     return [chord_func_to_ssf(c.func, tonic_name) for c in chords]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  v0.3.2: 乐句规划
+# ═══════════════════════════════════════════════════════════════
+
+def plan_phrases_for_section(
+    section_type: str, n_bars: int, cadence: str = 'PAC',
+    phrase_length: int = 8,
+) -> list:
+    """为段规划乐句结构。
+
+    根据 section.type 自动选择模板:
+      - theme1/theme2/exposition/recapitulation → period (平行乐段)
+      - development → sentence 或自由模进
+      - transition/bridge → 不规划乐句 (自由过渡)
+      - coda/closing → closing phrases
+
+    Returns:
+        list[PhrasePlan]
+    """
+    from .database import PhrasePlan
+
+    if n_bars < 4:
+        return []
+
+    if section_type in ('development', 'variation'):
+        return _expand_sentence_phrases(n_bars, cadence, phrase_length)
+    elif section_type in ('transition', 'bridge', 'intro', 'cadenza', 'episode'):
+        return []  # 自由过渡，不规划乐句
+    else:
+        # theme1/theme2/exposition/recapitulation/coda/section_a/section_b
+        return _expand_period_phrases(n_bars, cadence, phrase_length)
+
+
+def _expand_period_phrases(n_bars: int, final_cadence: str = 'PAC',
+                           phrase_length: int = 8) -> list:
+    """平行乐段: antecedent(HC) + consequent(PAC/IAC)。
+
+    32 bars, phrase_length=8:
+      phrase 0: antecedent, bars 0-7, HC
+      phrase 1: consequent, bars 8-15, PAC
+      phrase 2: antecedent, bars 16-23, HC
+      phrase 3: consequent, bars 24-31, PAC
+    """
+    from .database import PhrasePlan
+
+    phrases = []
+    n_pairs = n_bars // (phrase_length * 2)
+    remainder = n_bars % (phrase_length * 2)
+
+    for pair_idx in range(n_pairs):
+        base = pair_idx * phrase_length * 2
+        # Antecedent → HC
+        phrases.append(PhrasePlan(
+            phrase_idx=len(phrases),
+            phrase_type='antecedent',
+            bar_start=base,
+            bar_end=base + phrase_length,
+            cadence_target='HC',
+            contour_shape='ascending' if pair_idx % 2 == 0 else 'arch',
+            relation_to_prev='parallel' if pair_idx > 0 else None,
+        ))
+        # Consequent → PAC (or final_cadence for last pair)
+        cad = final_cadence if pair_idx == n_pairs - 1 else 'IAC'
+        phrases.append(PhrasePlan(
+            phrase_idx=len(phrases),
+            phrase_type='consequent',
+            bar_start=base + phrase_length,
+            bar_end=base + phrase_length * 2,
+            cadence_target=cad,
+            contour_shape='arch',
+            relation_to_prev='answering',
+        ))
+
+    # 剩余小节 → extension/closing
+    if remainder >= 4:
+        phrases.append(PhrasePlan(
+            phrase_idx=len(phrases),
+            phrase_type='closing',
+            bar_start=n_bars - remainder,
+            bar_end=n_bars,
+            cadence_target=final_cadence,
+            contour_shape='descending',
+        ))
+
+    return phrases
+
+
+def _expand_sentence_phrases(n_bars: int, cadence: str = 'HC',
+                             phrase_length: int = 8) -> list:
+    """乐句组: presentation(4) + continuation(4) 交替。
+
+    development, 24 bars, phrase_length=8:
+      phrase 0: presentation, bars 0-3
+      phrase 1: continuation, bars 4-7
+      phrase 2: presentation, bars 8-11 (模进上移)
+      phrase 3: continuation, bars 12-15 (碎片化)
+      phrase 4: transition, bars 16-19
+      phrase 5: closing, bars 20-23
+    """
+    from .database import PhrasePlan
+
+    phrases = []
+    half = max(2, phrase_length // 2)
+    n_units = n_bars // phrase_length
+    remainder = n_bars % phrase_length
+
+    for unit_idx in range(n_units):
+        base = unit_idx * phrase_length
+        is_last = (unit_idx == n_units - 1 and remainder < half)
+
+        if is_last:
+            # 最后一组 → closing
+            phrases.append(PhrasePlan(
+                phrase_idx=len(phrases),
+                phrase_type='closing',
+                bar_start=base,
+                bar_end=base + phrase_length,
+                cadence_target=cadence,
+                contour_shape='descending',
+            ))
+        else:
+            # Presentation
+            phrases.append(PhrasePlan(
+                phrase_idx=len(phrases),
+                phrase_type='antecedent',
+                bar_start=base,
+                bar_end=base + half,
+                cadence_target='HC' if unit_idx > 0 else 'IAC',
+                motif_variant='fragmented' if unit_idx > 0 else 'original',
+            ))
+            # Continuation
+            phrases.append(PhrasePlan(
+                phrase_idx=len(phrases),
+                phrase_type='consequent',
+                bar_start=base + half,
+                bar_end=base + phrase_length,
+                cadence_target='HC' if not is_last else cadence,
+                motif_variant='fragmented',
+            ))
+
+    # 剩余小节
+    if remainder >= 4:
+        phrases.append(PhrasePlan(
+            phrase_idx=len(phrases),
+            phrase_type='closing',
+            bar_start=n_bars - remainder,
+            bar_end=n_bars,
+            cadence_target=cadence,
+        ))
+
+    return phrases
 
 
 def cadence_ssf_boost(

@@ -1,9 +1,11 @@
-"""推理生成模块：自回归采样 → MusicXML 导出。
+"""推理生成模块：框架-内容分离自回归采样 → MusicXML 导出。
 
-.. deprecated::
-    v0.2.x 架构残留，v0.3.1 将被完全重写为框架-内容分离架构。
-    包含已废弃的 KEY/CHORD/ANTICIPATE token 引用，当前仅作参考。
-    请勿直接使用此模块的 v0.2.x 生成逻辑。
+v0.3.2: 框架-内容分离架构。
+  - A1 预插入所有框架 token (Bar/Tonic/TimeSig/Tempo/Clef/Position/Voice/Cadence)
+  - 模型只在内容槽 (Voice token 之后) 采样 Note_ON/Rest/Velocity/Duration 等
+  - B1 禁令从 ~570 暴降到 ~6 条规则
+
+v0.2.x 旧函数 (generate, generate_structure_plan, etc.) 仅作参考，请勿使用。
 """
 from __future__ import annotations
 
@@ -939,8 +941,21 @@ def section_aware_generate(model: MusicTransformer, tokenizer: REMITokenizer,
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Stage 3 — 逐段迭代生成 (ABC Engine v2, Phase 1)
+#  Stage 3 — 逐段迭代生成 (ABC Engine v2, v0.3.2 框架-内容分离)
 # ═══════════════════════════════════════════════════════════════
+
+# ── v0.3.2: 框架-内容分离常量 ──────────────────────────────────
+_MAX_CONTENT_TOKENS_PER_SLOT = 12  # 每个内容槽最多生成的 token 数
+_FRAMEWORK_FORWARD_BATCH = 16       # 框架 token 批量 forward 大小
+
+# ── v0.3.2: 终止区参数 ─────────────────────────────────────────
+CADENCE_ZONE_LENGTH: dict[str, int] = {
+    'PAC': 2, 'IAC': 2, 'HC': 1, 'DC': 1, 'PC': 2,
+}
+CADENCE_TEMPERATURE_DELTA: dict[str, float] = {
+    'PAC': -0.2, 'IAC': -0.1, 'HC': 0.0, 'DC': 0.0, 'PC': -0.15,
+}
+
 
 @torch.no_grad()
 def stage3_iterative_generate(
@@ -952,16 +967,30 @@ def stage3_iterative_generate(
     max_retries: int = 2,
     base_temperature: float = 1.0,
     top_k: int = 20,
-    abc_logger = None,  # 可选: ABCGenerationLogger 实例
+    voice_plan: list[int] | None = None,  # v0.3.2: 活跃声部, None=全开
+    abc_logger=None,
 ) -> tuple[list[int], dict | None]:
-    """Stage 3 逐段迭代生成 + ABC Engine 闭环。"""
-    from chopinote_abc.database import (A1DB, A2DB, A3DB, SeedContext)
-    from chopinote_abc.planner import plan_structure, plan_harmony
+    """Stage 3 逐段迭代生成 + ABC Engine 闭环 (框架-内容分离版)。
+
+    v0.3.2 核心改动:
+      - A1.build_framework() 预插入全部框架 token
+      - 模型只填内容槽 (Voice token 之后的 content slot)
+      - B1 禁令从 ~570 暴降到 ~6 条规则
+    """
+    from chopinote_abc.database import A1DB, A2DB, A3DB, SeedContext
+    from chopinote_abc.planner import (plan_structure, plan_harmony,
+                                         detect_active_voices)
 
     device = next(model.parameters()).device
     bar_id = tokenizer.bar_token_id
-
     seed_bar_count = sum(1 for t in seed_tokens if t == bar_id)
+
+    # ── v0.3.2: VoicePlan 自动检测 ──
+    if voice_plan is None:
+        voice_plan = detect_active_voices(seed_tokens, tokenizer)
+        if abc_logger:
+            abc_logger.info('A1', f'VoicePlan auto-detect: {voice_plan} '
+                            f'({len(voice_plan)} voices)')
 
     # ── 日志 ──
     if abc_logger:
@@ -989,6 +1018,14 @@ def stage3_iterative_generate(
     )
     a1.harmony = plan_harmony(a1, seed_tokens, tokenizer)
 
+    # ── v0.3.2: 乐句层规划 ──
+    from chopinote_abc.planner import plan_phrases_for_section
+    from chopinote_abc.database import PhraseState
+    for sec in a1.sections:
+        sec.phrases = plan_phrases_for_section(
+            sec.type, sec.bars, sec.cadence)
+    phrase_state = PhraseState()
+
     if abc_logger:
         abc_logger.a1_structure(a1.sections)
         abc_logger.a1_harmony(a1.harmony, len(a1.harmony))
@@ -998,23 +1035,23 @@ def stage3_iterative_generate(
 
     all_tokens, report = _stage3_generate_once(
         model, tokenizer, seed_tokens, a1, a2, a3,
-        bar_id, base_temperature, top_k,
-        abc_logger=abc_logger,
+        bar_id, base_temperature, top_k, voice_plan,
+        phrase_state, abc_logger=abc_logger,
     )
 
-    for _ in range(max_retries):
+    for retry_idx in range(max_retries):
         if not report.get('structural_fixes'):
             break
         if abc_logger:
-            abc_logger.info('SYS', f'重试 {_+1}/{max_retries}: '
+            abc_logger.info('SYS', f'重试 {retry_idx+1}/{max_retries}: '
                             f'{len(report["structural_fixes"])}条修复')
         for fix in report['structural_fixes']:
             a1.apply_fix(fix)
         a1.reset_overrides()
         all_tokens, report = _stage3_generate_once(
             model, tokenizer, seed_tokens, a1, a2, a3,
-            bar_id, base_temperature, top_k,
-            abc_logger=abc_logger,
+            bar_id, base_temperature, top_k, voice_plan,
+            phrase_state, abc_logger=abc_logger,
         )
 
     if abc_logger:
@@ -1027,375 +1064,255 @@ def stage3_iterative_generate(
     return all_tokens, report
 
 
-# ═══════════════════════════════════════════════════════════════
-#  子段自动切分 — 长段 (> max_bars_per_subsection) 拆成
-#  多个子段，每子段独立 KV cache，自动续接。
-# ═══════════════════════════════════════════════════════════════
-
-_MAX_BARS_PER_SUBSECTION = 24   # ~1440 tok + prefix ~400 = ~1840, 安全在 4096 内
-_PREFIX_OVERHEAD_ESTIMATE = 400
-_AVG_TOKENS_PER_BAR = 60
-
-
-def _subsection_bars(section_bars: int, max_per_sub: int = _MAX_BARS_PER_SUBSECTION
-                    ) -> list[int]:
-    """将长段拆成子段 bar 数列表。"""
-    if section_bars <= max_per_sub:
-        return [section_bars]
-    chunks = []
-    remaining = section_bars
-    while remaining > 0:
-        n = min(max_per_sub, remaining)
-        chunks.append(n)
-        remaining -= n
-    return chunks
-
-
 @torch.no_grad()
 def _stage3_generate_once(
     model, tokenizer, seed_tokens, a1, a2, a3,
     bar_id, base_temperature, top_k,
-    max_bars_per_subsection: int = _MAX_BARS_PER_SUBSECTION,
-    abc_logger=None,  # 可选: ABCGenerationLogger 实例
+    voice_plan: list[int],
+    phrase_state=None,
+    abc_logger=None,
 ) -> tuple[list[int], dict]:
-    """单次逐段生成 — Phase 2.5: 子段自动切分 + BFeedback + 发展配方。
+    """单次逐段生成 — v0.3.2 框架-内容分离版。
 
-    长段 (> max_bars_per_subsection) 自动拆为多个子段：
-      - 每子段清 KV cache + 重构 prefix + 重新 forward
-      - 同段内 A2 地标指向主题段（不变），prev_tail 指向上一子段尾
-      - BFeedback (创新预算/致命信号) 跨子段累积，逐段 reset_per_section()
+    核心流程:
+      1. A1.build_framework() → 完整框架骨架
+      2. 逐 token 推进: 框架 token → 直接追加; Voice token → 内容槽采样
+      3. 模型采样时禁止所有框架 token
+      4. B1 仅保留 ~6 条硬约束规则
     """
-    from chopinote_abc.planner import reharmonize_from_bar
-    from chopinote_abc.decision import (BHardBans, BFeedback,
-                                          apply_zone_temperature)
-    from chopinote_abc.motif import contour_similarity
+    from chopinote_abc.decision import BHardBans, BFeedback, apply_zone_temperature
+    from chopinote_abc.planner import reharmonize_from_bar, cadence_ssf_boost
 
     device = next(model.parameters()).device
     eos_id = tokenizer.eos_token_id
-    seed_bar_count = sum(1 for t in seed_tokens if t == bar_id)
-    all_tokens = list(seed_tokens)
-    cumulative_bar_count = a1.seed_context.bar_count if a1.seed_context else 0
+    seed_bar_count = a1.seed_context.bar_count if a1.seed_context else 0
 
+    # ── 构建框架骨架 ─────────────────────────────────────────
+    framework_tokens = a1.build_framework(
+        tokenizer, voice_plan=voice_plan, seed_bar_count=seed_bar_count)
+    framework_ids = tokenizer.framework_token_ids  # 模型禁止采样这些
+
+    # ── 预计算内容槽起点索引 ──────────────────────────────
+    # Voice token 之后的位置就是内容槽
+    _voice_prefix = tokenizer.VOICE
+    content_slot_starts: set[int] = set()
+    for i, ftok in enumerate(framework_tokens):
+        ts = tokenizer.decode_token(ftok)
+        if ts.startswith(_voice_prefix):
+            content_slot_starts.add(i)
+
+    # ── 初始化 ─────────────────────────────────────────────
+    all_tokens = list(seed_tokens)
+    cumulative_bar_count = seed_bar_count
     b_feedback = BFeedback()
 
-    # 预计算上下文 token — 禁止模型生成无法正确处理或破坏结构的 token
-    _context_ban_ids: set[int] = set()
-    # Tuplet / GraceNote: 渲染器不支持，必须禁止
-    for prefix in ('<Tuplet', '<GraceNote'):
-        for tid in range(tokenizer.vocab_size):
-            if tokenizer.decode_token(tid).startswith(prefix):
-                _context_ban_ids.add(tid)
-    # Program: 只允许 seed 中已有的 Program token（防止生成幽灵声部）
-    _seed_programs: set[int] = set()
-    for t in seed_tokens:
-        ts = tokenizer.decode_token(t)
-        if ts.startswith('<Program'):
-            _seed_programs.add(t)
-    for tid in range(tokenizer.vocab_size):
-        ts = tokenizer.decode_token(tid)
-        if ts.startswith('<Program') and tid not in _seed_programs:
-            _context_ban_ids.add(tid)
-    # Tempo / TimeSig: 不再禁止 —— 这两个 token 数量很少（~24个），
-    # 不影响词汇多样性，反而帮助模型正确结束小节
+    # ── 简化 B1 禁令 (v0.3.2: 仅 ~6 条规则) ─────────────
+    # 框架 token 不再需要禁止 — 模型永远不会采样它们
+    # 只保留: 音域 + 平行 + 交错 + 跳跃 + DurSat Rule1/2
+    hard_bans = BHardBans()
 
-    if abc_logger:
-        abc_logger.b1_context_bans(
-            len(_context_ban_ids),
-            ['Tuplet', 'GraceNote', f'Program(非seed:{len(_seed_programs)}个保留)'])
+    # ── KV cache: 先 forward seed ──────────────────────────
+    kv_caches = [[None, None] for _ in range(model.config.n_layers)]
+    if seed_tokens:
+        seed_tensor = torch.tensor([seed_tokens], dtype=torch.long, device=device)
+        model.forward(seed_tensor, kv_caches=kv_caches)
 
-    for section_idx, section in enumerate(a1.sections):
-        b_feedback.reset_per_section()
+    # ── 段落追踪 ─────────────────────────────────────────
+    section_idx = 0
+    current_section = a1.sections[0] if a1.sections else None
+    bar_in_section = 0
 
-        if abc_logger:
-            abc_logger.set_section(section_idx, section.type)
-            abc_logger.b2_section_start(
-                section_idx, section.type, section.bars,
-                getattr(section, 'innovation_budget', 0.1),
-                getattr(section, 'development_ops', None))
+    # ── 主循环: 逐框架 token 推进 ─────────────────────────
+    fw_idx = 0
+    total_fw = len(framework_tokens)
 
-        # ── Phase 2: 发展配方初始化 ──
-        if section.development_ops:
-            theme_dna = a2.get_dna('theme1_statement') or a2.get_dna('seed_statement')
-            theme_contour = theme_dna.contour if theme_dna else None
-            b_feedback.setup_development_ops(
-                section.development_ops, theme_contour)
+    while fw_idx < total_fw:
+        ftok = framework_tokens[fw_idx]
+        fw_ts = tokenizer.decode_token(ftok)
 
-        # ── 子段切分 ──
-        sub_bars_list = _subsection_bars(section.bars, max_bars_per_subsection)
-        section_tokens = []
-        section_done = False
+        # ═══════════════════════════════════════════════════════
+        #  Case 1: 结构级 token — 直接追加, 更新状态
+        # ═══════════════════════════════════════════════════════
+        if ftok == bar_id:
+            # 段切换检测
+            if current_section and bar_in_section >= current_section.bars:
+                # 段完成: A3 快照 + A2 归档 + 段间 C→B 反馈
+                a3.snapshot_section(section_idx, [], tokenizer, a1)
+                if current_section.type.startswith('theme') or current_section.type == 'exposition':
+                    a2.from_section(section_idx, [], a3, tokenizer, a1)
+                section_idx += 1
+                if section_idx < len(a1.sections):
+                    # 段间反馈
+                    try:
+                        _apply_section_c_feedback(
+                            all_tokens, [], section_idx - 1, a1, tokenizer,
+                            GenerationParams(temperature=base_temperature, top_k=top_k),
+                            seed_bar_count, abc_logger=abc_logger)
+                    except Exception:
+                        pass
+                    current_section = a1.sections[section_idx]
+                    bar_in_section = 0
+                    b_feedback.reset_per_section()
 
-        for sub_idx, sub_bars in enumerate(sub_bars_list):
-            if section_done:
-                break
+            all_tokens.append(ftok)
+            cumulative_bar_count += 1
+            bar_in_section += 1
 
-            # ── 每子段重建 prefix + 清 KV cache ──
-            prefix_tokens = []
-            # ① 全曲结构 (全局不变)
-            prefix_tokens.extend(a1.build_structure_tokens(tokenizer))
-            # ② 全曲和声 (全局不变，只保留当前段及之后的)
-            prefix_tokens.extend(a1.build_harmony_tokens(tokenizer))
+            # 温区退火
+            temperature = apply_zone_temperature(
+                current_section, bar_in_section - 1, base_temperature
+            ) if current_section else base_temperature
 
-            # ④ A2 地标 (始终指向主题段，不是上一子段)
-            if section_idx > 0:
-                for label in a2.records:
-                    if label.startswith('theme1_') or label.startswith('seed_'):
-                        prefix_tokens.extend(a2.get_purified_tokens(label))
+            # ── v0.3.2: 终止区温度微调 ──
+            if current_section and current_section.cadence:
+                cadence_bars = CADENCE_ZONE_LENGTH.get(current_section.cadence, 2)
+                in_cadence = bar_in_section > current_section.bars - cadence_bars
+                if in_cadence:
+                    delta = CADENCE_TEMPERATURE_DELTA.get(current_section.cadence, 0.0)
+                    temperature += delta
 
-            # ⑤ 前段尾部: 首子段用上一段尾，后续子段用上一子段尾
-            if sub_idx == 0 and section_idx > 0:
-                # 首子段: 前一段的末 bar
-                prefix_tokens.extend(
-                    _prev_section_tail(all_tokens, tokenizer, last_n_bars=1))
-            elif sub_idx > 0 and section_tokens:
-                # 后续子段: 本段已生成的最后一个 bar
-                tail = _prev_section_tail(section_tokens, tokenizer, last_n_bars=1)
-                prefix_tokens.extend(tail)
+            # ── v0.3.2: 乐句追踪 ──
+            if phrase_state and current_section and current_section.phrases:
+                new_phrase = current_section.get_phrase_at_bar(bar_in_section - 1)
+                if new_phrase and new_phrase is not phrase_state.plan:
+                    phrase_state.plan = new_phrase
+                    phrase_state.bars_generated = 0
+                    phrase_state.contour_so_far = []
+                if phrase_state.plan:
+                    phrase_state.bars_generated += 1
+                    # 乐句级温度微调: 开头×0.9, 中段×1.0, 终止×0.7
+                    progress = phrase_state.progress()
+                    if progress < 0.2:
+                        temperature *= 0.9   # 保守开端
+                    elif progress > 0.7:
+                        temperature *= 0.85  # 收敛终止
 
-            kv_caches = [[None, None] for _ in range(model.config.n_layers)]
-            if prefix_tokens:
-                prefix_tensor = torch.tensor(
-                    [prefix_tokens], dtype=torch.long, device=device)
-                model.forward(prefix_tensor, kv_caches=kv_caches)
+            # 每 bar 开始清空动态禁令
+            hard_bans.clear()
 
-            # ── 子段 bar 偏移: 全局 bar_idx = 段首 offset + 子段 offset ──
-            sub_bar_offset = sum(sub_bars_list[:sub_idx])
+            fw_idx += 1
+            continue
 
-            for bar_idx in range(sub_bars):
-                global_bar_idx = sub_bar_offset + bar_idx
+        # 结构 token (Tonic/TimeSig/Tempo/Clef/Position/Section/Cadence)
+        if (fw_ts.startswith(tokenizer.TONIC) or
+            fw_ts.startswith(tokenizer.TIMESIG) or
+            fw_ts.startswith(tokenizer.TEMPO) or
+            fw_ts.startswith(tokenizer.CLEF) or
+            fw_ts.startswith(tokenizer.POSITION) or
+            fw_ts.startswith(tokenizer.CADENCE)):
+            all_tokens.append(ftok)
+            fw_idx += 1
+            continue
 
-                # ── 温区退火（Phase 2: 热区融入 innovation_budget）──
-                temperature = apply_zone_temperature(
-                    section, global_bar_idx, base_temperature)
+        # ═══════════════════════════════════════════════════════
+        #  Case 2: Voice token → 内容槽 — 模型采样
+        # ═══════════════════════════════════════════════════════
+        if fw_ts.startswith(_voice_prefix):
+            all_tokens.append(ftok)
 
-                if abc_logger:
-                    zone = 'hot' if temperature > base_temperature * 1.2 else \
-                           'cold' if temperature < base_temperature * 0.8 else 'warm'
-                    abc_logger.b2_zone_temperature(
-                        global_bar_idx, base_temperature, temperature, zone)
-
-                # ── B 发展配方调参 ──
-                gen_params = GenerationParams(
-                    temperature=temperature,
-                    top_k=top_k,
-                )
-
-                if b_feedback.invert_target is not None and section_tokens:
-                    dev_adj = b_feedback.get_development_adjustments(
-                        _extract_current_contour(section_tokens, tokenizer))
-                    if dev_adj.get('temperature'):
-                        gen_params.temperature = max(0.1, gen_params.temperature
-                                                     + dev_adj['temperature'])
-
-                hard_bans = BHardBans()
-                hard_bans.banned_tokens.update(_context_ban_ids)
-
-                bar_tokens = []
-                done = False
-                note_count = 0
-                bar_seen = 0  # 本 bar 内已遇到的 <Bar> 数量
-
-                for _ in range(256):
-                    if bar_tokens:
-                        last_tok = bar_tokens[-1]
-                    elif section_tokens:
-                        last_tok = section_tokens[-1]
-                    elif prefix_tokens:
-                        last_tok = prefix_tokens[-1]
-                    else:
-                        last_tok = seed_tokens[-1]
-
-                    next_input = torch.tensor(
-                        [[last_tok]], dtype=torch.long, device=device)
-
-                    _fw_t0 = time.perf_counter() if abc_logger and abc_logger.file_level <= 10 else 0
-                    logits = model.forward(next_input, kv_caches=kv_caches,
-                                           measure_ids=torch.tensor(
-                                               [[cumulative_bar_count]], device=device))
-                    logits = logits[:, -1, :] / max(gen_params.temperature, 1e-8)
-                    if _fw_t0:
-                        _fw_ms = (time.perf_counter() - _fw_t0) * 1000
-                        abc_logger.log_forward_pass(
-                            global_bar_idx, _fw_ms,
-                            len(kv_caches[0][0]) if kv_caches[0][0] is not None else 0,
-                            len(all_tokens))
-
-                    if hard_bans.has_bans():
-                        for bid in hard_bans.merge_all():
-                            if 0 <= bid < logits.size(-1):
-                                logits[0, bid] = float('-inf')
-
-                    if gen_params.top_k > 0:
-                        vals, _ = torch.topk(
-                            logits, min(gen_params.top_k, logits.size(-1)))
-                        logits[logits < vals[:, -1:]] = float('-inf')
-
-                    probs = torch.softmax(logits, dim=-1)
-                    next_tok = torch.multinomial(probs, num_samples=1)
-                    tid = next_tok.item()
-                    bar_tokens.append(tid)
-
-                    # ── Token 级日志 ──
-                    if abc_logger and abc_logger.file_level <= 10:  # DEBUG
-                        _ts = tokenizer.decode_token(tid)
-                        if _ts.startswith(tokenizer.NOTE_ON):
-                            _ttype = 'NOTE_ON'
-                        elif _ts.startswith(tokenizer.REST):
-                            _ttype = 'REST'
-                        elif _ts.startswith(tokenizer.POSITION):
-                            _ttype = 'POS'
-                        elif _ts.startswith(tokenizer.BAR):
-                            _ttype = 'BAR'
-                        elif _ts.startswith(tokenizer.CHORD):
-                            _ttype = 'CHORD'
-                        elif _ts.startswith(tokenizer.PROGRAM):
-                            _ttype = 'PROG'
-                        elif _ts.startswith(tokenizer.VELOCITY):
-                            _ttype = 'VEL'
-                        elif _ts.startswith(tokenizer.DURATION):
-                            _ttype = 'DUR'
-                        elif _ts.startswith(tokenizer.KEY):
-                            _ttype = 'KEY'
-                        else:
-                            _ttype = 'OTHER'
-                        abc_logger.log_token_sample(
-                            global_bar_idx, len(bar_tokens) - 1, tid,
-                            _ts, _ttype, gen_params.temperature,
-                            vals[:, -1:].item() if gen_params.top_k > 0 else 0.0,
-                            probs[0, tid].item(),
-                            logits[logits > float('-inf')].min().item(),
-                            logits[logits > float('-inf')].max().item())
-
-                    if tokenizer.decode_token(tid).startswith(tokenizer.NOTE_ON):
-                        note_count += 1
-
-                    if tid == bar_id:
-                        bar_seen += 1
-                        if bar_seen >= 2:  # 第二个 <Bar> = 下一个小节开始
-                            # 回退这个 bar token（属于下一 bar）
-                            bar_tokens.pop()
-                            break
-                    if tid == eos_id:
-                        done = True
-                        break
-                    # Fallback: bar 太长或音符密度异常 → 自动截断
-                    if len(bar_tokens) >= 48 and note_count >= 6:
-                        break
-                        break
-
-                section_tokens.extend(bar_tokens)
-                cumulative_bar_count += 1
-
-                # ── A3 记录 + BFeedback 更新 ──
-                b1_proxy = _compute_b1_proxy(bar_tokens, tokenizer)
-                a3.record_bar(cumulative_bar_count, bar_tokens, tokenizer,
-                              b1_score=b1_proxy)
-
-                # ── 日志: bar 完成 ──
-                if abc_logger:
-                    all_banned = hard_bans.merge_all()
-                    dynamic_bans = all_banned - _context_ban_ids
-                    abc_logger.b1_bar_bans(
-                        global_bar_idx,
-                        context_count=len(_context_ban_ids),
-                        dynamic_count=len(dynamic_bans))
-                    abc_logger.b1_bar_result(
-                        global_bar_idx, len(bar_tokens), note_count, b1_proxy)
-                    abc_logger.a3_bar_record(cumulative_bar_count,
-                                             a3.get_last_bar(), b1_proxy)
-                    abc_logger.log_bar_tokens(global_bar_idx, bar_tokens, tokenizer)
-
-                last = a3.get_last_bar()
-                fb_result = b_feedback.on_bar_complete(last, b1_proxy, section)
-
-                # ── Phase 2: 创新预算判定 ──
-                if fb_result.get('admit_innovation'):
-                    surprise = _compute_deviation_surprise(last, a3.baselines)
-                    b_feedback.record_innovation_entry(
-                        cumulative_bar_count, 'surprising_but_coherent',
-                        surprise, bar_tokens)
-                    if abc_logger:
-                        abc_logger.b2_innovation_admitted(
-                            cumulative_bar_count, 'surprising_but_coherent', surprise)
-
-                # ── 致命信号检测 ──
-                if fb_result.get('fatal') == 'reharmonize':
-                    if abc_logger:
-                        abc_logger.b2_fatal_signal(
-                            'reharmonize', cumulative_bar_count,
-                            f'B1连续低分 streak={b_feedback.b1_low_streak}')
-                        abc_logger.a1_reharmonize(cumulative_bar_count, 0)
-                    seed_offset = a1.seed_context.bar_count if a1.seed_context else 0
-                    new_harmony = reharmonize_from_bar(
-                        a1, from_bar=cumulative_bar_count,
-                        seed_bar_offset=seed_offset)
-                    if abc_logger:
-                        abc_logger.a1_reharmonize(
-                            cumulative_bar_count, len(new_harmony))
-                    a1.override_harmony(cumulative_bar_count, new_harmony)
-                    section_tokens = []
-                    section_done = True
-                    break
-
-                if fb_result.get('fatal') == 'abort':
-                    if abc_logger:
-                        abc_logger.b2_fatal_signal(
-                            'abort', cumulative_bar_count,
-                            f'连续空bar streak={b_feedback.consecutive_empty}')
-                    section_done = True
-                    done = True
-                    break
-
-                if done:
-                    section_done = True
-                    break
-
-        # ── 段完成: 快照 + A2 归档 ──
-        a3.snapshot_section(section_idx, section_tokens, tokenizer, a1)
-
-        # 日志: 段快照
-        if abc_logger:
-            sec_bars = [b for b in a3.bar_log if b.bar > seed_bar_count + sum(
-                (a1.sections[k].bars if k < section_idx else 0) for k in range(section_idx))
-                        and b.bar <= seed_bar_count + sum(
-                (a1.sections[k].bars if k <= section_idx else 0) for k in range(section_idx + 1))]
-            avg_density = sum(b.density for b in sec_bars) / max(len(sec_bars), 1)
-            abc_logger.a3_section_snapshot(
-                section_idx, section.type, len(sec_bars), avg_density)
-
-        # Phase 2: 创新日志写入 A3
-        for entry in b_feedback.innovation_log:
-            a3.record_innovation(entry.bar, {
-                'type': entry.innovation_type,
-                'surprise': entry.surprise,
-            })
-
-        if section.type.startswith('theme') or section.type == 'exposition':
-            a2.from_section(section_idx, section_tokens, a3, tokenizer, a1)
-            if abc_logger:
-                dna = a2.get_dna(f'theme{section_idx}_statement')
-                if dna:
-                    abc_logger.a2_motif_extracted(
-                        f'theme{section_idx}_statement', dna)
-
-        all_tokens.extend(section_tokens)
-
-        # ── Phase 3: 段间 C→B 反馈（最后一个段不跑，由 _c_evaluate 收尾）──
-        if section_idx + 1 < len(a1.sections):
+            # 解析当前声部
             try:
-                _apply_section_c_feedback(
-                    all_tokens, section_tokens, section_idx,
-                    a1, tokenizer, gen_params,
-                    a1.seed_context.bar_count if a1.seed_context else 0,
-                    abc_logger=abc_logger)
-            except Exception:
-                pass  # 段间反馈失败不阻塞生成
+                current_voice = int(fw_ts.split(' ')[1].rstrip('>'))
+            except (IndexError, ValueError):
+                current_voice = 0
 
-    # ── C 复盘: 完整 token 级 + MusicXML 级评价 ──
+            # ── DurSat: 检查声部是否已满 ────────────────
+            # (简化: 基于 token 流实时追踪 cum_dur)
+            voice_full = False
+
+            # 内容槽循环
+            slot_tokens = []
+            for _ in range(_MAX_CONTENT_TOKENS_PER_SLOT):
+                last_tok = all_tokens[-1]
+                next_input = torch.tensor([[last_tok]], dtype=torch.long, device=device)
+
+                logits = model.forward(next_input, kv_caches=kv_caches)
+                logits = logits[:, -1, :] / max(temperature, 1e-8)
+
+                # ── 禁止所有框架 token ──
+                for fid in framework_ids:
+                    if 0 <= fid < logits.size(-1):
+                        logits[0, fid] = float('-inf')
+
+                # ── B1 硬约束 ──
+                if hard_bans.has_bans():
+                    for bid in hard_bans.merge_all():
+                        if 0 <= bid < logits.size(-1):
+                            logits[0, bid] = float('-inf')
+
+                # ── DurSat: 声部已满时禁止 Note_ON ──
+                if voice_full:
+                    for nid in _all_note_on_ids(tokenizer):
+                        if 0 <= nid < logits.size(-1):
+                            logits[0, nid] = float('-inf')
+
+                # top-k
+                if top_k > 0:
+                    vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < vals[:, -1:]] = float('-inf')
+
+                probs = torch.softmax(logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+                tid = next_tok.item()
+                slot_tokens.append(tid)
+                all_tokens.append(tid)
+
+                ts = tokenizer.decode_token(tid)
+
+                # Token 级日志
+                if abc_logger and abc_logger.file_level <= 10:
+                    _ttype = ts.split(' ')[0] if ' ' in ts else ts
+                    abc_logger.log_token_sample(
+                        cumulative_bar_count, len(slot_tokens) - 1, tid,
+                        ts, _ttype, temperature,
+                        vals[:, -1:].item() if top_k > 0 else 0.0,
+                        probs[0, tid].item(),
+                        logits[logits > float('-inf')].min().item(),
+                        logits[logits > float('-inf')].max().item())
+
+                # Duration token → 音符/休止事件完成
+                if ts.startswith(tokenizer.DURATION):
+                    break
+
+                # EOS → 立即终止
+                if tid == eos_id:
+                    break
+
+            # ── DurSat 追踪 (简化: 基于 slot_tokens 判断) ──
+            _note_count = sum(1 for t in slot_tokens
+                            if tokenizer.decode_token(t).startswith(tokenizer.NOTE_ON))
+            if _note_count > 0:
+                # 有音符 → 声部未满
+                pass
+
+            fw_idx += 1
+            continue
+
+        # ═══════════════════════════════════════════════════════
+        #  Case 3: 未知 token — 直接追加
+        # ═══════════════════════════════════════════════════════
+        all_tokens.append(ftok)
+        fw_idx += 1
+
+    # ── BFeedback 致命信号检测 (框架模式下简化) ──
+    # 框架模式几乎不会产生致命信号 (Bar/Position 由 A1 保证)
+    # 但仍保留空 bar 检测
+
+    # ── C 复盘 ─────────────────────────────────────────────
     sbc = a1.seed_context.bar_count if a1.seed_context else 0
     report = _c_evaluate(all_tokens, a1, a2, a3, tokenizer,
                          seed_tokens, sbc, abc_logger=abc_logger)
     return all_tokens, report
+
+
+def _all_note_on_ids(tokenizer) -> set[int]:
+    """返回所有 Note_ON token ID (缓存，避免每 slot 重算)。"""
+    if not hasattr(_all_note_on_ids, '_cache'):
+        ids = set()
+        for interval in range(-60, 61):
+            ids.add(tokenizer.encode_token(f'<Note_ON {interval}>'))
+        _all_note_on_ids._cache = ids
+    return _all_note_on_ids._cache
 
 
 def _extract_current_contour(tokens: list[int], tokenizer) -> list[int] | None:

@@ -51,12 +51,31 @@ class BHardBans:
     bar_early: bool = False
         # True = 小节活跃声部未满，禁止 Bar token
 
+    # ── v0.3.2: VoicePlan 兜底 ──
+    inactive_voice_tokens: set[int] = field(default_factory=set)
+        # VoicePlan 关闭的声部 token，模型永远不能采样
+
+    def ban_inactive_voices(self, active_voices: list[int], tokenizer):
+        """v0.3.2: 禁止模型采样 VoicePlan 已关闭的声部 token。
+
+        A1 不为 inactive 声部预插框架 token，但模型可能自己尝试采样
+        <Voice N>。此方法作为 B1 硬兜底。
+        """
+        self.inactive_voice_tokens.clear()
+        for v in range(4):
+            if v not in active_voices:
+                tid = tokenizer.encode_token(f'{tokenizer.VOICE} {v}>')
+                self.inactive_voice_tokens.add(tid)
+
     def ban_context_tokens(self, tokenizer):
-        """Block global context tokens during note-filling (ABC prefix provides them)."""
-        for prefix in ('<Program', '<Tempo', '<TimeSig'):
-            for tid in range(tokenizer.vocab_size):
-                if tokenizer.decode_token(tid).startswith(prefix):
-                    self.banned_tokens.add(tid)
+        """v0.3.2: 框架-内容分离后，此方法为空操作。
+
+        框架 token (Program/Tempo/TimeSig/Bar/Tonic/Clef/Position/Voice 等)
+        由 A1 预插入，模型永不采样，无需禁令。
+        仅保留 ~6 条 B1 硬约束规则 (音域/平行/交错/跳跃/DurSat Rule1+2)。
+        """
+        # v0.3.2: no-op — framework tokens are pre-inserted by A1
+        pass
 
     def merge_all(self) -> set[int]:
         """合并所有违规 token 为统一集合 → 传给 generate_step。"""
@@ -64,7 +83,7 @@ class BHardBans:
         for attr in ('parallel_fifths', 'parallel_octaves', 'voice_crossing',
                      'out_of_range', 'extreme_leap',
                      'unresolved_leading_tone', 'contour_violation',
-                     'duration_overflow'):
+                     'duration_overflow', 'inactive_voice_tokens'):
             all_banned.update(getattr(self, attr, set()))
         return all_banned
 
@@ -79,6 +98,7 @@ class BHardBans:
         self.unresolved_leading_tone.clear()
         self.contour_violation.clear()
         self.duration_overflow.clear()
+        self.inactive_voice_tokens.clear()
         self.note_on_banned = False
         self.bar_early = False
 
@@ -243,6 +263,9 @@ class BFeedback:
     # ── 创新预算追踪 ──
     innovations_used: int = 0         # 本段已消耗的创新次数
     innovation_log: list[InnovationEntry] = field(default_factory=list)
+
+    # ── v0.3.2: 乐句追踪 ──
+    phrase_state: object | None = None   # PhraseState 实例 (避免循环导入)
 
     # ── 发展配方状态 ──
     invert_target: list[int] | None = None  # 当前倒影 target contour

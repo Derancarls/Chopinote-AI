@@ -205,6 +205,7 @@ class TrainingConfig:
     max_eval_batches: int = 100  # 限制验证批次数，100 batch × 8 = 800 样本，~6min
     # ── Token 级 loss 加权 ──
     position_token_loss_weight: float = 2.0    # Position token 预测 loss 乘数（提权强调换位）
+    frame_weight: float = 0.1                  # v0.3.2: 框架 token CE loss 降权 (从训练学到上下文，但不重点预测)
     repetition_penalty: float = 1.2            # 连续 ≥4 同类型 token 的 loss 乘数
     max_notes_per_position: int = 8            # 训练时同 Position 音符数 > 此值 → mask 该 bar
     # ── 训练稳定化 ──
