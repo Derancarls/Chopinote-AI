@@ -429,8 +429,10 @@ class FastMIDIToREMI:
                 current_key = key_at_m
             else:
                 current_key = last_key_name or initial_key
-            events.append((self.KEY, current_key))
-            last_key_name = current_key
+            # v0.3.0: extract tonic from key name (Dm→D, Bb→Bb)
+            tonic_name = current_key[:-1] if current_key.endswith('m') else current_key
+            events.append((self.KEY, tonic_name))
+            last_key_name = current_key  # keep full key for next-iteration comparison
 
             # 拍号（每小节必发）
             ts = measure_ts.get(m) or _get_time_sig(measure_starts[m])
@@ -506,7 +508,9 @@ class FastMIDIToREMI:
                         cur_prog = prog
                         cur_sub = sub
 
-                    tonic = key_name_to_tonic_midi(last_key_name or initial_key)
+                    key_name = last_key_name or initial_key
+                    tonic_name = key_name[:-1] if key_name.endswith('m') else key_name
+                    tonic = key_name_to_tonic_midi(tonic_name)
                     interval = max(-60, min(60, pitch - tonic))
 
                     if is_grace:
