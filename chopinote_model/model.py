@@ -476,16 +476,33 @@ class MusicTransformer(nn.Module):
                 voice_ids[:, t] = current
         return voice_ids
 
-    def _build_fig_ids(self, input_ids):
-        """从 token 序列追踪当前 Figuration type。"""
+    def _build_voicefig_ids(self, input_ids):
+        """v0.3.2 gen5: 追踪 per-voice fig type，在 Voice token 位置返回对应 fig type。
+
+        遇到 <FigV V X> 时更新 voice_fig[V], 遇到 <Voice V> 时输出 voice_fig[V]。
+        非 Voice token 位置填 0 (none)。
+        """
         B, T = input_ids.shape
         fig_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
-        for fid in self.fig_token_ids_set:
-            current = 0
+        for b in range(B):
+            vf = [0, 0, 0, 0]  # current fig type per voice
             for t in range(T):
-                if input_ids[0, t] == fid:
-                    current = fid - min(self.fig_token_ids_set) + 1 if self.fig_token_ids_set else 0
-                fig_ids[:, t] = current
+                tid = input_ids[b, t].item()
+                # Check for per-voice fig tokens
+                for vi in range(4):
+                    for fi, ftid in enumerate(self.figv_tids_by_voice[vi]):
+                        if ftid > 0 and tid == ftid:
+                            vf[vi] = fi  # fi=0 is 'none', 1=block, etc.
+                            break
+                # Check for Voice tokens → output current fig for that voice
+                if tid == self.voice_tids[0]:
+                    fig_ids[b, t] = vf[0]
+                elif tid == self.voice_tids[1]:
+                    fig_ids[b, t] = vf[1]
+                elif tid == self.voice_tids[2]:
+                    fig_ids[b, t] = vf[2]
+                elif tid == self.voice_tids[3]:
+                    fig_ids[b, t] = vf[3]
         return fig_ids
 
     def _build_cadence_ids(self, input_ids):
@@ -510,9 +527,17 @@ class MusicTransformer(nn.Module):
             for v in range(4):
                 self.voice_tids[v] = tk.encode_token(f'<Voice {v}>')
         if self.config.use_figuration:
-            self.fig_tids: list[int] = []
-            for fname in range(len(tk.FIGURATION_NAMES)):
-                self.fig_tids.append(tk.encode_token(f'<Fig {tk.FIGURATION_NAMES[fname]}>'))
+            # v0.3.2 gen5: per-voice fig tokens (<FigV0 block>, etc.)
+            # figv_tids_by_voice[v][fi] = token_id for voice v, fig type fi (0=none)
+            self.figv_tids_by_voice: list[list[int]] = []
+            for v in range(4):
+                voice_tids = []
+                for fi, fname in enumerate(tk.FIGURATION_NAMES):
+                    if fname == 'none':
+                        voice_tids.append(-1)  # no token for none (implicit)
+                    else:
+                        voice_tids.append(tk.encode_token(f'<FigV{v} {fname}>'))
+                self.figv_tids_by_voice.append(voice_tids)
         if self.config.use_cadence:
             self.cadence_tids: list[int] = []
             for cname in range(len(tk.CADENCE_NAMES)):
@@ -543,20 +568,7 @@ class MusicTransformer(nn.Module):
                 voice_ids[b, t] = current
         return voice_ids
 
-    def _build_fig_ids(self, input_ids):
-        """扫描 token 序列, 返回每个位置的 fig_type_id (0=none, 1-11=fig types)。"""
-        B, T = input_ids.shape
-        fig_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
-        for b in range(B):
-            current = 0
-            for t in range(T):
-                tid = input_ids[b, t].item()
-                for fi, ftid in enumerate(self.fig_tids):
-                    if tid == ftid:
-                        current = fi  # 0-based
-                        break
-                fig_ids[b, t] = current
-        return fig_ids
+    # _build_fig_ids removed in v0.3.2-gen5 — replaced by _build_voicefig_ids above
 
     def _build_cadence_ids(self, input_ids):
         """扫描 token 序列, 返回每个位置的 cadence_type_id (0=none, 1-5=PAC/IAC/HC/DC/PC)。"""
@@ -708,7 +720,7 @@ class MusicTransformer(nn.Module):
 
         # ── Figuration embedding ─────────────────────────────────
         if self.config.use_figuration:
-            fig_ids = self._build_fig_ids(input_ids[:, -T:])
+            fig_ids = self._build_voicefig_ids(input_ids[:, -T:])
             x = x + self.fig_embedding(fig_ids)
 
         # ── Cadence embedding ────────────────────────────────────

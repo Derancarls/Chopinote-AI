@@ -14,6 +14,64 @@ from typing import Optional
 
 
 # ═══════════════════════════════════════════════════════════════
+#  v0.3.2 gen5: Per-voice Fig helpers
+# ═══════════════════════════════════════════════════════════════
+
+# Fig type index → name (matching tokenizer.FIGURATION_NAMES)
+_FIG_IDX_TO_NAME: dict[int, str] = {
+    1: 'block', 2: 'alberti', 3: 'arpeggio', 4: 'stride',
+    5: 'octave_tremolo', 6: 'walking_bass', 7: 'countermelody', 8: 'pedal',
+    9: 'waltz', 10: 'broken_octave', 11: 'tremolo',
+}
+
+
+def _fig_idx_to_name(fi: int) -> str:
+    return _FIG_IDX_TO_NAME.get(fi, '')
+
+
+def _resolve_bar_figs(sec, bar_offset: int, voice_plan: list[int]) -> dict[int, int]:
+    """解析单 bar 的 per-voice fig 配置。
+
+    优先从 SectionPlan 的 phrases 推断（如果 phrase 有 motif_variant），
+    否则从 SectionPlan 级别的 voice_figs 继承。
+
+    Returns:
+        {voice_idx: fig_type_idx}，不含 'none' (0) 的条目
+    """
+    result: dict[int, int] = {}
+
+    # 1. 从短语层推断
+    if sec.phrases:
+        phrase = sec.get_phrase_at_bar(bar_offset)
+        if phrase and phrase.motif_variant == 'original':
+            # 乐句开头: 主高音轨用 countermelody, 低音轨默认
+            if 0 in voice_plan:
+                result[0] = 7  # countermelody
+            if 3 in voice_plan:
+                result[3] = 3  # arpeggio
+
+    # 2. SectionPlan 级别的 voice_figs 覆盖（A1 显式指定优先）
+    if hasattr(sec, 'voice_figs') and sec.voice_figs:
+        result.update(sec.voice_figs)
+
+    # 3. 按段落类型设默认
+    if not result:
+        if sec.type == 'development':
+            for v in voice_plan:
+                if v == 0:
+                    result[v] = 7  # countermelody
+                elif v == 3:
+                    result[v] = 6  # walking_bass
+        elif sec.type in ('coda', 'closing'):
+            if 0 in voice_plan:
+                result[0] = 1  # block (庄严)
+            if 3 in voice_plan:
+                result[3] = 8  # pedal
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
 #  A1DB — 框架数据库
 # ═══════════════════════════════════════════════════════════════
 
@@ -71,7 +129,7 @@ class BarFramework:
     positions: int = 16                     # grid 位置数 (grid_size)
     active_voices: list[int] = field(default_factory=lambda: [0, 1, 2, 3])
     cadence: str = ''                       # 终止式类型 (PAC/IAC/HC/DC/PC), 空=非终止区
-    fig: int = 0                            # 织体类型索引 (0=none)
+    voice_figs: dict[int, int] = field(default_factory=dict)  # v0.3.2 gen5: per-voice fig {voice: fig_idx}
     section_type: str = ''                  # 当前段落类型
 
 
@@ -241,6 +299,18 @@ class A1DB:
                     clef_tid = tokenizer.encode_token(
                         f'{tokenizer.CLEF} {clef}>')
                     tokens.append(clef_tid)
+
+                # ── v0.3.2 gen5: Per-voice Figuration ──
+                # 从 SectionPlan 的 phrases 推断当前 bar 的 per-voice fig
+                bar_figs = _resolve_bar_figs(sec, bar_offset, voice_plan)
+                for v in sorted(bar_figs.keys()):
+                    fi = bar_figs[v]
+                    if fi > 0:
+                        fname = _fig_idx_to_name(fi)
+                        if fname:
+                            figv_tid = tokenizer.get_figv_id(v, fname)
+                            if figv_tid > 0:
+                                tokens.append(figv_tid)
 
                 # ── Cadence (终止区注入) ──
                 cadence_bars = 2 if sec.cadence in ('PAC', 'IAC', 'PC') else 1

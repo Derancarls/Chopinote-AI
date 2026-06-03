@@ -13,7 +13,7 @@ NO_SECTION_TYPE_ID: int = 0
 @dataclass
 class ModelConfig:
     """Decoder-only Transformer 超参数（适配 RTX 5090 32GB）。"""
-    vocab_size: int = 542                     # v0.3.0: 929 → 542
+    vocab_size: int = 574                     # v0.3.2-gen5: 542 → 574 (per-voice Fig)
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 32

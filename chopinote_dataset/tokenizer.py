@@ -71,7 +71,7 @@ class REMITokenizer:
     BASS = '<Bass'
     SECTION = '<Section'
     SEC_SUM = '<SecSum>'
-    FIGURATION = '<Fig'
+    FIGV = '<FigV'
     CADENCE = '<Cad'
 
     MAX_SUBTRACKS = 4
@@ -328,12 +328,16 @@ class REMITokenizer:
         self._id_to_token[idx] = self.SEC_SUM
         idx += 1
 
-        # ── Figuration (12 types) ──
-        for fname in self.FIGURATION_NAMES:
-            t = f'{self.FIGURATION} {fname}>'
-            self._token_to_id[t] = idx
-            self._id_to_token[idx] = t
-            idx += 1
+        # ── v0.3.2 gen5: Per-voice Figuration (4 voices × 11 non-none types = 44) ──
+        # "none" is implicit (no token emitted), only non-none types get tokens
+        for v in self.VOICE_NAMES:
+            for fname in self.FIGURATION_NAMES:
+                if fname == 'none':
+                    continue  # implicit default, no token needed
+                t = f'{self.FIGV}{v} {fname}>'
+                self._token_to_id[t] = idx
+                self._id_to_token[idx] = t
+                idx += 1
 
         # ── Cadence (5 types) ──
         for cname in self.CADENCE_NAMES:
@@ -479,9 +483,10 @@ class REMITokenizer:
                 events.append((self.SECTION, val))
             elif token == self.SEC_SUM:
                 events.append((self.SEC_SUM, None))
-            elif token.startswith(self.FIGURATION):
-                val = token[len(self.FIGURATION) + 1:-1]
-                events.append((self.FIGURATION, val))
+            elif token.startswith(self.FIGV):
+                # <FigV0 block> → val = "0 block"
+                val = token[len(self.FIGV):-1]
+                events.append((self.FIGV, val))
             elif token.startswith(self.CADENCE):
                 val = token[len(self.CADENCE) + 1:-1]
                 events.append((self.CADENCE, val))
@@ -513,8 +518,21 @@ class REMITokenizer:
         return [self.encode_token(f'{self.VOICE} {v}>') for v in self.VOICE_NAMES]
 
     @property
-    def fig_token_ids(self) -> List[int]:
-        return [self.encode_token(f'{self.FIGURATION} {f}>') for f in self.FIGURATION_NAMES]
+    def figv_token_ids(self) -> List[int]:
+        """All <FigV V X> token IDs (44: 4 voices × 11 non-none types)."""
+        ids = []
+        for v in self.VOICE_NAMES:
+            for f in self.FIGURATION_NAMES:
+                if f == 'none':
+                    continue
+                ids.append(self.encode_token(f'{self.FIGV}{v} {f}>'))
+        return ids
+
+    def get_figv_id(self, voice: int, fig_name: str) -> int:
+        """获取指定声部和织体类型的 token ID。fig_name='none' 返回 -1 (无 token)。"""
+        if fig_name == 'none':
+            return -1
+        return self.encode_token(f'{self.FIGV}{voice} {fig_name}>')
 
     @property
     def cadence_token_ids(self) -> List[int]:
@@ -539,7 +557,7 @@ class REMITokenizer:
             ids.add(self.encode_token(f'{self.SECTION} {sec_name}>'))
         ids.add(self.encode_token(self.SEC_SUM))
         ids.update(self.voice_token_ids)
-        ids.update(self.fig_token_ids)
+        ids.update(self.figv_token_ids)
         ids.update(self.cadence_token_ids)
         for beat_num in range(1, self.MAX_BEATS + 1):
             ids.add(self.encode_token(f'{self.BEAT} {beat_num}>'))

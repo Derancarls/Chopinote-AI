@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Figuration 标注脚本 — v0.3.0。
-从 .tokens 文件按 Voice 拆分，每 4-bar 窗口分类织体模式，生成 .fig.json。
+Figuration 标注脚本 — v0.3.2 gen5。
+从 .tokens 文件按 Voice 拆分，每 4-bar 窗口分类织体模式，
+直接将 <FigV V X> token 注入 .tokens 序列（改写原文件）。
 
 织体类型 (11 种):
-  0=none, 1=block, 2=alberti, 3=arpeggio, 4=stride,
+  0=none(不写token), 1=block, 2=alberti, 3=arpeggio, 4=stride,
   5=octave_tremolo, 6=walking_bass, 7=countermelody, 8=pedal,
   9=waltz, 10=broken_octave, 11=tremolo
 
@@ -29,20 +30,28 @@ FIG_WALTZ = 9
 FIG_BROKEN_OCTAVE = 10
 FIG_TREMOLO = 11
 
+FIG_IDX_TO_NAME = {
+    1: 'block', 2: 'alberti', 3: 'arpeggio', 4: 'stride',
+    5: 'octave_tremolo', 6: 'walking_bass', 7: 'countermelody', 8: 'pedal',
+    9: 'waltz', 10: 'broken_octave', 11: 'tremolo',
+}
+
 WINDOW_BARS = 4
 
-# 每声部单独分类的心跳
-_VOICE_IDS = None  # set in main()
-_NOTE_ON_MIN = _NOTE_ON_MAX = _NOTE_ON_ZERO = 0
+# 全局常量，由 _init_constants() 设置
+_VOICE_IDS = None
 _BAR_ID = 4
-_POS_MIN = _POS_MAX = 0
+_POS_MIN = _POS_MAX = -1
+_NOTE_ON_MIN = _NOTE_ON_MAX = _NOTE_ON_ZERO = 0
 
 
 def _init_constants():
-    global _VOICE_IDS, _NOTE_ON_MIN, _NOTE_ON_MAX, _NOTE_ON_ZERO, _POS_MIN, _POS_MAX
+    global _VOICE_IDS, _BAR_ID, _POS_MIN, _POS_MAX
+    global _NOTE_ON_MIN, _NOTE_ON_MAX, _NOTE_ON_ZERO
     from chopinote_dataset.tokenizer import REMITokenizer
     t = REMITokenizer(16, 8)
     _VOICE_IDS = {t.encode_token(f'<Voice {v}>'): v for v in range(4)}
+    _BAR_ID = t.bar_token_id
     note_ids = [t.encode_token(f'<Note_ON {i}>') for i in range(-60, 61)]
     _NOTE_ON_MIN = min(note_ids)
     _NOTE_ON_MAX = max(note_ids)
@@ -61,12 +70,10 @@ def classify_window(notes: list[tuple[int, int, int]]) -> int:
         return FIG_NONE
 
     pitches = [n[0] for n in notes]
-    durations = [n[1] for n in notes]
-    positions = [n[2] for n in notes]
     intervals = [pitches[i+1] - pitches[i] for i in range(len(pitches) - 1)]
 
     # 1. 同 position ≥3 音 → Block
-    pos_counts = Counter(positions)
+    pos_counts = Counter(n[2] for n in notes)
     if max(pos_counts.values()) >= 3:
         return FIG_BLOCK
 
@@ -149,7 +156,8 @@ def _pitch_variance(pitches: list[int]) -> float:
 
 
 def process_file(args: tuple) -> dict:
-    fpath, out_dir, dry_run = args
+    """处理单个 .tokens 文件: 读取→分类→注入 FigV token→写回。"""
+    fpath = args
     try:
         with open(fpath) as f:
             ids = json.load(f)
@@ -159,40 +167,40 @@ def process_file(args: tuple) -> dict:
     if not isinstance(ids, list) or len(ids) < 10:
         return {'status': 'skip', 'file': fpath}
 
-    # 按 bar 和 voice 收集 Note_ON 事件
-    # per_bar_voice[bar][voice] = [(interval, duration, position)]
+    # ── 第一遍: 按 bar 和 voice 收集 Note_ON 事件 ──
+    # per_bar_voice[bar][voice] = [(interval, position), ...]
     per_bar_voice: dict[int, dict[int, list]] = {}
     bar_idx = -1
     current_voice = 0
+    bar_positions: list[int] = []  # token 序列中每个 <Bar> 的位置
 
     for pos, tid in enumerate(ids):
         if tid == _BAR_ID:
             bar_idx += 1
+            bar_positions.append(pos)
             per_bar_voice.setdefault(bar_idx, {})
             continue
         if tid in _VOICE_IDS:
             current_voice = _VOICE_IDS[tid]
             continue
         if _POS_MIN <= tid <= _POS_MAX:
-            per_bar_voice.setdefault(bar_idx, {})
             current_pos = tid - _POS_MIN
             continue
         if _NOTE_ON_MIN <= tid <= _NOTE_ON_MAX:
             interval = tid - _NOTE_ON_ZERO
             per_bar_voice.setdefault(bar_idx, {}).setdefault(current_voice, []).append(
-                (interval, 0, current_pos))
-            continue
+                (interval, current_pos))
 
-    # 对每个 voice，按 4-bar 窗口分类
-    fig_ids = [FIG_NONE] * len(ids)  # per-token fig 标注
     if bar_idx < 0:
-        return {'status': 'ok', 'file': fpath, 'data': {'fig_ids': fig_ids, 'fig_changes': []}}
+        return {'status': 'ok', 'file': fpath, 'injected': 0}
+
+    # ── 第二遍: per-voice 分类 (每个 voice 独立滑动窗口) ──
+    # bar_figs[bar][voice] = fig_type_idx (1-11), 0=none 不写
+    bar_figs: dict[int, dict[int, int]] = {}
 
     all_voices = set()
     for bar in per_bar_voice.values():
         all_voices.update(bar.keys())
-
-    fig_changes = []
 
     for voice in all_voices:
         # 收集该 voice 的 per-bar notes
@@ -205,10 +213,10 @@ def process_file(args: tuple) -> dict:
         if len(voice_bars) < WINDOW_BARS:
             continue
 
-        # 滑动窗口分类
         sorted_bars = sorted(voice_bars.keys())
-        prev_fig = None
-        for i in range(0, len(sorted_bars) - WINDOW_BARS + 1, WINDOW_BARS // 2):
+
+        # 滑动窗口分类
+        for i in range(0, len(sorted_bars) - WINDOW_BARS + 1, max(1, WINDOW_BARS // 2)):
             window_bars = sorted_bars[i:i+WINDOW_BARS]
             window_notes = []
             for b in window_bars:
@@ -221,30 +229,64 @@ def process_file(args: tuple) -> dict:
             if fig == FIG_NONE:
                 continue
 
-            # 把标注写回该窗口的 bar 范围内
-            start_bar = window_bars[0]
-            end_bar = window_bars[-1]
+            # 标注写回该窗口的每个 bar
+            for b in window_bars:
+                bar_figs.setdefault(b, {})[voice] = fig
 
-            if fig != prev_fig:
-                fig_changes.append({
-                    'bar': start_bar,
-                    'voice': voice,
-                    'fig': fig,
-                })
-                prev_fig = fig
+    # ── 第三遍: 注入 <FigV V X> token 到序列中 ──
+    # 在每 bar 的 <Bar> token 之后插入
+    injected = 0
+    new_ids = []
+    # bar 号 → <FigV V X> token ID 列表
+    figv_tokens_per_bar: dict[int, list[int]] = {}
+    for b, voice_figs in bar_figs.items():
+        figv_tokens_per_bar[b] = _build_figv_tokens(voice_figs)
 
-    return {
-        'status': 'ok',
-        'file': fpath,
-        'data': {
-            'fig_ids': fig_ids,
-            'fig_changes': fig_changes,
-        },
-    }
+    for pos, tid in enumerate(ids):
+        new_ids.append(tid)
+        if tid == _BAR_ID:
+            bar_num = _count_bar_until(new_ids) - 1
+            if bar_num in figv_tokens_per_bar:
+                for fvtid in figv_tokens_per_bar[bar_num]:
+                    new_ids.append(fvtid)
+                    injected += 1
+
+    # ── 写回 ──
+    with open(fpath, 'w') as f:
+        json.dump(new_ids, f)
+
+    return {'status': 'ok', 'file': fpath, 'injected': injected}
+
+
+def _build_figv_tokens(voice_figs: dict[int, int]) -> list[int]:
+    """构建单个 bar 的 <FigV V X> token ID 列表 (按 voice 排序)。
+
+    voice_figs: {voice_idx: fig_type_idx}, 不包含 'none' (值不会是 0)
+    """
+    from chopinote_dataset.tokenizer import REMITokenizer
+    tk = REMITokenizer(16, 8)
+    tokens = []
+    for v in sorted(voice_figs.keys()):
+        fi = voice_figs[v]
+        if fi == FIG_NONE:
+            continue
+        fname = FIG_IDX_TO_NAME.get(fi)
+        if fname:
+            tokens.append(tk.get_figv_id(v, fname))
+    return tokens
+
+
+def _count_bar_until(tokens: list[int]) -> int:
+    """统计 tokens 中的 <Bar> 数量。"""
+    count = 0
+    for tid in tokens:
+        if tid == _BAR_ID:
+            count += 1
+    return count
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Figuration annotation for v0.3.0')
+    ap = argparse.ArgumentParser(description='Per-voice figuration annotation — v0.3.2 gen5')
     ap.add_argument('command', choices=['annotate'])
     ap.add_argument('--input-dir', default='/root/autodl-tmp/data/processed/tokens_v4')
     ap.add_argument('--num-workers', type=int, default=8)
@@ -261,26 +303,29 @@ def main():
 
     print(f"文件总数: {len(all_files)}")
 
-    tasks = [(f, args.input_dir, args.dry_run) for f in all_files]
-    stats = Counter()
+    if args.dry_run:
+        print("[dry-run] 不写文件")
 
+    stats = Counter()
+    total_injected = 0
+
+    tasks = all_files
     with mp.Pool(args.num_workers) as pool:
         for i, result in enumerate(pool.imap_unordered(process_file, tasks, chunksize=100)):
             if result['status'] == 'ok':
                 stats['ok'] += 1
-                if not args.dry_run:
-                    data = result['data']
-                    out_path = result['file'].replace('.tokens', '.fig.json')
-                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                    with open(out_path, 'w') as f:
-                        json.dump(data, f)
+                injected = result.get('injected', 0)
+                total_injected += injected
             else:
                 stats[result['status']] += 1
 
             if (i + 1) % 100000 == 0:
-                print(f"  进度: {i+1}/{len(all_files)} ({100*(i+1)/len(all_files):.0f}%), ok={stats['ok']}")
+                print(f"  进度: {i+1}/{len(all_files)} "
+                      f"({100*(i+1)/len(all_files):.0f}%), "
+                      f"ok={stats['ok']}, inj={total_injected}")
 
-    print(f"完成! 成功={stats['ok']}, 错误={stats['error']}, 跳过={stats['skip']}")
+    print(f"完成! 成功={stats['ok']}, 错误={stats['error']}, "
+          f"跳过={stats['skip']}, 注入={total_injected} tokens")
 
 
 if __name__ == '__main__':
