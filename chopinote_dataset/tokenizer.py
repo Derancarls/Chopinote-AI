@@ -18,6 +18,58 @@ _FLAT_TO_SHARP: dict[str, str] = {
     'Cb': 'B', 'Fb': 'E',
 }
 
+# ── MIDI Program 0-127 → 保留的 43 个乐器映射 ────────────
+# 映射原则: 同乐器族内最近的高频乐器; 无同族则映射到相近族
+_PROGRAM_FALLBACK: dict[int, int] = {
+    # Piano (0-7): retained 0,1,4,5
+    2: 1,    # Bright Acoustic → Acoustic Grand
+    3: 4,    # Electric Grand → Electric Piano 1
+    6: 1,    # Harpsichord → Acoustic Grand (closest keyboard)
+    7: 5,    # Clavinet → Electric Piano 2
+    # Chromatic Percussion (8-15): retained 11
+    8: 11, 9: 11, 10: 11, 12: 11, 13: 11, 14: 11, 15: 11,
+    # Organ (16-23): retained 18,21
+    16: 18, 17: 18,  # Drawbar/Percussive → Rock Organ
+    19: 18,           # Rock → Rock
+    20: 21, 22: 21, 23: 21,  # Church/Reed/Accordion → Accordion
+    # Guitar (24-31): retained 24,25,26,27,28,29,30
+    31: 30,  # Overdriven → Distortion
+    # Bass (32-39): retained 32,33,34,35,38
+    36: 35, 37: 35,  # Fretless/Slap → Picked Bass
+    39: 38,           # Synth Bass 2 → Synth Bass 1
+    # Strings (40-47): retained 40,42,45,46,47
+    41: 40,  # Viola → Violin
+    43: 42,  # Contrabass → Cello (bowed strings)
+    44: 40,  # Tremolo → Violin
+    # Ensemble (48-55): retained 48,49,50,52,53
+    51: 50,  # Synth Strings 2 → Synth Strings 1
+    54: 53,  # Synth Voice → Voice Oohs
+    55: 62,  # Orchestra Hit → Brass Section (bright orchestral)
+    # Brass (56-63): retained 56,57,60,61,62
+    58: 57,  # Tuba → Trombone (low brass)
+    59: 56,  # Muted Trumpet → Trumpet
+    63: 62,  # Synth Brass 2 → Synth Brass 1
+    # Reed (64-71): retained 65,66,68,71
+    64: 65,  # Soprano Sax → Alto Sax
+    67: 66,  # Baritone Sax → Tenor Sax
+    69: 68,  # English Horn → Oboe
+    70: 71,  # Bassoon → Clarinet
+    # Pipe (72-79): retained 73
+    72: 73, 74: 73, 75: 73, 76: 73, 77: 73, 78: 73, 79: 73,
+    # Synth Lead (80-87): retained 80,81,87
+    82: 81, 83: 81, 84: 81, 85: 81, 86: 81,
+    # Synth Pad (88-95): retained 89
+    88: 89, 90: 89, 91: 89, 92: 89, 93: 89, 94: 89, 95: 89,
+    # Synth Effects (96-103): no retained → Synth Lead 81
+    96: 81, 97: 81, 98: 81, 99: 81, 100: 81, 101: 81, 102: 81, 103: 81,
+    # Ethnic (104-111): no retained → Flute 73
+    104: 73, 105: 73, 106: 73, 107: 73, 108: 73, 109: 73, 110: 73, 111: 73,
+    # Percussive (112-119): drum kits → Piano 0
+    112: 0, 113: 0, 114: 0, 115: 0, 116: 0, 117: 0, 118: 0, 119: 0,
+    # Sound Effects (120-127): → Piano 0
+    120: 0, 121: 0, 122: 0, 123: 0, 124: 0, 125: 0, 126: 0, 127: 0,
+}
+
 
 def tonic_name_to_midi(tonic_name: str | None) -> int:
     """将主音名转为 MIDI 主音音高（八度 4），无时默认 C（60）。"""
@@ -396,8 +448,16 @@ class REMITokenizer:
         ids = []
         for token_type, value in events:
             if value is not None:
+                v = value
                 # v0.3.2: normalize flat tonic names (Bb→A#) to match vocab
-                v = _FLAT_TO_SHARP.get(str(value), str(value)) if token_type.startswith(self.TONIC) else value
+                if token_type.startswith(self.TONIC):
+                    v = _FLAT_TO_SHARP.get(str(value), str(value))
+                # v0.3.2: map rare MIDI programs to nearest retained instrument
+                elif token_type.startswith(self.PROGRAM):
+                    prog_num = int(value)
+                    if prog_num not in self._prog_index:
+                        prog_num = _PROGRAM_FALLBACK.get(prog_num, 0)
+                    v = prog_num
                 token = f'{token_type} {v}>'
             else:
                 token = token_type
