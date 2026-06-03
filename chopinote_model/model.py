@@ -458,23 +458,8 @@ class MusicTransformer(nn.Module):
 
         return boundary_mask  # (B, T, T)
 
-    # ── v0.3.0: Voice / Fig / Cadence ID builders ──────────────
-
-    def _build_voice_ids(self, input_ids):
-        """从 token 序列追踪当前 Voice: <Voice N> 之后属于声部 N+1。"""
-        B, T = input_ids.shape
-        voice_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
-        # Voice token IDs 0-3 → voice embedding indices 1-4
-        for v in range(4):
-            vid = self.voice_token_to_idx.get(v, -1)
-            if vid < 0:
-                continue
-            current = 0
-            for t in range(T):
-                if input_ids[0, t] == vid:
-                    current = v + 1
-                voice_ids[:, t] = current
-        return voice_ids
+    # ── v0.3.2: VoiceFig / Cadence ID builders ──────────────
+    # _build_voice_ids (dead copy) removed in v0.3.2 audit — live version below
 
     def _build_voicefig_ids(self, input_ids):
         """v0.3.2 gen5: 追踪 per-voice fig type，在 Voice token 位置返回对应 fig type。
@@ -505,24 +490,14 @@ class MusicTransformer(nn.Module):
                     fig_ids[b, t] = vf[3]
         return fig_ids
 
-    def _build_cadence_ids(self, input_ids):
-        """从 token 序列追踪当前 Cadence type。"""
-        B, T = input_ids.shape
-        cad_ids = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
-        for cid in self.cadence_token_ids_set:
-            current = 0
-            for t in range(T):
-                if input_ids[0, t] == cid:
-                    current = cid - min(self.cadence_token_ids_set) + 1 if self.cadence_token_ids_set else 0
-                cad_ids[:, t] = current
-        return cad_ids
+    # _build_cadence_ids (dead copy) removed in v0.3.2 audit — live version below
 
     def _init_token_maps(self):
         """缓存 Voice/Fig/Cadence/Position/Duration token ID 集合, 按前缀扫描 vocab。"""
         # 用临时的 tokenizer 实例来获取 token ID
         from chopinote_dataset.tokenizer import REMITokenizer
         tk = REMITokenizer()
-        if self.config.use_voice_identity or self.config.use_dur_sat:
+        if self.config.use_voice_identity or self.config.use_dur_sat or self.config.use_figuration:
             self.voice_tids: list[int] = [-1] * 4
             for v in range(4):
                 self.voice_tids[v] = tk.encode_token(f'<Voice {v}>')

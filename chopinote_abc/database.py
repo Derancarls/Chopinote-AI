@@ -92,6 +92,8 @@ class SectionPlan:
         # None = B 根据段落类型自动推断
     phrases: list = field(default_factory=list)
         # v0.3.2: PhrasePlan 列表, 由 plan_phrases_for_section() 填充
+    voice_figs: dict[int, int] = field(default_factory=dict)
+        # v0.3.2 gen5: A1 显式指定 per-voice fig {voice_idx: fig_type_idx}
 
     def get_phrase_at_bar(self, bar_idx: int):
         """查询 bar_idx (段内偏移) 属于哪个乐句。"""
@@ -139,6 +141,7 @@ class SeedContext:
     final_chord: str | None = None  # seed 最后一个和弦功能 (Phase 3 启用)
     final_key: str | None = None    # seed 最后一个已知调性
     bar_count: int = 0              # seed 包含的小节数
+    programs: list[int] = field(default_factory=list)  # seed 中的 Program 列表
 
 
 @dataclass

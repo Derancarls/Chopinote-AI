@@ -283,17 +283,7 @@ class TokenDataset(Dataset):
         except Exception:
             return None
 
-    def _load_chord_data(self, file_idx: int) -> Optional[dict]:
-        """加载和弦标注数据。返回 None 表示无标注。"""
-        path = self._resolve_path(self.file_paths[file_idx])
-        chord_path = path.with_suffix('.chord.json')
-        if not chord_path.exists():
-            return None
-        try:
-            with open(chord_path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return None
+    # _load_chord_data removed in v0.3.2 audit — chord tokens removed in v0.3.0
 
     def _load_ssf_data(self, file_idx: int) -> Optional[dict]:
         """加载 SSF (Sliding Scale Field) 标注 (v0.3.0)。"""
@@ -327,7 +317,6 @@ class TokenDataset(Dataset):
 
         # ── 侧边文件预加载（声部/节内计算需要段落数据）─────
         section_data = self._load_section_data(file_idx)
-        chord_data = self._load_chord_data(file_idx)
 
         # ── 声部计数 ──────────────────────────────────────────
         voice_full = _compute_voice_counts(tokens)
@@ -406,46 +395,7 @@ class TokenDataset(Dataset):
             sec_keys_target = torch.full((T,), -1, dtype=torch.long)
             sec_types_target = torch.full((T,), -1, dtype=torch.long)
 
-        # ── 和弦数据构建 ────────────────────────────────────────
-        if chord_data is not None:
-            chord_func_ids_all = chord_data.get('chord_func_ids', [])
-            chord_inv_ids_all = chord_data.get('chord_inv_ids', [])
-            n_c_total = len(chord_func_ids_all)
-
-            assert n_c_total == len(tokens), (
-                f'.chord.json chord_func_ids 长度 ({n_c_total}) 与 token 序列 ({len(tokens)}) 不匹配: '
-                f'{self.file_paths[file_idx]}'
-            )
-
-            if start < n_c_total:
-                chord_func_ids = torch.tensor(
-                    chord_func_ids_all[start:start + T + 1][:-1], dtype=torch.long)
-                chord_inv_ids = torch.tensor(
-                    chord_inv_ids_all[start:start + T + 1][:-1], dtype=torch.long)
-            else:
-                chord_func_ids = torch.zeros(T, dtype=torch.long)
-                chord_inv_ids = torch.zeros(T, dtype=torch.long)
-
-            # 构建和弦预测目标（仅在 Chord/Inv token 位置有效, -1 = ignore_index）
-            chord_func_targets = torch.full((T,), -1, dtype=torch.long)
-            chord_inv_targets = torch.full((T,), -1, dtype=torch.long)
-
-            chord_positions = chord_data.get('chord_token_positions', [])
-            chord_attrs = chord_data.get('chord_attrs', [])
-            for i, pos in enumerate(chord_positions):
-                local_pos = pos - start
-                if 0 <= local_pos < T and i < len(chord_attrs):
-                    attr = chord_attrs[i]
-                    chord_func_targets[local_pos] = attr.get('func', -1)
-                    # Inv token 紧跟 Chord func (和 Chord7) 之后
-                    inv_pos = local_pos + (2 if attr.get('has_7th', False) else 1)
-                    if inv_pos < T:
-                        chord_inv_targets[inv_pos] = attr.get('inv', -1)
-        else:
-            chord_func_ids = torch.zeros(T, dtype=torch.long)
-            chord_inv_ids = torch.zeros(T, dtype=torch.long)
-            chord_func_targets = torch.full((T,), -1, dtype=torch.long)
-            chord_inv_targets = torch.full((T,), -1, dtype=torch.long)
+        # ── 和弦数据 — v0.3.0 已移除 Chord tokens, 不再需要 .chord.json ──
 
         # ── SSF field 构建 (v0.3.0) ────────────────────────────
         ssf_data = self._load_ssf_data(file_idx)
@@ -491,10 +441,6 @@ class TokenDataset(Dataset):
             'sec_bars_target': sec_bars_target,
             'sec_keys_target': sec_keys_target,
             'sec_types_target': sec_types_target,
-            'chord_func_ids': chord_func_ids,
-            'chord_inv_ids': chord_inv_ids,
-            'chord_func_targets': chord_func_targets,
-            'chord_inv_targets': chord_inv_targets,
         }
 
 
@@ -560,22 +506,6 @@ def collate_fn(batch: list[dict]) -> dict:
             sec_keys_target, batch_first=True, padding_value=-1)
         result['sec_types_target'] = torch.nn.utils.rnn.pad_sequence(
             sec_types_target, batch_first=True, padding_value=-1)
-
-    # ── 和弦字段 padding ────────────────────────────────────────
-    if 'chord_func_ids' in batch[0]:
-        chord_func_ids = [b['chord_func_ids'] for b in batch]
-        chord_inv_ids = [b['chord_inv_ids'] for b in batch]
-        chord_func_targets = [b['chord_func_targets'] for b in batch]
-        chord_inv_targets = [b['chord_inv_targets'] for b in batch]
-
-        result['chord_func_ids'] = torch.nn.utils.rnn.pad_sequence(
-            chord_func_ids, batch_first=True, padding_value=0)
-        result['chord_inv_ids'] = torch.nn.utils.rnn.pad_sequence(
-            chord_inv_ids, batch_first=True, padding_value=0)
-        result['chord_func_targets'] = torch.nn.utils.rnn.pad_sequence(
-            chord_func_targets, batch_first=True, padding_value=-1)
-        result['chord_inv_targets'] = torch.nn.utils.rnn.pad_sequence(
-            chord_inv_targets, batch_first=True, padding_value=-1)
 
     return result
 

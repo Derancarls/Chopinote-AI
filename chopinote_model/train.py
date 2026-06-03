@@ -652,7 +652,7 @@ class Trainer:
             ('octave', tokenizer.OCTAVE),
             ('bass', tokenizer.BASS),
             ('voice', tokenizer.VOICE),
-            ('fig', tokenizer.FIGURATION),
+            ('fig', tokenizer.FIGV),
             ('cadence', tokenizer.CADENCE),
         ]
 
@@ -749,17 +749,19 @@ class Trainer:
         note_type_idx = self._type_names.index('note') if 'note' in self._type_names else -1
 
         weights = torch.ones(B * T, device=labels.device, dtype=torch.float)
-        if pos_type_idx >= 0 and cfg.position_token_loss_weight != 1.0:
-            is_pos = (label_types == pos_type_idx) & valid_mask
-            weights[is_pos] = cfg.position_token_loss_weight
 
         # ── v0.3.2: 框架 token CE loss 降权 (frame_weight=0.1) ──
+        # 先应用框架降权，再叠加 Position 提权（位置权重不应被框架覆盖）
         if cfg.frame_weight != 1.0 and hasattr(self, '_framework_token_ids'):
             labels_flat = labels.view(-1)
             is_fw = torch.zeros(B * T, dtype=torch.bool, device=labels.device)
             for fid in self._framework_token_ids:
                 is_fw |= (labels_flat == fid)
             weights[is_fw & valid_mask] = cfg.frame_weight
+
+        if pos_type_idx >= 0 and cfg.position_token_loss_weight != 1.0:
+            is_pos = (label_types == pos_type_idx) & valid_mask
+            weights[is_pos] = cfg.position_token_loss_weight
 
         # ── 重复惩罚：连续 ≥4 同类型 token → loss × penalty ─
         if cfg.repetition_penalty > 1.0:

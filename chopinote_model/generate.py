@@ -1048,6 +1048,8 @@ def stage3_iterative_generate(
         for fix in report['structural_fixes']:
             a1.apply_fix(fix)
         a1.reset_overrides()
+        # v0.3.2-gen4: 重置 PhraseState（retry 时 phrase identity 不变，必须显式重建）
+        phrase_state = PhraseState()
         all_tokens, report = _stage3_generate_once(
             model, tokenizer, seed_tokens, a1, a2, a3,
             bar_id, base_temperature, top_k, voice_plan,
