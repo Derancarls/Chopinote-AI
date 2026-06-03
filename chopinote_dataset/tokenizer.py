@@ -71,14 +71,21 @@ _PROGRAM_FALLBACK: dict[int, int] = {
 }
 
 # ── Dynamic 特殊值规范化 ───────────────────────────────
+_DYN_STANDARD: set[str] = {
+    'pppp', 'ppp', 'pp', 'p', 'mp', 'mf', 'f', 'ff', 'fff', 'ffff',
+    'sfz', 'sfp', 'sf', 'fz', 'fp', 'rf', 'rfz', 'sffz', 'sfpp',
+}
+
 def _normalize_dynamic(value: str) -> str:
     """将非标准动态记号映射到词表中的 19 个。
 
-    规则:
+    标准记号直接返回；非标准按规则映射:
       - p (n≥5) → pppp, f (n≥5) → ffff
-      - 显式映射表中未覆盖的 → 默认 mf
+      - 显式映射表覆盖罕见的特殊记号
+      - 未知 → mf (安全默认)
     """
-    # DYN_FALLBACK: non-standard → standard
+    if value in _DYN_STANDARD:
+        return value
     _DYN_FALLBACK: dict[str, str] = {
         'ppppp': 'pppp', 'pppppp': 'pppp',
         'fffff': 'ffff', 'ffffff': 'ffff',
@@ -86,7 +93,6 @@ def _normalize_dynamic(value: str) -> str:
     }
     if value in _DYN_FALLBACK:
         return _DYN_FALLBACK[value]
-    # General rule: extended p/f sequences
     if all(c == 'p' for c in value) and len(value) >= 5:
         return 'pppp'
     if all(c == 'f' for c in value) and len(value) >= 5:
