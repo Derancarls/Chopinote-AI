@@ -50,8 +50,8 @@ class FastMIDIToREMI:
         self.DURATION = '<Duration'
         self.TEMPO = '<Tempo'
         self.TIMESIG = '<TimeSig'
-        self.KEY = '<Key'
-        self.ANTICIPATE = '<Anticipate'
+        self.KEY = '<Tonic'  # v0.3.0: Key→Tonic
+        # v0.3.0: ANTICIPATE removed — replaced by SSF LocalField
         self.BEAT = '<Beat'
         self.BASS = '<Bass'
         self.GRACE_NOTE = '<GraceNote'
@@ -417,9 +417,7 @@ class FastMIDIToREMI:
         for m in all_measures:
             key_at_m = _get_key_name(measure_starts[m])
 
-            # ANTICIPATE: emit BEFORE BAR if key changes in the next measure
-            if m > 0 and key_at_m and key_at_m != last_key_name:
-                events.append((self.ANTICIPATE, key_at_m))
+            # v0.3.0: ANTICIPATE removed — SSF LocalField handles key changes
 
             events.append((self.BAR, None))
 
