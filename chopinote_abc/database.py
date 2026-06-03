@@ -402,6 +402,110 @@ class PhraseState:
                 return {5: 0.3, 0: 0.3}             # subdominant→tonic
         return {}
 
+    # ── v0.3.2 gen4: 轮廓追踪 ─────────────────────────
+
+    def record_pitch(self, pitch: int) -> None:
+        """记录旋律音高，追踪实际 contour 走向。
+
+        只关心 Voice 0 (主高音轨) 的音高变化。
+        pitch: MIDI pitch (0-127)
+        """
+        if not self.contour_so_far:
+            self.contour_so_far.append(pitch)
+            return
+        # 去重: 同一 pitch 不重复记录
+        if pitch != self.contour_so_far[-1]:
+            self.contour_so_far.append(pitch)
+
+    def contour_deviation(self) -> float:
+        """计算实际 contour 与目标形状的偏离度 [0, 1]。
+
+        0 = 完全匹配目标, 1 = 完全偏离。
+        通过比较相邻音高变化的方向统计来评估。
+
+        target shapes:
+          arch:     先升后降 (前半上升, 后半下降)
+          ascending:  整体上升
+          descending: 整体下降
+          wave:     升-降-升-降 交替
+          flat:     音高变化幅度小
+
+        Returns:
+            deviation ∈ [0, 1], 需要 ≥ 3 个音高点才有意义
+        """
+        if self.plan is None or len(self.contour_so_far) < 3:
+            return 0.0
+
+        target = self.plan.contour_shape
+        # 计算相邻音高的方向: +1=上升, -1=下降, 0=平
+        directions = []
+        for i in range(1, len(self.contour_so_far)):
+            d = self.contour_so_far[i] - self.contour_so_far[i - 1]
+            if d > 0:
+                directions.append(1)
+            elif d < 0:
+                directions.append(-1)
+            else:
+                directions.append(0)
+
+        n = len(directions)
+        if n == 0:
+            return 0.0
+
+        # 统计方向分布
+        up = sum(1 for d in directions if d > 0) / n
+        down = sum(1 for d in directions if d < 0) / n
+        flat_ratio = sum(1 for d in directions if d == 0) / n
+
+        if target == 'arch':
+            # 理想: up≈0.5, down≈0.5 (前半上升, 后半下降)
+            half = n // 2
+            first_up = sum(1 for d in directions[:half] if d > 0) / max(half, 1)
+            second_down = sum(1 for d in directions[half:] if d < 0) / max(n - half, 1)
+            ideal = 0.5 * first_up + 0.5 * second_down
+            return 1.0 - ideal
+        elif target == 'ascending':
+            # 理想: mostly up
+            return 1.0 - up
+        elif target == 'descending':
+            # 理想: mostly down
+            return 1.0 - down
+        elif target == 'wave':
+            # 理想: 方向交替 (sign changes 多)
+            changes = sum(1 for i in range(1, n) if directions[i] != directions[i - 1] and directions[i] != 0 and directions[i - 1] != 0)
+            expected = max(n // 3, 1)
+            return max(0.0, 1.0 - changes / expected)
+        elif target == 'flat':
+            # 理想: mostly flat or small changes
+            return 1.0 - flat_ratio
+        return 0.0
+
+    def breathing_bias(self) -> tuple[float, float]:
+        """乐句呼吸点 bias: 返回 (rest_bias, long_dur_bias)。
+
+        在终止式区域（最后 1-2 bar），鼓励休止和长音来制造乐句呼吸。
+        - rest_bias: 加到 Rest token logit 上的值
+        - long_dur_bias: 加到 Duration≥4 (四分音符及以上) logit 上的值
+
+        Returns:
+            (rest_bias, long_dur_bias)，不在呼吸区时返回 (0.0, 0.0)
+        """
+        if self.plan is None:
+            return (0.0, 0.0)
+
+        bars_left = self.bars_until_cadence()
+
+        if bars_left <= 0:
+            # 最后 1 bar: 强烈鼓励呼吸
+            return (0.8, 0.5)
+        elif bars_left == 1:
+            # 倒数第 2 bar: 温和鼓励
+            return (0.4, 0.2)
+        elif bars_left == 2 and self.progress() > 0.5:
+            # 乐句过半后: 轻微鼓励
+            return (0.15, 0.1)
+        return (0.0, 0.0)
+
 
 # ═══════════════════════════════════════════════════════════════
 #  A3DB — 统计数据库

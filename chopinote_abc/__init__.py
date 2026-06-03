@@ -14,11 +14,13 @@ from .database import (
     SectionPlan, ChordAtBar, SeedContext, StructuralFix,
     MotifDNA, MotifRecord,
     BarStats, SectionStats,
+    PhrasePlan, PhraseState,          # v0.3.2 gen4: 乐句层
     compute_novelty_bonus, compute_diversity_bonus, write_reward_log,
 )
 from .planner import (
     plan_structure, plan_harmony, reharmonize_from_bar,
     tonal_progression_template,
+    plan_phrases_for_section,         # v0.3.2 gen4: 乐句规划
 )
 from .motif import (
     identify_landmarks, purify_tokens, extract_dna,

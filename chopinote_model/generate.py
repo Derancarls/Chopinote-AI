@@ -1092,6 +1092,12 @@ def _stage3_generate_once(
         tokenizer, voice_plan=voice_plan, seed_bar_count=seed_bar_count)
     framework_ids = tokenizer.framework_token_ids  # 模型禁止采样这些
 
+    # ── v0.3.2 gen4: 预计算呼吸点 token ID ───────────────────
+    _REST_TOKEN_ID = tokenizer.encode_token('<Rest>')
+    _LONG_DUR_IDS: set[int] = set()
+    for d in range(4, tokenizer.grid_size + 1):  # >= quarter note
+        _LONG_DUR_IDS.add(tokenizer.encode_token(f'<Duration {d}>'))
+
     # ── 预计算内容槽起点索引 ──────────────────────────────
     # Voice token 之后的位置就是内容槽
     _voice_prefix = tokenizer.VOICE
@@ -1216,6 +1222,11 @@ def _stage3_generate_once(
             except (IndexError, ValueError):
                 current_voice = 0
 
+            # ── v0.3.2 gen4: 乐句呼吸点 bias ──────────
+            _rest_bias, _long_dur_bias = (0.0, 0.0)
+            if phrase_state:
+                _rest_bias, _long_dur_bias = phrase_state.breathing_bias()
+
             # ── DurSat: 检查声部是否已满 ────────────────
             # (简化: 基于 token 流实时追踪 cum_dur)
             voice_full = False
@@ -1246,6 +1257,14 @@ def _stage3_generate_once(
                         if 0 <= nid < logits.size(-1):
                             logits[0, nid] = float('-inf')
 
+                # ── v0.3.2 gen4: 乐句呼吸点 — Rest / 长 Duration boost ──
+                if _rest_bias > 0.0 and 0 <= _REST_TOKEN_ID < logits.size(-1):
+                    logits[0, _REST_TOKEN_ID] += _rest_bias
+                if _long_dur_bias > 0.0:
+                    for did in _LONG_DUR_IDS:
+                        if 0 <= did < logits.size(-1):
+                            logits[0, did] += _long_dur_bias
+
                 # top-k
                 if top_k > 0:
                     vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -1258,6 +1277,14 @@ def _stage3_generate_once(
                 all_tokens.append(tid)
 
                 ts = tokenizer.decode_token(tid)
+
+                # ── v0.3.2 gen4: 轮廓追踪 (Voice 0 only) ──
+                if phrase_state and current_voice == 0 and ts.startswith(tokenizer.NOTE_ON):
+                    try:
+                        pitch = int(ts.split(' ')[1].rstrip('>'))
+                        phrase_state.record_pitch(pitch)
+                    except (IndexError, ValueError):
+                        pass
 
                 # Token 级日志
                 if abc_logger and abc_logger.file_level <= 10:
@@ -1562,6 +1589,103 @@ def _c_evaluate(all_tokens, a1, a2, a3, tokenizer,
     except Exception as e:
         xml_review = [{'error': str(e)}]
 
+    # ═══════════════════════════════════════════════════════════
+    #  v0.3.2 gen4: C 层乐句评估
+    # ═══════════════════════════════════════════════════════════
+    phrase_scores: list[dict] = []
+    for sec_idx, sec in enumerate(a1.sections):
+        if not sec.phrases:
+            continue
+        sec_start, sec_end = _sec_bar_range(sec_idx)
+        sec_bars = [b for b in a3.bar_log if sec_start <= b.bar < sec_end]
+        if len(sec_bars) < 2:
+            continue
+
+        for phrase in sec.phrases:
+            p_start = sec_start + phrase.bar_start
+            p_end = sec_start + phrase.bar_end
+            p_bars = [b for b in a3.bar_log if p_start <= b.bar < p_end]
+
+            if not p_bars:
+                continue
+
+            # ── 终止式强度 ──
+            # 检查乐句末尾 bar 的密度是否自然 (不应空洞也不应过密)
+            cadence_strength = 1.0
+            if len(p_bars) >= 1:
+                last_bar = p_bars[-1]
+                if last_bar.density < 0.5:
+                    cadence_strength *= 0.5   # 终止 bar 太空 → 弱终止
+                elif last_bar.density > 8:
+                    cadence_strength *= 0.7   # 终止 bar 太密 → 不自然
+                if last_bar.rest_ratio < 0.1:
+                    cadence_strength *= 0.8   # 终止 bar 无休止 → 缺呼吸
+
+            # ── 乐句连贯性 ──
+            # density 的 CV 越低越连贯 (乐句内不应忽密忽疏)
+            densities = [b.density for b in p_bars]
+            if len(densities) >= 2:
+                mean_d = sum(densities) / len(densities)
+                if mean_d > 0:
+                    std_d = (sum((d - mean_d) ** 2 for d in densities) / len(densities)) ** 0.5
+                    cv = std_d / mean_d
+                    coherence = max(0.0, 1.0 - cv)  # CV < 1 → OK, CV > 2 → bad
+                else:
+                    coherence = 0.0
+            else:
+                coherence = 0.8
+
+            # ── 呼吸自然度 ──
+            # 乐句末尾应有一定比例的休止/长音
+            breathing = 0.5
+            if len(p_bars) >= 2:
+                # 后 1/3 的 rest_ratio 应高于前 2/3
+                split = max(1, len(p_bars) * 2 // 3)
+                front_rest = sum(b.rest_ratio for b in p_bars[:split]) / max(split, 1)
+                back_rest = sum(b.rest_ratio for b in p_bars[split:]) / max(len(p_bars) - split, 1)
+                if back_rest > front_rest + 0.05:
+                    breathing = 0.9   # 好的呼吸: 结尾更松
+                elif back_rest > front_rest:
+                    breathing = 0.7
+                else:
+                    breathing = 0.3   # 结尾反而更密 → 不自然
+
+            phrase_scores.append({
+                'section_idx': sec_idx,
+                'phrase_idx': phrase.phrase_idx,
+                'phrase_type': phrase.phrase_type,
+                'cadence_target': phrase.cadence_target,
+                'bars': f'{phrase.bar_start}-{phrase.bar_end}',
+                'cadence_strength': round(cadence_strength, 3),
+                'coherence': round(coherence, 3),
+                'breathing': round(breathing, 3),
+                'overall': round((cadence_strength + coherence + breathing) / 3, 3),
+            })
+
+    # ── 前后句匹配 (antecedent-consequent) ──
+    phrase_matching = 1.0
+    for ps in phrase_scores:
+        if ps['phrase_type'] == 'consequent':
+            # 找同一段内的前一个 antecedent
+            prev = None
+            for ps2 in phrase_scores:
+                if (ps2['section_idx'] == ps['section_idx'] and
+                    ps2['phrase_type'] == 'antecedent' and
+                    ps2['phrase_idx'] == ps['phrase_idx'] - 1):
+                    prev = ps2
+                    break
+            if prev:
+                # coherence 相近 = 前后句匹配好
+                match = 1.0 - abs(ps['coherence'] - prev['coherence'])
+                phrase_matching = min(phrase_matching, match)
+                ps['match_with_prev'] = round(match, 3)
+
+    # ── 短语评估汇总 ──
+    if phrase_scores:
+        avg_phrase = sum(p['overall'] for p in phrase_scores) / len(phrase_scores)
+    else:
+        avg_phrase = 0.0
+
     report = {
         'structural_fixes': fixes,
         'archive_commands': archive_cmds,
@@ -1572,6 +1696,10 @@ def _c_evaluate(all_tokens, a1, a2, a3, tokenizer,
         'xml_review': xml_review,
         'xml_comparison': xml_comparison,
         'c_feedback': c_feedback_dict,
+        # v0.3.2 gen4: 乐句评估
+        'phrase_scores': phrase_scores,
+        'phrase_matching': round(phrase_matching, 3),
+        'avg_phrase_score': round(avg_phrase, 3),
     }
 
     if abc_logger:
@@ -1583,6 +1711,15 @@ def _c_evaluate(all_tokens, a1, a2, a3, tokenizer,
         abc_logger.c_scores(novelty, diversity, 0.0)
         if archive_cmds:
             abc_logger.c_archive(archive_cmds)
+        # v0.3.2 gen4: 乐句评估日志
+        if phrase_scores:
+            abc_logger.info('C', f'乐句评估: avg={avg_phrase:.3f} matching={phrase_matching:.3f} '
+                            f'({len(phrase_scores)} phrases)')
+            for ps in phrase_scores:
+                abc_logger.info('C', f'  phrase[{ps["phrase_idx"]}] {ps["phrase_type"]} '
+                                f'bars={ps["bars"]} cad={ps["cadence_strength"]:.2f} '
+                                f'coh={ps["coherence"]:.2f} breath={ps["breathing"]:.2f} '
+                                f'→ {ps["overall"]:.3f}')
 
     # ── Phase 2: DPO reward log ──
     reward_path = '/root/autodl-tmp/chopinote/rewards/reward_log.jsonl'
