@@ -124,7 +124,7 @@ def load_state() -> dict:
         except (json.JSONDecodeError, OSError):
             pass
     return {
-        'version': 3,
+        'version': 4,
         'last_updated': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'datasets': {},
         'totals': {'converted': 0, 'duplicate_skip': 0, 'quality_skip': 0,

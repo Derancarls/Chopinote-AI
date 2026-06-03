@@ -58,6 +58,11 @@ python scripts/preprocess/dedup_and_split.py \
     --input-dir /root/autodl-tmp/data/processed/tokens_v4 2>&1 || log "Dedup exit=$? (non-fatal)"
 log "Dedup done ($(date '+%H:%M:%S'))"
 
+# ── Generate token_lengths.json ─────────────────────────────────
+log "Generating token_lengths.json..."
+python scripts/preprocess/generate_token_lengths.py 2>&1 || log "Token lengths exit=$? (non-fatal)"
+log "Token lengths done ($(date '+%H:%M:%S'))"
+
 # ── Summary ─────────────────────────────────────────────────
 TOTAL_TOKENS=$(find /root/autodl-tmp/data/processed/tokens_v4 -name "*.tokens" | wc -l)
 TOTAL_SEC=$(find /root/autodl-tmp/data/processed/tokens_v4 -name "*.sec.json" | wc -l)

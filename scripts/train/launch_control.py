@@ -572,8 +572,8 @@ class PreflightChecker:
             import random
             samples = random.sample(files, min(3, len(files)))
             for fpath in samples:
-                # 匹配 TokenDataset._resolve_path 逻辑：优先 data_dir/tokens_v3/<basename>
-                full = os.path.join(self.config.data_dir, 'tokens_v3', os.path.basename(fpath))
+                # 匹配 TokenDataset._resolve_path 逻辑：优先 data_dir/tokens_v4/<basename>
+                full = os.path.join(self.config.data_dir, 'tokens_v4', os.path.basename(fpath))
                 if not os.path.exists(full):
                     full = fpath if os.path.isabs(fpath) else os.path.join(self.config.data_dir, fpath)
                 if not os.path.exists(full):

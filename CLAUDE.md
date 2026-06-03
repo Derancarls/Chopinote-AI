@@ -106,6 +106,8 @@ A1 (框架记忆) → A2 (动机提取) → A3 (统计画像) → B1 (硬约束)
 - Vocab: 542 tokens, deterministic given grid_size=16, velocity_levels=8
 - CloudTrain branch: local/remote diverged, write-only push only
 - Git commits: `Derancarls <derancarls@foxmail.com>`, **NO** `Co-Authored-By`
+- **禁止自动提交**: 未经用户明确要求，不得执行 `git commit`。只有用户明确说"提交"时才能提交
+- **Commit message 版本号规范**: 同一版本内的多次修复用递增序号区分，如 `v0.3.2-fix1`, `v0.3.2-fix2`, `v0.3.2-preprocess1`。禁止无序号重复使用同一前缀
 - `docs/` directory: NEVER delete from disk
 - `chopinote_evaluator/`: deleted, logic absorbed into `chopinote_abc/`
 - DataLoader: `num_workers=0` mandatory (multiprocessing crashes on long runs)

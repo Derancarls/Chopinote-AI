@@ -115,14 +115,14 @@ class _BasePreprocessor:
         metadata.num_tokens = len(tokens)
         tid = f"{metadata.file_id}.tokens"
         mid = f"{metadata.file_id}.meta.json"
-        tp = os.path.join(output_dir, "tokens_v3", tid)
+        tp = os.path.join(output_dir, "tokens_v4", tid)
         os.makedirs(os.path.dirname(tp), exist_ok=True)
         with open(tp, 'w', encoding='utf-8') as f:
             json.dump(tokens, f)
         metadata.processing_time = time.time() - t0
         md = asdict(metadata)
         md.update(conversion_metadata)
-        mp = os.path.join(output_dir, "metadata_v3", mid)
+        mp = os.path.join(output_dir, "metadata_v4", mid)
         os.makedirs(os.path.dirname(mp), exist_ok=True)
         with open(mp, 'w', encoding='utf-8') as f:
             json.dump(md, f, indent=2, ensure_ascii=False)

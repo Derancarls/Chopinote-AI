@@ -707,8 +707,8 @@ def process_midi_file_fast(file_path: str, output_dir: str,
 
     # Generate file paths
     fid = generate_file_id(file_path)
-    token_path = os.path.join(output_dir, "tokens_v3", f"{fid}.tokens")
-    meta_path = os.path.join(output_dir, "metadata_v3", f"{fid}.meta.json")
+    token_path = os.path.join(output_dir, "tokens_v4", f"{fid}.tokens")
+    meta_path = os.path.join(output_dir, "metadata_v4", f"{fid}.meta.json")
     os.makedirs(os.path.dirname(token_path), exist_ok=True)
     os.makedirs(os.path.dirname(meta_path), exist_ok=True)
 

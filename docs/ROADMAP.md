@@ -760,6 +760,43 @@ SSF + Voice + Fig      Voice Splitting ──→ Framework-C.S. ──→ 课程
 | **P2: 手动 attention 性能优化** | 搁置 | 等 PyTorch 原生 custom bias API |
 | **序列并行 / 多卡训练** | 搁置 | 单卡 48GB 当前够用 |
 
+---
+
+## 考虑中的优化方向
+
+> 以下是从「作曲家视角」审视 v0.3.2-gen4 架构后识别的结构性缺口。
+> 当前项目解决了「如何把音乐编码成 token」的问题，但要让模型从 sequence completer 变成 composer，
+> 核心差距在主题发展、和声句法、戏剧结构、层次化生成四个维度。
+> 以下按优先级排列，尚未排入具体版本。
+
+### P0 — 决定性能力
+
+| 方向 | 说明 | 难度 |
+|------|------|------|
+| **主题发展引擎** | A2 目前只能提取动机 DNA，没有变形能力。真正的作曲家会逆行/倒影/增值/减值/碎片化/模进动机。需要 A2 增加 `MotifTransform` 算子（retrograde/inversion/augmentation/diminution/fragmentation/sequence），B2 增加发展策略选择（「下个乐句用主题A的倒影，属调开始」），生成时从变形后的动机 token 片段拼接而非从零采样 | 高 |
+| **功能化和声语法** | SSF 12 维连续 chroma 场优雅但丢掉了功能和声的离散句法（T→SD→D→T 方向性、终止式的期待-解决）。A1 规划了和弦进行但模型只看到 SSF 向量看不到功能标签。建议增加轻量 `FunctionField`（3-4 维 T/SD/D/T embedding）或把 chord function 作为框架 token 由 A1 预插入 | 中 |
+
+### P1 — 结构性提升
+
+| 方向 | 说明 | 难度 |
+|------|------|------|
+| **长程张力曲线** | 当前 B2 温区退火是段级独立的。一首奏鸣曲的戏剧弧线跨全部乐章：呈示部低→发展部高→再现部下降。没有组件追踪全曲紧张度。建议 A1 增加 `DramaticCurve`（全局 0~1 标量曲线），B2 沿曲线调温度/密度/音域/不协和度 | 低 |
+| **粗到细层次化生成** | 当前是单次自回归采样 4096 token。作曲家工作方式是先定骨架再填细节。建议三 pass 生成：(1) 骨架 pass — 结构+终止式+调性框架，(2) 外声部 pass — Soprano+Bass Note_ON，其他 mask，(3) 填充 pass — Alto/Tenor+织体+力度+表情 | 高 |
+| **风格 conditioning** | 当前无差别学习所有 MIDI 数据。建议预训练时加入 composer/style embedding（从 metadata 提取），推理时指定风格自动切换和声偏好/织体选择/终止式频率。类似 voice_embedding 的注入方式 | 中 |
+
+### P2 — 质量与可用性
+
+| 方向 | 说明 | 难度 |
+|------|------|------|
+| **对位意识** | 四个声部各自生成，B1 禁止了声部交错和平行五八度，但没有正向鼓励反向进行/不完全→完全协和解决/声部旋律独立性。建议 B2 增加 `ContourBias`：相邻声部反向进行 bonus，平行进行 penalty，~10 行代码无需新 embedding | 低 |
+| **迭代修改 (Inpainting)** | DPO 做偏好微调（权重级），但作曲家工作方式是局部修改——「这个乐句不好，重写它」。建议 C 产出结构化诊断（「bar 24-28 密度下降太快」），A1 局部重规划，B 在指定区间重新采样。局部 inpainting 而非全局 regenerate | 中 |
+
+### P3 — 锦上添花
+
+| 方向 | 说明 | 难度 |
+|------|------|------|
+| **情感/美学意图** | 无情感模型。建议可选 conditioning token（sad/joyful/mysterious/majestic 等），通过速度+调式+力度启发式标注或 metadata 推断，作为全局 embedding 注入 | 低 |
+
 ### 已完成
 
 | 方向 | 版本 | 说明 |
