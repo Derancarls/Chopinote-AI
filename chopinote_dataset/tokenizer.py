@@ -70,6 +70,29 @@ _PROGRAM_FALLBACK: dict[int, int] = {
     120: 0, 121: 0, 122: 0, 123: 0, 124: 0, 125: 0, 126: 0, 127: 0,
 }
 
+# ── Dynamic 特殊值规范化 ───────────────────────────────
+def _normalize_dynamic(value: str) -> str:
+    """将非标准动态记号映射到词表中的 19 个。
+
+    规则:
+      - p (n≥5) → pppp, f (n≥5) → ffff
+      - 显式映射表中未覆盖的 → 默认 mf
+    """
+    # DYN_FALLBACK: non-standard → standard
+    _DYN_FALLBACK: dict[str, str] = {
+        'ppppp': 'pppp', 'pppppp': 'pppp',
+        'fffff': 'ffff', 'ffffff': 'ffff',
+        'n': 'pppp', 'pf': 'mp',
+    }
+    if value in _DYN_FALLBACK:
+        return _DYN_FALLBACK[value]
+    # General rule: extended p/f sequences
+    if all(c == 'p' for c in value) and len(value) >= 5:
+        return 'pppp'
+    if all(c == 'f' for c in value) and len(value) >= 5:
+        return 'ffff'
+    return 'mf'
+
 
 def tonic_name_to_midi(tonic_name: str | None) -> int:
     """将主音名转为 MIDI 主音音高（八度 4），无时默认 C（60）。"""
@@ -458,6 +481,9 @@ class REMITokenizer:
                     if prog_num not in self._prog_index:
                         prog_num = _PROGRAM_FALLBACK.get(prog_num, 0)
                     v = prog_num
+                # v0.3.2: normalize rare dynamics (ppppp→pppp etc.)
+                elif token_type.startswith(self.DYNAMIC):
+                    v = _normalize_dynamic(str(value))
                 token = f'{token_type} {v}>'
             else:
                 token = token_type
