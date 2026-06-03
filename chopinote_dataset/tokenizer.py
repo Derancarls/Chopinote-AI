@@ -12,6 +12,12 @@ _TONIC_PC_MAP = {
     'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11, 'Cb': 11,
 }
 
+# ── 降号→升号规范化 (词表只含升号名) ─────────────────────
+_FLAT_TO_SHARP: dict[str, str] = {
+    'Db': 'C#', 'Eb': 'D#', 'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#',
+    'Cb': 'B', 'Fb': 'E',
+}
+
 
 def tonic_name_to_midi(tonic_name: str | None) -> int:
     """将主音名转为 MIDI 主音音高（八度 4），无时默认 C（60）。"""
@@ -390,7 +396,9 @@ class REMITokenizer:
         ids = []
         for token_type, value in events:
             if value is not None:
-                token = f'{token_type} {value}>'
+                # v0.3.2: normalize flat tonic names (Bb→A#) to match vocab
+                v = _FLAT_TO_SHARP.get(str(value), str(value)) if token_type.startswith(self.TONIC) else value
+                token = f'{token_type} {v}>'
             else:
                 token = token_type
             ids.append(self.encode_token(token))
@@ -495,6 +503,7 @@ class REMITokenizer:
     # ── Helpers ────────────────────────────────────────────
 
     def get_tonic_id(self, tonic_name: str) -> int:
+        tonic_name = _FLAT_TO_SHARP.get(tonic_name, tonic_name)
         t = f'{self.TONIC} {tonic_name}>'
         return self.encode_token(t)
 
