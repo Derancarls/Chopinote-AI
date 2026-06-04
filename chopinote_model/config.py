@@ -66,6 +66,10 @@ class ModelConfig:
     use_cadence: bool = True
     n_cadence_types: int = 6                # 0=none, 1-5=PAC/IAC/HC/DC/PC
 
+    # --- 功能化和声语法（functional harmony） ---
+    use_function_field: bool = True
+    n_func_types: int = 5                   # 0=PAD, 1=T, 2=SD, 3=D, 4=SDom
+
     # --- 时值饱和度（DurSat） ---
     use_dur_sat: bool = True
     dur_sat_buckets: int = 17               # 0/16 ~ 16/16

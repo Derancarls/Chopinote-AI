@@ -297,6 +297,18 @@ class TokenDataset(Dataset):
         except Exception:
             return None
 
+    def _load_func_data(self, file_idx: int) -> Optional[dict]:
+        """加载功能和声标注 (v0.3.3-opt2)。"""
+        path = self._resolve_path(self.file_paths[file_idx])
+        func_path = path.with_suffix('.func.json')
+        if not func_path.exists():
+            return None
+        try:
+            with open(func_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     def __getitem__(self, idx: int) -> dict:
         file_idx = self.valid_indices[idx % len(self.valid_indices)]
         tokens = self._load_tokens(file_idx)
@@ -397,6 +409,32 @@ class TokenDataset(Dataset):
 
         # ── 和弦数据 — v0.3.0 已移除 Chord tokens, 不再需要 .chord.json ──
 
+        # ── 功能化和声 field (v0.3.3-opt2) ──────────────────────
+        func_data = self._load_func_data(file_idx)
+        if func_data is not None:
+            # Build bar→func_id mapping: 0=PAD, 1=T, 2=SD, 3=D, 4=SDom
+            _FUNC_NAME_TO_ID = {'T': 1, 'SD': 2, 'D': 3, 'SDom': 4}
+            func_per_bar: dict[int, int] = {}
+            for entry in func_data.get('functions', []):
+                bar = entry.get('bar', -1)
+                fname = entry.get('func', '')
+                func_per_bar[bar] = _FUNC_NAME_TO_ID.get(fname, 0)
+            # Expand to per-token: track Bar token positions
+            n_total = len(tokens)
+            func_full = [0] * n_total
+            bar_idx = -1
+            for i, tid in enumerate(tokens):
+                if tid == 4:  # bar_token_id
+                    bar_idx += 1
+                func_full[i] = func_per_bar.get(bar_idx, 0)
+            # Align to crop window
+            if start > 0:
+                func_ids = torch.tensor(func_full[start:start + T + 1][:-1], dtype=torch.long)
+            else:
+                func_ids = torch.tensor(func_full[:T], dtype=torch.long)
+        else:
+            func_ids = torch.zeros(T, dtype=torch.long)
+
         # ── SSF field 构建 (v0.3.0) ────────────────────────────
         ssf_data = self._load_ssf_data(file_idx)
         if ssf_data is not None:
@@ -441,6 +479,7 @@ class TokenDataset(Dataset):
             'sec_bars_target': sec_bars_target,
             'sec_keys_target': sec_keys_target,
             'sec_types_target': sec_types_target,
+            'func_ids': func_ids,
         }
 
 
@@ -487,6 +526,12 @@ def collate_fn(batch: list[dict]) -> dict:
         dur_sat_ids = [b['dur_sat_ids'] for b in batch]
         result['dur_sat_ids'] = torch.nn.utils.rnn.pad_sequence(
             dur_sat_ids, batch_first=True, padding_value=0)
+
+    # ── 功能化和声字段 padding ──────────────────────────────
+    if 'func_ids' in batch[0]:
+        func_ids = [b['func_ids'] for b in batch]
+        result['func_ids'] = torch.nn.utils.rnn.pad_sequence(
+            func_ids, batch_first=True, padding_value=0)
 
     # ── 段落字段 padding ────────────────────────────────────────
     if 'section_ids' in batch[0]:
