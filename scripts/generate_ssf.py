@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-SSF (Sliding Scale Field) 标注脚本 — v0.3.0。
+SSF (Sliding Scale Field) 标注脚本 — v0.3.0 → v0.3.3 升级。
 从 .tokens 文件生成 .ssf.json 侧边文件。
 
 SSF 编码规则 (主音锚定):
   - 12 维向量, 位置 0 = 主音, 位置 i = 距主音 i 个半音
-  - TonicField: 段落级 PC histogram, 归一化
-  - LocalField: 小节级 delta (稀疏, 仅存 |delta| > threshold)
+  - TonicField:  段落级 PC histogram, 归一化
+  - LocalField:  小节级 delta (稀疏, 仅存 |delta| > threshold)
+  - BeatField:   节拍级, 每 bar 内相邻 Position token 间的 SSF 向量 (v0.3.3 新增)
 
 用法:
   python scripts/generate_ssf.py annotate \
@@ -32,17 +33,13 @@ def tonic_name_to_pc(name: str) -> int:
 
 
 def compute_tonic_field(note_intervals: list[int], tonic_name: str) -> list[float]:
-    """统计 Note_ON 区间 → 12 维 TonicField (主音在 pos 0)。
-
-    note_intervals: Note_ON 的 interval 值 (pitch - tonic_midi)
-    tonic_name: 当前主音名
-    """
+    """统计 Note_ON 区间 → 12 维 TonicField (主音在 pos 0)。"""
     counts = [0] * 12
     tonic_pc = tonic_name_to_pc(tonic_name)
 
     for interval in note_intervals:
         abs_pc = (tonic_pc + interval) % 12
-        rotated_pos = (abs_pc - tonic_pc) % 12  # tonic 落到 pos 0
+        rotated_pos = (abs_pc - tonic_pc) % 12
         counts[rotated_pos] += 1
 
     total = sum(counts)
@@ -50,13 +47,13 @@ def compute_tonic_field(note_intervals: list[int], tonic_name: str) -> list[floa
         return [0.5] * 12
 
     max_count = max(counts)
-    return [c / max_count for c in counts]  # 归一化到 [0, 1]
+    return [c / max_count for c in counts]
 
 
 def compute_local_field(
     note_intervals: list[int], tonic_name: str, tonic_field: list[float]
 ) -> list[float] | None:
-    """计算小节级 LocalField delta。如果 delta 太小返回 None (稀疏存储)。"""
+    """计算小节级 LocalField delta。delta 太小返回 None (稀疏存储)。"""
     if len(note_intervals) < 3:
         return None
 
@@ -64,16 +61,22 @@ def compute_local_field(
     delta = [local[i] - tonic_field[i] for i in range(12)]
 
     if max(abs(d) for d in delta) < LOCAL_DELTA_THRESHOLD:
-        return None  # 稀疏: 变化太小不存
+        return None
 
     return delta
+
+
+def compute_beat_field(note_intervals: list[int], tonic_name: str) -> list[float] | None:
+    """计算节拍级 SSF 向量。无音符返回 None。"""
+    if not note_intervals:
+        return None
+    return compute_tonic_field(note_intervals, tonic_name)
 
 
 def process_file(args: tuple) -> dict:
     """处理单个 .tokens 文件。"""
     fpath, secio_dir = args
 
-    # 加载 tokens
     try:
         with open(fpath) as f:
             ids = json.load(f)
@@ -96,17 +99,14 @@ def process_file(args: tuple) -> dict:
     if not section_boundaries:
         section_boundaries = [0]
 
-    # 解码 token → 提取 Note_ON 区间 和 Tonic
-    # 简单扫描: 用 token ID 但不依赖完整的 tokenizer (更快)
-    # Tonic token: 遍历词表前缀匹配太慢，改为在 script 启动时预计算
-    note_intervals = []  # 每个小节: [(bar_idx, interval)]
+    TONIC_IDS = _get_tonic_ids()
+    POSITION_IDS = _get_position_ids()
+
+    # ── 扫描 token 序列 ──
     bar_idx = -1
     current_tonic = 'C'
-    bar_positions = []  # token 位置列表
-
-    # 这里用到一个简化的扫描器，不依赖完整 tokenizer
-    # Tonic tokens: 需要外部传入 ID 范围
-    TONIC_IDS = _get_tonic_ids()
+    current_position = 0
+    note_intervals = []  # [(bar_idx, position_in_bar, interval)]
 
     for pos, tid in enumerate(ids):
         if tid in TONIC_IDS:
@@ -114,48 +114,52 @@ def process_file(args: tuple) -> dict:
             continue
         if tid == 4:  # <Bar>
             bar_idx += 1
-            bar_positions.append(pos)
+            current_position = 0
             continue
-        # Note_ON IDs: 需要外部传入范围
+        if tid in POSITION_IDS:
+            current_position = POSITION_IDS[tid]
+            continue
         if _NOTE_ON_MIN <= tid <= _NOTE_ON_MAX:
             interval = tid - _NOTE_ON_ZERO
-            note_intervals.append((bar_idx, pos, interval))
+            note_intervals.append((bar_idx, current_position, interval))
 
     if bar_idx < 0:
-        bar_positions = [0]
         bar_idx = 0
 
-    # 构建 per-bar 的 Note_ON 区间列表
+    # ── 组织数据: bar_notes[bar] = list of intervals ──
     bar_notes: dict[int, list[int]] = {b: [] for b in range(bar_idx + 1)}
-    for bar, pos, interval in note_intervals:
-        if bar >= 0:
-            bar_notes[bar].append(interval)
+    # beat_notes[bar][position] = list of intervals
+    beat_notes: dict[int, dict[int, list[int]]] = {b: {} for b in range(bar_idx + 1)}
 
-    # 如果 section_boundaries 只有起始值, 补上结束值
+    for bar, pos_in_bar, interval in note_intervals:
+        if bar >= 0:
+            bar_notes.setdefault(bar, []).append(interval)
+            beat_notes.setdefault(bar, {}).setdefault(pos_in_bar, []).append(interval)
+
+    # ── 补全 section_boundaries ──
     if len(section_boundaries) == 1:
         section_boundaries.append(bar_idx + 1)
 
-    # ── 计算 TonicField (段落级) ──
+    # ── 段落级 TonicField ──
     tonic_fields = []
-    for i in range(len(section_boundaries)):
+    for i in range(len(section_boundaries) - 1):
         sec_start = section_boundaries[i]
-        sec_end = (section_boundaries[i + 1]
-                   if i + 1 < len(section_boundaries)
-                   else bar_idx + 1)
-
-        # 收集该段落内所有 Note_ON 区间
+        sec_end = section_boundaries[i + 1]
         sec_intervals = []
         for b in range(sec_start, min(sec_end, bar_idx + 1)):
             sec_intervals.extend(bar_notes.get(b, []))
+        tonic_fields.append(compute_tonic_field(sec_intervals, current_tonic))
+    # 最后一段 (sec_boundaries[-1] → end)
+    last_start = section_boundaries[-1]
+    sec_intervals = []
+    for b in range(last_start, bar_idx + 1):
+        sec_intervals.extend(bar_notes.get(b, []))
+    tonic_fields.append(compute_tonic_field(sec_intervals, current_tonic))
 
-        tf = compute_tonic_field(sec_intervals, current_tonic)
-        tonic_fields.append(tf)
-
-    # ── 计算 LocalField (小节级 delta) ──
+    # ── 小节级 LocalField (delta from section TonicField) ──
     local_fields: dict[str, list[float]] = {}
     for b in range(bar_idx + 1):
-        if b < len(bar_notes) and bar_notes[b]:
-            # 找到该 bar 所属段落
+        if b in bar_notes and bar_notes[b]:
             sec_idx = 0
             for i in range(len(section_boundaries)):
                 if b >= section_boundaries[i]:
@@ -165,6 +169,18 @@ def process_file(args: tuple) -> dict:
             if delta is not None:
                 local_fields[str(b)] = delta
 
+    # ── 节拍级 BeatField (v0.3.3 新增) ──
+    beat_fields: dict[str, dict[str, list[float]]] = {}
+    for b in range(bar_idx + 1):
+        if b in beat_notes:
+            bar_beats = {}
+            for pos_in_bar, intervals in beat_notes[b].items():
+                bf = compute_beat_field(intervals, current_tonic)
+                if bf is not None:
+                    bar_beats[str(pos_in_bar)] = bf
+            if bar_beats:
+                beat_fields[str(b)] = bar_beats
+
     return {
         'status': 'ok',
         'file': fpath,
@@ -172,29 +188,50 @@ def process_file(args: tuple) -> dict:
             'tonic_fields': tonic_fields,
             'section_boundaries': section_boundaries,
             'local_fields': local_fields,
+            'beat_fields': beat_fields,
         },
     }
 
 
-# ── Token ID 常量 (在 main 中初始化) ──
+# ── Token ID 常量 ────────────────────────────────────────
 _NOTE_ON_MIN = 0
 _NOTE_ON_MAX = 0
 _NOTE_ON_ZERO = 0
 
+_tonic_ids_cache: dict[int, str] | None = None
+_position_ids_cache: dict[int, int] | None = None
+
 
 def _get_tonic_ids() -> dict[int, str]:
-    """获取 Tonic token ID → tonic name 映射。"""
+    global _tonic_ids_cache
+    if _tonic_ids_cache is not None:
+        return _tonic_ids_cache
     from chopinote_dataset.tokenizer import REMITokenizer
     t = REMITokenizer(16, 8)
     mapping = {}
     for name in t.TONIC_NAMES:
         tid = t.encode_token(f'<Tonic {name}>')
         mapping[tid] = name
+    _tonic_ids_cache = mapping
+    return mapping
+
+
+def _get_position_ids() -> dict[int, int]:
+    """Position token ID → position value (0-15) 映射。"""
+    global _position_ids_cache
+    if _position_ids_cache is not None:
+        return _position_ids_cache
+    from chopinote_dataset.tokenizer import REMITokenizer
+    t = REMITokenizer(16, 8)
+    mapping = {}
+    for i in range(t.grid_size):
+        tid = t.encode_token(f'<Position {i}>')
+        mapping[tid] = i
+    _position_ids_cache = mapping
     return mapping
 
 
 def _init_note_on_range():
-    """初始化 Note_ON token 的 ID 范围。"""
     global _NOTE_ON_MIN, _NOTE_ON_MAX, _NOTE_ON_ZERO
     from chopinote_dataset.tokenizer import REMITokenizer
     t = REMITokenizer(16, 8)
@@ -207,7 +244,7 @@ def _init_note_on_range():
 # ── CLI ────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description='SSF annotation for v0.3.0')
+    ap = argparse.ArgumentParser(description='SSF annotation for v0.3.3')
     ap.add_argument('command', choices=['annotate'])
     ap.add_argument('--input-dir', default='/root/autodl-tmp/data/processed/tokens_v4')
     ap.add_argument('--num-workers', type=int, default=16)

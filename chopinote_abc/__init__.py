@@ -15,12 +15,15 @@ from .database import (
     MotifDNA, MotifRecord,
     BarStats, SectionStats,
     PhrasePlan, PhraseState,          # v0.3.2 gen4: 乐句层
+    DramaticCurve,                    # v0.3.3-opt3: 长程张力曲线
     compute_novelty_bonus, compute_diversity_bonus, write_reward_log,
 )
 from .planner import (
     plan_structure, plan_harmony, reharmonize_from_bar,
     tonal_progression_template,
     plan_phrases_for_section,         # v0.3.2 gen4: 乐句规划
+    DRAMATIC_TEMPLATES,               # v0.3.3-opt3: 曲式张力模板
+    build_dramatic_curve,             # v0.3.3-opt3: 曲线生成器
 )
 from .motif import (
     identify_landmarks, purify_tokens, extract_dna,
@@ -33,6 +36,7 @@ from .decision import (
     BFeedback, InnovationEntry,
     DevelopmentAction, select_development_action,
     apply_motif_guidance, build_note_on_range,
+    DramaticParams, apply_dramatic_params,  # v0.3.3-opt3: 张力曲线参数联动
 )
 from .metrics import (
     METRIC_FUNCTIONS,

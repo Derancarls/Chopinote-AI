@@ -30,19 +30,22 @@ def _init_voice_ids():
 
 # ── 时值饱和度（DurSat）：预计算 Position/Voice/Duration token ID ──
 _DURSAT_POSITION_IDS: set[int] = set()
+_DURSAT_POS_TO_VAL: dict[int, int] = {}    # Position token ID → position value (0-15)
 _DURSAT_VOICE_TIDS: list[int] = [-1, -1, -1, -1]
 _DURSAT_DUR_TID_TO_VAL: dict[int, int] = {}
 _DURSAT_INITIALIZED = False
 
 
 def _init_dursat_ids():
-    global _DURSAT_POSITION_IDS, _DURSAT_VOICE_TIDS, _DURSAT_DUR_TID_TO_VAL, _DURSAT_INITIALIZED
+    global _DURSAT_POSITION_IDS, _DURSAT_POS_TO_VAL, _DURSAT_VOICE_TIDS, _DURSAT_DUR_TID_TO_VAL, _DURSAT_INITIALIZED
     if _DURSAT_INITIALIZED:
         return
     from chopinote_dataset.tokenizer import REMITokenizer
     tk = REMITokenizer(grid_size=16, velocity_levels=8)
     for i in range(tk.grid_size):
-        _DURSAT_POSITION_IDS.add(tk.encode_token(f'<Position {i}>'))
+        tid = tk.encode_token(f'<Position {i}>')
+        _DURSAT_POSITION_IDS.add(tid)
+        _DURSAT_POS_TO_VAL[tid] = i
     for v in range(4):
         _DURSAT_VOICE_TIDS[v] = tk.encode_token(f'<Voice {v}>')
     for d in range(1, tk.grid_size + 1):
@@ -409,31 +412,78 @@ class TokenDataset(Dataset):
 
         # ── 和弦数据 — v0.3.0 已移除 Chord tokens, 不再需要 .chord.json ──
 
-        # ── 功能化和声 field (v0.3.3-opt2) ──────────────────────
+        # ── 功能化和声 three granularities (v0.3.3): 段落/小节/节拍 ──
+        _FUNC_NAME_TO_ID = {'T': 1, 'SD': 2, 'D': 3, 'SDom': 4}
         func_data = self._load_func_data(file_idx)
-        if func_data is not None:
-            # Build bar→func_id mapping: 0=PAD, 1=T, 2=SD, 3=D, 4=SDom
-            _FUNC_NAME_TO_ID = {'T': 1, 'SD': 2, 'D': 3, 'SDom': 4}
-            func_per_bar: dict[int, int] = {}
-            for entry in func_data.get('functions', []):
-                bar = entry.get('bar', -1)
-                fname = entry.get('func', '')
-                func_per_bar[bar] = _FUNC_NAME_TO_ID.get(fname, 0)
-            # Expand to per-token: track Bar token positions
-            n_total = len(tokens)
-            func_full = [0] * n_total
+        n_total = len(tokens)
+
+        # —— 段落级 func_sec_ids ——
+        if func_data is not None and func_data.get('version', 1) >= 2:
+            sec_to_func: dict[int, int] = {}
+            for entry in func_data.get('section_funcs', []):
+                sec_to_func[entry.get('section', -1)] = \
+                    _FUNC_NAME_TO_ID.get(entry.get('func', ''), 0)
+            # Use section_boundaries from SSF (loaded below) or sec_data
+            # We'll fill after SSF load, placeholder for now
+            func_sec_full = [0] * n_total
+            if section_data is not None:
+                boundaries = section_data.get('section_token_positions', [0])
+                sec_idx = -1
+                for i in range(n_total):
+                    if i in boundaries:
+                        sec_idx += 1
+                    func_sec_full[i] = sec_to_func.get(sec_idx, 0)
+            if start > 0:
+                func_sec_ids = torch.tensor(func_sec_full[start:start + T + 1][:-1], dtype=torch.long)
+            else:
+                func_sec_ids = torch.tensor(func_sec_full[:T], dtype=torch.long)
+
+            # —— 小节级 func_bar_ids ——
+            bar_to_func: dict[int, int] = {}
+            for entry in func_data.get('bar_funcs', []):
+                bar_to_func[entry.get('bar', -1)] = \
+                    _FUNC_NAME_TO_ID.get(entry.get('func', ''), 0)
+            func_bar_full = [0] * n_total
             bar_idx = -1
             for i, tid in enumerate(tokens):
-                if tid == 4:  # bar_token_id
+                if tid == 4:
                     bar_idx += 1
-                func_full[i] = func_per_bar.get(bar_idx, 0)
-            # Align to crop window
+                func_bar_full[i] = bar_to_func.get(bar_idx, 0)
             if start > 0:
-                func_ids = torch.tensor(func_full[start:start + T + 1][:-1], dtype=torch.long)
+                func_bar_ids = torch.tensor(func_bar_full[start:start + T + 1][:-1], dtype=torch.long)
             else:
-                func_ids = torch.tensor(func_full[:T], dtype=torch.long)
+                func_bar_ids = torch.tensor(func_bar_full[:T], dtype=torch.long)
+
+            # —— 节拍级 func_beat_ids ——
+            beat_key_to_func: dict[tuple, int] = {}
+            for entry in func_data.get('beat_funcs', []):
+                b = entry.get('bar', -1)
+                p = entry.get('pos', -1)
+                beat_key_to_func[(b, p)] = \
+                    _FUNC_NAME_TO_ID.get(entry.get('func', ''), 0)
+            func_beat_full = [0] * n_total
+            bar_idx_beat = -1
+            current_pos_val = 0
+            for i, tid in enumerate(tokens):
+                if tid == 4:
+                    bar_idx_beat += 1
+                    current_pos_val = 0
+                elif tid in _DURSAT_POSITION_IDS:
+                    # Parse position value from Position token
+                    for pos_tid, pos_val in _DURSAT_POS_TO_VAL.items():
+                        if tid == pos_tid:
+                            current_pos_val = pos_val
+                            break
+                func_beat_full[i] = beat_key_to_func.get((bar_idx_beat, current_pos_val), 0)
+            if start > 0:
+                func_beat_ids = torch.tensor(func_beat_full[start:start + T + 1][:-1], dtype=torch.long)
+            else:
+                func_beat_ids = torch.tensor(func_beat_full[:T], dtype=torch.long)
         else:
-            func_ids = torch.zeros(T, dtype=torch.long)
+            # v1 format or no .func.json — all zeros
+            func_sec_ids = torch.zeros(T, dtype=torch.long)
+            func_bar_ids = torch.zeros(T, dtype=torch.long)
+            func_beat_ids = torch.zeros(T, dtype=torch.long)
 
         # ── SSF field 构建 (v0.3.0) ────────────────────────────
         ssf_data = self._load_ssf_data(file_idx)
@@ -479,7 +529,9 @@ class TokenDataset(Dataset):
             'sec_bars_target': sec_bars_target,
             'sec_keys_target': sec_keys_target,
             'sec_types_target': sec_types_target,
-            'func_ids': func_ids,
+            'func_sec_ids': func_sec_ids,
+            'func_bar_ids': func_bar_ids,
+            'func_beat_ids': func_beat_ids,
         }
 
 
@@ -527,11 +579,16 @@ def collate_fn(batch: list[dict]) -> dict:
         result['dur_sat_ids'] = torch.nn.utils.rnn.pad_sequence(
             dur_sat_ids, batch_first=True, padding_value=0)
 
-    # ── 功能化和声字段 padding ──────────────────────────────
-    if 'func_ids' in batch[0]:
-        func_ids = [b['func_ids'] for b in batch]
-        result['func_ids'] = torch.nn.utils.rnn.pad_sequence(
-            func_ids, batch_first=True, padding_value=0)
+    # ── 功能化和声字段 padding (三粒度) ────────────────────────
+    if 'func_sec_ids' in batch[0]:
+        result['func_sec_ids'] = torch.nn.utils.rnn.pad_sequence(
+            [b['func_sec_ids'] for b in batch], batch_first=True, padding_value=0)
+    if 'func_bar_ids' in batch[0]:
+        result['func_bar_ids'] = torch.nn.utils.rnn.pad_sequence(
+            [b['func_bar_ids'] for b in batch], batch_first=True, padding_value=0)
+    if 'func_beat_ids' in batch[0]:
+        result['func_beat_ids'] = torch.nn.utils.rnn.pad_sequence(
+            [b['func_beat_ids'] for b in batch], batch_first=True, padding_value=0)
 
     # ── 段落字段 padding ────────────────────────────────────────
     if 'section_ids' in batch[0]:

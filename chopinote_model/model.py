@@ -331,10 +331,16 @@ class MusicTransformer(nn.Module):
             self.dur_sat_embedding = nn.Embedding(config.dur_sat_buckets, config.d_model)
             nn.init.zeros_(self.dur_sat_embedding.weight)
 
-        # ── 功能化和声语法（functional harmony） ──────────
-        if config.use_function_field:
-            self.func_embedding = nn.Embedding(config.n_func_types, config.d_model)
-            nn.init.zeros_(self.func_embedding.weight)
+        # ── 功能化和声语法（三粒度并行） ──────────
+        if config.use_func_section:
+            self.func_sec_embedding = nn.Embedding(config.n_func_types, config.d_model)
+            nn.init.zeros_(self.func_sec_embedding.weight)
+        if config.use_func_bar:
+            self.func_bar_embedding = nn.Embedding(config.n_func_types, config.d_model)
+            nn.init.zeros_(self.func_bar_embedding.weight)
+        if config.use_func_beat:
+            self.func_beat_embedding = nn.Embedding(config.n_func_types, config.d_model)
+            nn.init.zeros_(self.func_beat_embedding.weight)
 
         self.blocks = nn.ModuleList([
             TransformerBlock(config, i) for i in range(config.n_layers)
@@ -378,9 +384,15 @@ class MusicTransformer(nn.Module):
         if self.config.use_dur_sat:
             with torch.no_grad():
                 self.dur_sat_embedding.weight.zero_()
-        if self.config.use_function_field:
+        if self.config.use_func_section:
             with torch.no_grad():
-                self.func_embedding.weight.zero_()
+                self.func_sec_embedding.weight.zero_()
+        if self.config.use_func_bar:
+            with torch.no_grad():
+                self.func_bar_embedding.weight.zero_()
+        if self.config.use_func_beat:
+            with torch.no_grad():
+                self.func_beat_embedding.weight.zero_()
 
     def _compute_sec_bias(self, section_ids: torch.Tensor,
                           section_types: torch.Tensor,
@@ -629,7 +641,9 @@ class MusicTransformer(nn.Module):
                 voice_count_ids: Optional[torch.Tensor] = None,
                 measure_in_section_ids: Optional[torch.Tensor] = None,
                 dur_sat_ids: Optional[torch.Tensor] = None,
-                func_ids: Optional[torch.Tensor] = None,
+                func_sec_ids: Optional[torch.Tensor] = None,
+                func_bar_ids: Optional[torch.Tensor] = None,
+                func_beat_ids: Optional[torch.Tensor] = None,
                 return_sec_head: bool = False) -> torch.Tensor:
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, \
@@ -721,12 +735,22 @@ class MusicTransformer(nn.Module):
             dur_sat_ids = dur_sat_ids[:, -T:]
             x = x + self.dur_sat_embedding(dur_sat_ids)
 
-        # ── Function field embedding ──────────────────────────
-        if self.config.use_function_field and func_ids is not None:
-            if func_ids.ndim == 1:
-                func_ids = func_ids.unsqueeze(0)
-            func_clamped = func_ids[:, -T:].clamp(0, self.config.n_func_types - 1)
-            x = x + self.func_embedding(func_clamped)
+        # ── Function field embeddings (三粒度并行) ──────────
+        if self.config.use_func_section and func_sec_ids is not None:
+            if func_sec_ids.ndim == 1:
+                func_sec_ids = func_sec_ids.unsqueeze(0)
+            x = x + self.func_sec_embedding(
+                func_sec_ids[:, -T:].clamp(0, self.config.n_func_types - 1))
+        if self.config.use_func_bar and func_bar_ids is not None:
+            if func_bar_ids.ndim == 1:
+                func_bar_ids = func_bar_ids.unsqueeze(0)
+            x = x + self.func_bar_embedding(
+                func_bar_ids[:, -T:].clamp(0, self.config.n_func_types - 1))
+        if self.config.use_func_beat and func_beat_ids is not None:
+            if func_beat_ids.ndim == 1:
+                func_beat_ids = func_beat_ids.unsqueeze(0)
+            x = x + self.func_beat_embedding(
+                func_beat_ids[:, -T:].clamp(0, self.config.n_func_types - 1))
 
         x = self.dropout(x)
 

@@ -104,6 +104,59 @@ class SectionPlan:
 
 
 @dataclass
+class DramaticCurve:
+    """全曲长程紧张度曲线 (v0.3.3-opt3)。
+
+    A1 在 Stage 1 规划阶段生成，B2 沿曲线连续调参。
+    曲线精度为 bar 级，值域 [0, 1]。
+
+    0.0 = 完全松弛 (曲首/曲尾)
+    0.5 = 中性
+    1.0 = 全曲最高潮
+    """
+    curve: list[float]              # bar 级精度, 长度 = 总 bar 数
+    global_peak_bar: int            # 全曲高潮位置 (全局 bar 号)
+    section_peaks: dict[int, int] = field(default_factory=dict)
+        # section_idx → 该段的局部峰值 bar 号 (段内偏移)
+
+    @classmethod
+    def from_template(cls, form: str, section_plans: list,
+                      smoothness: float | None = None):
+        """从曲式模板生成 DramaticCurve。
+
+        在 planner.build_dramatic_curve() 中调用。
+        """
+        from .planner import DRAMATIC_TEMPLATES, build_dramatic_curve
+        template = DRAMATIC_TEMPLATES.get(form, DRAMATIC_TEMPLATES['free'])
+        if smoothness is not None:
+            template = {**template, 'smoothness': smoothness}
+        return build_dramatic_curve(section_plans, template)
+
+    def get_tension(self, bar_idx: int) -> float:
+        """查询某 bar 的目标紧张度。"""
+        if 0 <= bar_idx < len(self.curve):
+            return self.curve[bar_idx]
+        return 0.5
+
+    def get_derivative(self, bar_idx: int) -> float:
+        """紧张度变化率 (正=上升, 负=下降)。"""
+        if 0 < bar_idx < len(self.curve) - 1:
+            return (self.curve[bar_idx + 1] - self.curve[bar_idx - 1]) / 2.0
+        return 0.0
+
+    def get_section_tension_range(self, section_idx: int,
+                                  section_plans: list) -> tuple[float, float]:
+        """返回某段的 (tension_start, tension_end)。"""
+        start_bar = 0
+        for i in range(section_idx):
+            start_bar += section_plans[i].bars
+        end_bar = start_bar + section_plans[section_idx].bars
+        t_start = self.get_tension(start_bar)
+        t_end = self.get_tension(end_bar - 1) if end_bar > start_bar else t_start
+        return (t_start, t_end)
+
+
+@dataclass
 class ChordAtBar:
     """单个 bar 的和声 — 仅在和弦变更时记录。"""
     bar: int           # 全局 bar 号

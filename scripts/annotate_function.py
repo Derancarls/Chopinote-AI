@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""功能和声标注脚本 — 从 Note_ON interval 推断 T/SD/D/SDom。
+"""功能和声标注脚本 — 从 .ssf.json 的 SSF 向量分类 T/SD/D/SDom。
 
-方案 B: 扫描已有 .tokens 文件, 对每个 bar 推断功能标签,
-写入 .func.json 侧文件。不修改 .tokens, 不需要重转换。
+不重复解析 .tokens，直接读 SSF 标注结果：
+  - 段落级 TonicField    → section_funcs
+  - 小节级 LocalField    → bar_funcs
+  - 节拍级 BeatField     → beat_funcs
+
+超过余弦相似度阈值才标注，未达标的标记为 none (func_id=0)。
 
 Usage:
     python scripts/annotate_function.py annotate \
@@ -11,8 +15,7 @@ Usage:
 """
 import sys, os, time, json, logging, math, argparse
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
-from collections import Counter
+from multiprocessing import Pool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -21,7 +24,6 @@ logger = logging.getLogger(__name__)
 # ── 功能 PC 模板 (主音锚定, 12 维) ──────────────────────────────
 FUNCTION_TEMPLATES = {
     'T':  [1.0, 0.1, 0.2, 0.1, 0.7, 0.1, 0.1, 0.7, 0.1, 0.3, 0.1, 0.2],
-    #     C    C#   D    Eb   E    F    F#   G    Ab   A    Bb   B
     'SD': [0.5, 0.1, 0.3, 0.1, 0.3, 0.8, 0.1, 0.3, 0.6, 0.2, 0.2, 0.1],
     'D':  [0.5, 0.1, 0.4, 0.1, 0.3, 0.3, 0.1, 0.9, 0.1, 0.2, 0.6, 0.4],
     'SDom': [0.3, 0.1, 0.8, 0.1, 0.2, 0.3, 0.7, 0.3, 0.1, 0.1, 0.1, 0.1],
@@ -30,8 +32,11 @@ FUNCTION_TEMPLATES = {
 FUNC_NAMES = ['T', 'SD', 'D', 'SDom']
 FUNC_TO_ID = {'T': 1, 'SD': 2, 'D': 3, 'SDom': 4}
 
+# ── 分类阈值 ────────────────────────────────────────────────
+CLASSIFY_THRESHOLD = 0.50       # cosine similarity 最低阈值
+CONFIDENCE_FLOOR = 0.55         # 归一化后验最低置信度
+
 # ── Markov 转移概率 ────────────────────────────────────────────
-# P(next | current), 基于经典功能和声统计
 MARKOV_TRANSITION = {
     'T':    {'T': 0.3, 'SD': 0.4, 'D': 0.25, 'SDom': 0.05},
     'SD':   {'T': 0.15, 'SD': 0.2, 'D': 0.55, 'SDom': 0.1},
@@ -41,7 +46,6 @@ MARKOV_TRANSITION = {
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """两个向量的余弦相似度。"""
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
@@ -50,175 +54,165 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-class FunctionAnnotator:
-    """功能和声推断器。
+def classify_ssf_vector(
+    ssf_vec: list[float],
+    prev_func: str | None = None,
+    use_markov: bool = True,
+) -> tuple[str | None, float]:
+    """对单个 SSF 向量分类为功能标签。
 
-    对每个 bar:
-    1. 收集 Note_ON interval → 主音锚定 PC histogram
-    2. 计算与四类功能模板的 cosine similarity
-    3. 乘 Markov 转移先验 (从前一 bar 的功能)
-    4. MAP → 最高后验概率的功能标签
+    Args:
+        ssf_vec: 12 维 SSF chroma 向量
+        prev_func: 前一个功能标签 (用于 Markov 先验)
+        use_markov: 是否使用 Markov 转移先验
+
+    Returns:
+        (func_name, confidence) 或 (None, 0.0)
     """
+    if all(v == 0.5 for v in ssf_vec):
+        return (None, 0.0)
 
-    def __init__(self, tokenizer):
-        self.tk = tokenizer
-        self.bar_token_id = 4
+    # Cosine similarity
+    sim_scores = {}
+    for fname in FUNC_NAMES:
+        sim_scores[fname] = cosine_similarity(ssf_vec, FUNCTION_TEMPLATES[fname])
 
-        # 预计算 Note_ON token ID → interval 映射
-        self._note_on_tid_to_interval: dict[int, int] = {}
-        for token_str, token_id in tokenizer._token_to_id.items():
-            if token_str.startswith('<Note_ON '):
-                try:
-                    interval = int(token_str.split()[1].rstrip('>'))
-                    self._note_on_tid_to_interval[token_id] = interval
-                except (ValueError, IndexError):
-                    pass
+    best_func = max(sim_scores, key=sim_scores.get)
+    best_sim = sim_scores[best_func]
 
-        # 预计算 Tonic token ID → tonic_name 映射
-        self._tonic_tid_to_name: dict[int, str] = {}
-        for token_str, token_id in tokenizer._token_to_id.items():
-            if token_str.startswith('<Tonic ') and token_str.endswith('>'):
-                tonic_name = token_str[7:-1]
-                self._tonic_tid_to_name[token_id] = tonic_name
+    # 低于阈值 → 不标注
+    if best_sim < CLASSIFY_THRESHOLD:
+        return (None, 0.0)
 
-        # 主音名 → chroma 偏移 (C=0)
-        self._tonic_chroma: dict[str, int] = {
-            'C': 0, 'C#': 1, 'D': 2, 'D#': 3, 'E': 4,
-            'F': 5, 'F#': 6, 'G': 7, 'G#': 8, 'A': 9, 'A#': 10, 'B': 11,
-        }
+    # Markov prior (仅对有时间顺序的级别使用)
+    if use_markov and prev_func is not None:
+        posterior = {}
+        for fname in FUNC_NAMES:
+            prior = MARKOV_TRANSITION.get(prev_func, {}).get(fname, 0.25)
+            posterior[fname] = sim_scores[fname] * (0.3 + 0.7 * prior)
+        best_func = max(posterior, key=posterior.get)
+        best_score = posterior[best_func]
+        total = sum(posterior.values())
+        confidence = best_score / total if total > 0 else 0.0
+    else:
+        total = sum(sim_scores.values())
+        confidence = best_sim / total if total > 0 else 0.0
 
-    def _build_pc_histogram(self, intervals: list[int], tonic_name: str) -> list[float]:
-        """将 Note_ON interval 列表转换为主音锚定 PC histogram (12维, 归一化)。
+    if confidence < CONFIDENCE_FLOOR:
+        return (None, 0.0)
 
-        interval 是相对于主音 MIDI 60 的半音程 (-60..60)。
-        pitch_class = (60 + interval) % 12 → tonic-anchored → (pc - tonic_chroma) % 12
-        """
-        hist = [0.0] * 12
-        tonic_chroma = self._tonic_chroma.get(tonic_name, 0)
-        for interval in intervals:
-            pc = (60 + interval) % 12
-            anchored = (pc - tonic_chroma) % 12
-            hist[anchored] += 1.0
-        # 归一化
-        total = sum(hist)
-        if total > 0:
-            hist = [h / total for h in hist]
-        return hist
-
-    def _infer_tonic(self, tokens: list[int]) -> str:
-        """从 token 序列中推断主音 (取最后一个 Tonic token)。
-        无 Tonic token 时默认 C 大调。
-        """
-        current_tonic = 'C'
-        for tid in tokens:
-            tonic = self._tonic_tid_to_name.get(tid)
-            if tonic is not None:
-                current_tonic = tonic
-        return current_tonic
-
-    def annotate(self, tokens: list[int]) -> dict:
-        """对完整 token 序列进行功能和声标注。
-
-        Returns:
-            {"version": 1, "num_bars": N, "functions": [{"bar": 0, "func": "T", "confidence": 0.92}, ...]}
-        """
-        # ── Step 1: 分 bar + 收集 Note_ON interval ──────────
-        bars: list[list[int]] = []  # bar_idx → list of Note_ON intervals
-        current_bar: list[int] = []
-        current_tonic = 'C'
-
-        for tid in tokens:
-            # 跟踪主音
-            tonic = self._tonic_tid_to_name.get(tid)
-            if tonic is not None:
-                current_tonic = tonic
-
-            if tid == self.bar_token_id:
-                if current_bar:
-                    bars.append(current_bar)
-                current_bar = []
-            else:
-                interval = self._note_on_tid_to_interval.get(tid)
-                if interval is not None:
-                    current_bar.append(interval)
-
-        # 最后一个 bar
-        if current_bar:
-            bars.append(current_bar)
-
-        if not bars:
-            bars.append([])
-
-        # ── Step 2: 逐 bar 推断功能 ──────────────────────────
-        functions = []
-        prev_func = 'T'  # 默认从 Tonic 开始
-
-        for bar_idx, intervals in enumerate(bars):
-            if not intervals:
-                # 无音符 bar: 延续前一功能, 低置信度
-                functions.append({
-                    'bar': bar_idx,
-                    'func': prev_func,
-                    'confidence': 0.3,
-                })
-                continue
-
-            # PC histogram
-            hist = self._build_pc_histogram(intervals, current_tonic)
-
-            # Cosine similarity with each template
-            sim_scores = {}
-            for fname in FUNC_NAMES:
-                sim_scores[fname] = cosine_similarity(hist, FUNCTION_TEMPLATES[fname])
-
-            # 乘 Markov transition prior (prior weight 0.7 强化句法约束)
-            posterior = {}
-            for fname in FUNC_NAMES:
-                prior = MARKOV_TRANSITION.get(prev_func, {}).get(fname, 0.25)
-                posterior[fname] = sim_scores[fname] * (0.3 + 0.7 * prior)
-
-            # MAP
-            best_func = max(posterior, key=posterior.get)
-            best_score = posterior[best_func]
-            # 归一化置信度
-            total_post = sum(posterior.values())
-            confidence = best_score / total_post if total_post > 0 else 0.5
-
-            functions.append({
-                'bar': bar_idx,
-                'func': best_func,
-                'confidence': round(confidence, 3),
-            })
-
-            prev_func = best_func
-
-        return {
-            'version': 1,
-            'num_bars': len(bars),
-            'functions': functions,
-        }
+    return (best_func, round(confidence, 3))
 
 
 # ═══════════════════════════════════════════════════════════════
-#  标注入口
+#  标注逻辑
+# ═══════════════════════════════════════════════════════════════
+
+def annotate_from_ssf(ssf_data: dict) -> dict:
+    """从 SSF 数据标注三粒度功能和声。
+
+    Returns:
+        {
+            "version": 2,
+            "section_funcs": [...],
+            "bar_funcs": [...],
+            "beat_funcs": [...]
+        }
+    """
+    tonic_fields = ssf_data.get('tonic_fields', [])
+    local_fields = ssf_data.get('local_fields', {})
+    beat_fields = ssf_data.get('beat_fields', {})
+
+    # ── 段落级: 不使用 Markov (段落间独立) ──
+    section_funcs = []
+    for i, tf in enumerate(tonic_fields):
+        func, conf = classify_ssf_vector(tf, prev_func=None, use_markov=False)
+        section_funcs.append({
+            'section': i,
+            'func': func or 'none',
+            'confidence': conf,
+        })
+
+    # ── 小节级: 使用 Markov 链 ──
+    bar_funcs = []
+    prev_bar_func = 'T'
+    # 需要知道总 bar 数 → 从 beat_fields 推断
+    if beat_fields:
+        num_bars = max(int(k) for k in beat_fields.keys()) + 1
+    elif local_fields:
+        num_bars = max(int(k) for k in local_fields.keys()) + 1
+    else:
+        num_bars = len(tonic_fields) * 8  # 粗略估计
+
+    for b in range(num_bars):
+        # 找到该 bar 所属 section
+        sec_idx = 0
+        boundaries = ssf_data.get('section_boundaries', [0])
+        for i in range(len(boundaries)):
+            if b >= boundaries[i]:
+                sec_idx = i
+
+        # 从 section TonicField + bar LocalField 合成 bar 级 SSF
+        base_tf = tonic_fields[sec_idx] if sec_idx < len(tonic_fields) else [0.5] * 12
+        bar_ssf = list(base_tf)  # copy
+        b_str = str(b)
+        if b_str in local_fields:
+            delta = local_fields[b_str]
+            for j in range(12):
+                bar_ssf[j] = max(0.0, min(1.0, bar_ssf[j] + delta[j]))
+
+        func, conf = classify_ssf_vector(bar_ssf, prev_func=prev_bar_func, use_markov=True)
+        bar_funcs.append({
+            'bar': b,
+            'func': func or 'none',
+            'confidence': conf,
+        })
+        if func is not None:
+            prev_bar_func = func
+
+    # ── 节拍级: 使用局部 Markov 链 ──
+    beat_funcs = []
+    for b_str, beats in sorted(beat_fields.items(), key=lambda x: int(x[0])):
+        b = int(b_str)
+        prev_beat_func = 'T'
+        for pos_str, bf in sorted(beats.items(), key=lambda x: int(x[0])):
+            pos = int(pos_str)
+            func, conf = classify_ssf_vector(bf, prev_func=prev_beat_func, use_markov=True)
+            beat_funcs.append({
+                'bar': b,
+                'pos': pos,
+                'func': func or 'none',
+                'confidence': conf,
+            })
+            if func is not None:
+                prev_beat_func = func
+
+    return {
+        'version': 2,
+        'section_funcs': section_funcs,
+        'bar_funcs': bar_funcs,
+        'beat_funcs': beat_funcs,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  并行标注入口
 # ═══════════════════════════════════════════════════════════════
 
 def _annotate_one(args: tuple[str, str]) -> tuple[str, bool, str]:
-    """单个文件的标注 (worker 调用)。"""
+    """单个文件标注。"""
     token_path, output_dir = args
     try:
-        # 延迟加载 tokenizer (每个 worker 一个)
-        import threading
-        pid = threading.current_thread().ident
-        tk = _get_worker_tokenizer()
+        # 读 SSF (不是 tokens)
+        ssf_path = Path(token_path).with_suffix('.ssf.json')
+        if not ssf_path.exists():
+            return (token_path, False, 'no_ssf')
 
-        with open(token_path, 'r') as f:
-            tokens = json.load(f)
+        with open(ssf_path, 'r') as f:
+            ssf_data = json.load(f)
 
-        annotator = FunctionAnnotator(tk)
-        result = annotator.annotate(tokens)
+        result = annotate_from_ssf(ssf_data)
 
-        # 写入同目录 (与 .tokens 同位置)
         out_path = Path(token_path).with_suffix('.func.json')
         with open(out_path, 'w') as f:
             json.dump(result, f, separators=(',', ':'))
@@ -228,46 +222,20 @@ def _annotate_one(args: tuple[str, str]) -> tuple[str, bool, str]:
         return (token_path, False, str(e))
 
 
-_worker_tokenizer = None
-_worker_tokenizer_lock = None
-
-
-def _init_worker():
-    """Pool worker 初始化。"""
-    global _worker_tokenizer_lock
-    import threading
-    _worker_tokenizer_lock = threading.Lock()
-
-
-def _get_worker_tokenizer():
-    """每个 worker 线程延迟初始化一个 tokenizer 实例。"""
-    global _worker_tokenizer, _worker_tokenizer_lock
-    if _worker_tokenizer is None:
-        with _worker_tokenizer_lock:
-            if _worker_tokenizer is None:
-                from chopinote_dataset.tokenizer import REMITokenizer
-                _worker_tokenizer = REMITokenizer(grid_size=16, velocity_levels=8)
-    return _worker_tokenizer
-
-
 def annotate_all(input_dir: str, num_workers: int = 25):
-    """扫描 input_dir 下所有 .tokens 文件, 并行标注功能和声。
-
-    对已有 .func.json 的文件跳过 (幂等性)。
-    """
+    """扫描已有 .ssf.json 文件, 并行标注功能和声。"""
     token_dir = Path(input_dir)
     if not token_dir.is_dir():
         logger.error(f"目录不存在: {input_dir}")
         return
 
-    # 收集所有 .tokens 文件
-    all_tokens = list(token_dir.glob('*.tokens'))
-    logger.info(f"找到 {len(all_tokens)} 个 .tokens 文件")
+    ssf_files = list(token_dir.glob('*.ssf.json'))
+    logger.info(f"找到 {len(ssf_files)} 个 .ssf.json 文件")
 
-    # 跳过已有 .func.json 的文件
     tasks = []
     skipped = 0
-    for tp in all_tokens:
+    for sp in ssf_files:
+        tp = sp.with_suffix('.tokens')
         func_path = tp.with_suffix('.func.json')
         if func_path.exists():
             skipped += 1
@@ -276,14 +244,14 @@ def annotate_all(input_dir: str, num_workers: int = 25):
 
     logger.info(f"已标注: {skipped}, 待标注: {len(tasks)}")
     if not tasks:
-        logger.info("全部已标注, 无需操作")
+        logger.info("全部已标注")
         return
 
     t0 = time.time()
     completed = 0
     failed = 0
 
-    with Pool(processes=num_workers, initializer=_init_worker) as pool:
+    with Pool(processes=num_workers) as pool:
         for path, ok, err in pool.imap_unordered(_annotate_one, tasks, chunksize=50):
             completed += 1
             if not ok:
@@ -311,28 +279,28 @@ def annotate_all(input_dir: str, num_workers: int = 25):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description='功能和声标注')
+    parser = argparse.ArgumentParser(description='功能和声标注 (读 SSF)')
     sub = parser.add_subparsers(dest='cmd')
 
-    annotate_p = sub.add_parser('annotate', help='标注 .tokens → .func.json')
+    annotate_p = sub.add_parser('annotate', help='标注 .ssf.json → .func.json')
     annotate_p.add_argument('--input-dir', required=True, help='tokens_v4 目录')
     annotate_p.add_argument('--num-workers', type=int, default=25)
 
-    # test 子命令: 对单个文件测试
-    test_p = sub.add_parser('test', help='对单个文件测试标注')
-    test_p.add_argument('--input', required=True, help='.tokens 文件路径')
+    test_p = sub.add_parser('test', help='对单个文件测试')
+    test_p.add_argument('--input', required=True, help='.tokens 文件路径 (自动找 .ssf.json)')
 
     args = parser.parse_args()
 
     if args.cmd == 'annotate':
         annotate_all(args.input_dir, args.num_workers)
     elif args.cmd == 'test':
-        from chopinote_dataset.tokenizer import REMITokenizer
-        tk = REMITokenizer(grid_size=16, velocity_levels=8)
-        with open(args.input, 'r') as f:
-            tokens = json.load(f)
-        annotator = FunctionAnnotator(tk)
-        result = annotator.annotate(tokens)
+        ssf_path = Path(args.input).with_suffix('.ssf.json')
+        if not ssf_path.exists():
+            print(f"SSF 文件不存在: {ssf_path}")
+            sys.exit(1)
+        with open(ssf_path, 'r') as f:
+            ssf_data = json.load(f)
+        result = annotate_from_ssf(ssf_data)
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         parser.print_help()

@@ -66,9 +66,11 @@ class ModelConfig:
     use_cadence: bool = True
     n_cadence_types: int = 6                # 0=none, 1-5=PAC/IAC/HC/DC/PC
 
-    # --- 功能化和声语法（functional harmony） ---
-    use_function_field: bool = True
-    n_func_types: int = 5                   # 0=PAD, 1=T, 2=SD, 3=D, 4=SDom
+    # --- 功能化和声语法（functional harmony, 三粒度并行） ---
+    use_func_section: bool = True            # 段落级
+    use_func_bar: bool = True                # 小节级
+    use_func_beat: bool = True               # 节拍级 (Position粒度)
+    n_func_types: int = 5                    # 0=PAD, 1=T, 2=SD, 3=D, 4=SDom
 
     # --- 时值饱和度（DurSat） ---
     use_dur_sat: bool = True

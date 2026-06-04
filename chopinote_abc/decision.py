@@ -603,3 +603,66 @@ def build_note_on_range(tokenizer) -> tuple[int, int]:
     lo = tokenizer.encode_token('<Note_ON -60>')
     hi = tokenizer.encode_token('<Note_ON 60>')
     return (lo, hi)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  长程张力曲线参数联动 (v0.3.3-opt3)
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class DramaticParams:
+    """B2 沿 DramaticCurve 动态调参的全部输出。
+
+    tension:     当前目标紧张度 [0, 1]
+    derivative:  紧张度变化方向 (正=爬升, 负=回落)
+    temperature: 采样温度
+    target_density: 目标音符密度 (notes/bar)
+    dissonance_tolerance: 不协和容忍度
+    register_range: (min_octave_offset, max_octave_offset)
+    rest_penalty: 休止符惩罚
+    ssf_constraint: SSF 约束强度
+    innovation_budget: 创新预算
+    cadence_strength: 终止式期待强度
+    """
+    tension: float = 0.5
+    derivative: float = 0.0
+    temperature: float = 1.0
+    target_density: float = 8.0
+    dissonance_tolerance: float = 0.2
+    register_range: tuple[float, float] = (2.0, 6.0)
+    rest_penalty: float = 1.0
+    ssf_constraint: float = 0.5
+    innovation_budget: float = 0.2
+    cadence_strength: float = 0.5
+
+
+def apply_dramatic_params(
+    tension: float,
+    derivative: float,
+    base_temperature: float = 1.0,
+) -> DramaticParams:
+    """沿 DramaticCurve 连续调参，替代段级温区退火。
+
+    Args:
+        tension: 当前目标紧张度 [0, 1], 来自 DramaticCurve.get_tension()
+        derivative: 紧张度变化率, 来自 DramaticCurve.get_derivative()
+        base_temperature: 基础温度
+
+    Returns:
+        DramaticParams 完整参数集
+    """
+    t = max(0.0, min(1.0, tension))
+    d = max(-0.5, min(0.5, derivative))
+
+    return DramaticParams(
+        tension=t,
+        derivative=d,
+        temperature=base_temperature * (0.7 + t * 0.6),
+        target_density=3.0 + t * 12.0,
+        dissonance_tolerance=0.05 + t * 0.5,
+        register_range=(2.0 - t * 1.5, 5.0 + t * 1.5),
+        rest_penalty=2.0 - t * 1.8,
+        ssf_constraint=0.8 - t * 0.5,
+        innovation_budget=0.1 + max(0.0, d) * 0.4,
+        cadence_strength=0.3 + max(0.0, -d) * 0.6 if d < -0.03 else 0.3,
+    )

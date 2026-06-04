@@ -417,8 +417,12 @@ class Trainer:
                         model_kwargs['measure_in_section_ids'] = batch['measure_in_section_ids'].to(self.device)
                     if model.config.use_dur_sat and 'dur_sat_ids' in batch:
                         model_kwargs['dur_sat_ids'] = batch['dur_sat_ids'].to(self.device)
-                    if model.config.use_function_field and 'func_ids' in batch:
-                        model_kwargs['func_ids'] = batch['func_ids'].to(self.device)
+                    if model.config.use_func_section and 'func_sec_ids' in batch:
+                        model_kwargs['func_sec_ids'] = batch['func_sec_ids'].to(self.device)
+                    if model.config.use_func_bar and 'func_bar_ids' in batch:
+                        model_kwargs['func_bar_ids'] = batch['func_bar_ids'].to(self.device)
+                    if model.config.use_func_beat and 'func_beat_ids' in batch:
+                        model_kwargs['func_beat_ids'] = batch['func_beat_ids'].to(self.device)
                     if model.config.use_section_attention and 'section_ids' in batch:
                         model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
                         model_kwargs['section_types'] = batch['section_types'].to(self.device)
@@ -1080,8 +1084,12 @@ class Trainer:
                     model_kwargs['measure_in_section_ids'] = batch['measure_in_section_ids'].to(self.device)
                 if self.model_config.use_dur_sat and 'dur_sat_ids' in batch:
                     model_kwargs['dur_sat_ids'] = batch['dur_sat_ids'].to(self.device)
-                if self.model_config.use_function_field and 'func_ids' in batch:
-                    model_kwargs['func_ids'] = batch['func_ids'].to(self.device)
+                if self.model_config.use_func_section and 'func_sec_ids' in batch:
+                    model_kwargs['func_sec_ids'] = batch['func_sec_ids'].to(self.device)
+                if self.model_config.use_func_bar and 'func_bar_ids' in batch:
+                    model_kwargs['func_bar_ids'] = batch['func_bar_ids'].to(self.device)
+                if self.model_config.use_func_beat and 'func_beat_ids' in batch:
+                    model_kwargs['func_beat_ids'] = batch['func_beat_ids'].to(self.device)
                 if self.model_config.use_section_attention and 'section_ids' in batch:
                     model_kwargs['section_ids'] = batch['section_ids'].to(self.device)
                     model_kwargs['section_types'] = batch['section_types'].to(self.device)
