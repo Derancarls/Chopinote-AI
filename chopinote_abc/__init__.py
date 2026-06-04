@@ -16,6 +16,7 @@ from .database import (
     BarStats, SectionStats,
     PhrasePlan, PhraseState,          # v0.3.2 gen4: 乐句层
     DramaticCurve,                    # v0.3.3-opt3: 长程张力曲线
+    compute_voice_independence,        # v0.3.3-opt4: 声部独立性
     compute_novelty_bonus, compute_diversity_bonus, write_reward_log,
 )
 from .planner import (
@@ -37,6 +38,7 @@ from .decision import (
     DevelopmentAction, select_development_action,
     apply_motif_guidance, build_note_on_range,
     DramaticParams, apply_dramatic_params,  # v0.3.3-opt3: 张力曲线参数联动
+    ContourBias,                              # v0.3.3-opt4: 对位方向偏置
 )
 from .metrics import (
     METRIC_FUNCTIONS,

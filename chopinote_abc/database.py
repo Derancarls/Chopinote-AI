@@ -924,6 +924,101 @@ class A3DB:
         return results
 
 # ═══════════════════════════════════════════════════════════════
+#  v0.3.3-opt4: 声部旋律独立性评估 (C 层诊断)
+# ═══════════════════════════════════════════════════════════════
+
+
+def compute_voice_independence(
+    voice_notes: dict[int, list[int]],     # {voice: [Note_ON intervals]}
+    voice_rhythms: dict[int, list[float]] | None = None,
+        # {voice: [duration_values]} 可选
+) -> dict[int, float]:
+    """计算每个声部的旋律独立性分数。
+
+    标准:
+      - 级进比例高: +分 (旋律性强，可唱性高)
+      - 方向变化频繁: +分 (不单调)
+      - 音域覆盖广: +分
+      - 与其他声部节奏同步率低: +分 (不跟别人一起动)
+
+    Returns:
+        {voice: independence_score}  [0, 1]
+    """
+    scores = {}
+    n_voices = len(voice_notes)
+
+    for voice, intervals in voice_notes.items():
+        if len(intervals) < 3:
+            scores[voice] = 0.5
+            continue
+
+        step_ratio = _calc_step_ratio(intervals)
+        dir_changes = _calc_direction_changes(intervals)
+        range_span = _calc_range_span(intervals)
+        sync_penalty = _calc_sync_penalty(
+            voice, voice_rhythms) if voice_rhythms else 0.0
+
+        scores[voice] = max(0.0, min(1.0,
+            step_ratio * 0.35 + dir_changes * 0.25
+            + range_span * 0.25 - sync_penalty * 0.15))
+
+    return scores
+
+
+def _calc_step_ratio(intervals: list[int]) -> float:
+    """级进比例: 级进(≤2半音) / 总数。"""
+    moves = [abs(intervals[i] - intervals[i - 1])
+             for i in range(1, len(intervals))]
+    if not moves:
+        return 0.0
+    steps = sum(1 for m in moves if m <= 2)
+    return steps / len(moves)
+
+
+def _calc_direction_changes(intervals: list[int]) -> float:
+    """方向变化: 方向翻转次数 / 最大可能翻转次数。"""
+    if len(intervals) < 3:
+        return 0.0
+    changes = 0
+    for i in range(2, len(intervals)):
+        d1 = intervals[i - 1] - intervals[i - 2]
+        d2 = intervals[i] - intervals[i - 1]
+        if d1 != 0 and d2 != 0 and (d1 > 0) != (d2 > 0):
+            changes += 1
+    return min(1.0, changes / (len(intervals) - 2))
+
+
+def _calc_range_span(intervals: list[int]) -> float:
+    """音域覆盖: (max - min) / 24 (两个八度→满分)。"""
+    lo, hi = min(intervals), max(intervals)
+    return min(1.0, (hi - lo) / 24.0)
+
+
+def _calc_sync_penalty(
+    voice: int, voice_rhythms: dict[int, list[float]],
+) -> float:
+    """节奏同步率: 与其他声部同位置同 duration 的比例。"""
+    my_rhythm = voice_rhythms.get(voice, [])
+    if not my_rhythm:
+        return 0.0
+    n = len(my_rhythm)
+    total_sync = 0.0
+    n_others = 0
+    for ov, or_rhythm in voice_rhythms.items():
+        if ov == voice or not or_rhythm:
+            continue
+        n_others += 1
+        syncs = 0
+        for i in range(min(n, len(or_rhythm))):
+            if abs(my_rhythm[i] - or_rhythm[i]) < 0.01:
+                syncs += 1
+        total_sync += syncs / max(1, min(n, len(or_rhythm)))
+    if n_others == 0:
+        return 0.0
+    return total_sync / n_others
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Phase 2: C 新颖性评估 + DPO reward log
 # ═══════════════════════════════════════════════════════════════
 

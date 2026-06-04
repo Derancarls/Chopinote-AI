@@ -666,3 +666,151 @@ def apply_dramatic_params(
         innovation_budget=0.1 + max(0.0, d) * 0.4,
         cadence_strength=0.3 + max(0.0, -d) * 0.6 if d < -0.03 else 0.3,
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  对位意识 ContourBias (v0.3.3-opt4)
+# ═══════════════════════════════════════════════════════════════
+
+class ContourBias:
+    """对位方向偏置: 鼓励反向进行 + 不完全→完全协和解决。
+
+    在每 step 采样前调用 compute_bias()，修改 logits 偏置 Note_ON token。
+    轻量级: 无参数、无 embedding，纯规则。
+
+    用法:
+        cb = ContourBias(tokenizer)
+        bias = cb.compute_bias(voice=0, prev_notes={0: 7, 1: 4, 2: 0, 3: -5},
+                               prev_prev_notes={}, active_voices=[0,1,2,3])
+        for tid, val in bias.items():
+            logits[tid] += val
+    """
+
+    def __init__(self, tokenizer):
+        self.tk = tokenizer
+        # 预计算 Note_ON token ID → interval 映射
+        self._interval_of: dict[int, int] = {}
+        for token_str, token_id in tokenizer._token_to_id.items():
+            if token_str.startswith('<Note_ON '):
+                try:
+                    self._interval_of[token_id] = int(
+                        token_str.split()[1].rstrip('>'))
+                except (ValueError, IndexError):
+                    pass
+        self._note_ids = sorted(self._interval_of.keys())
+
+    def compute_bias(
+        self,
+        current_voice: int,
+        prev_notes: dict[int, int],         # {voice: prev_note_interval}
+        prev_prev_notes: dict[int, int],    # {voice: prev_prev_note_interval}
+        active_voices: list[int],
+    ) -> dict[int, float]:
+        """计算当前 step 每个 Note_ON token 的对位偏置。
+
+        Returns:
+            {token_id: bias_value} 加到 logits 上的偏置
+        """
+        bias: dict[int, float] = {}
+        my_prev = prev_notes.get(current_voice)
+        if my_prev is None:
+            return bias
+
+        for other_voice in active_voices:
+            if other_voice == current_voice:
+                continue
+            prev_other = prev_notes.get(other_voice)
+            if prev_other is None:
+                continue
+            prev_prev_other = prev_prev_notes.get(other_voice)
+
+            for tid in self._note_ids:
+                candidate = self._interval_of[tid]
+                my_move = candidate - my_prev
+                other_move = self._estimate_other_move(
+                    other_voice, prev_other, prev_prev_other)
+
+                b = 0.0
+                b += self._contrary_bonus(my_move, other_move)
+                b += self._parallel_penalty(
+                    my_move, other_move, candidate, my_prev, prev_other)
+                b += self._resolution_bonus(
+                    candidate, my_prev, prev_other, other_move)
+
+                if b != 0.0:
+                    bias[tid] = bias.get(tid, 0.0) + b
+
+        return bias
+
+    @staticmethod
+    def _estimate_other_move(voice: int, prev_interval: int,
+                             prev_prev_interval: int | None) -> int:
+        """估计另一声部当前 step 的移动方向。
+
+        使用 prev_prev → prev 的趋势推算 (假设方向持续)。
+        无法推算时返回 0 (假设静止)。
+        """
+        if prev_prev_interval is not None:
+            return prev_interval - prev_prev_interval
+        return 0
+
+    @staticmethod
+    def _contrary_bonus(my_move: int, other_move: int) -> float:
+        """反向进行 +0.2, 严格平行 -0.15, 同向 -0.05。"""
+        if my_move == 0 or other_move == 0:
+            return 0.0
+        my_dir = 1 if my_move > 0 else -1
+        other_dir = 1 if other_move > 0 else -1
+        if my_dir != other_dir:
+            return 0.20
+        elif my_move == other_move:
+            return -0.15
+        else:
+            return -0.05
+
+    @staticmethod
+    def _parallel_penalty(
+        my_move: int, other_move: int,
+        candidate_interval: int, prev_my_interval: int,
+        prev_other_interval: int,
+    ) -> float:
+        """平行五度/八度: 更强惩罚 -1.0。
+
+        cur_vert = |candidate - (prev_other + other_move)| % 12
+        prev_vert = |prev_my - prev_other| % 12
+        """
+        if my_move == 0 or other_move == 0:
+            return 0.0
+        if my_move != other_move:
+            return 0.0
+
+        new_other = prev_other_interval + other_move
+        cur = abs(candidate_interval - new_other) % 12
+        prev = abs(prev_my_interval - prev_other_interval) % 12
+
+        if cur == 7 and prev == 7:
+            return -1.0
+        if cur == 0 and prev == 0:
+            return -1.0
+        return 0.0
+
+    @staticmethod
+    def _resolution_bonus(
+        candidate_interval: int,
+        prev_my_interval: int,
+        prev_other_interval: int,
+        other_move: int,
+    ) -> float:
+        """不完全协和→完全协和解决: +0.15, 半音解决额外 +0.10。"""
+        new_other = prev_other_interval + other_move
+        prev_vert = abs(prev_my_interval - prev_other_interval) % 12
+        cur_vert = abs(candidate_interval - new_other) % 12
+
+        prev_imperfect = prev_vert in (3, 4, 8, 9)
+        cur_perfect = cur_vert in (0, 5, 7)
+
+        if prev_imperfect and cur_perfect:
+            # 半音解决 (导音→主音): 两声部音程差 = 1 或 2 或 11 半音
+            semitone_res = abs(candidate_interval - new_other) % 12 in (1, 2, 11)
+            return 0.15 + (0.10 if semitone_res else 0.0)
+        return 0.0
