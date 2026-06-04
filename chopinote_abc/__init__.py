@@ -39,6 +39,14 @@ from .decision import (
     apply_motif_guidance, build_note_on_range,
     DramaticParams, apply_dramatic_params,  # v0.3.3-opt3: 张力曲线参数联动
     ContourBias,                              # v0.3.3-opt4: 对位方向偏置
+    AFFECT_PARAM_MAP, AffectBias,            # v0.3.3-opt5: 情感B2联动
+    apply_affect_bias,                        # v0.3.3-opt5: 情感→参数映射
+)
+from .affect import (
+    AffectVector, AffectCalculator,           # v0.3.3-opt5: 八维情感计算
+    AFFECT_PRESETS, STYLE_PRESETS,           # v0.3.3-opt5: 情绪/风格预置表
+    parse_affective_intent,                   # v0.3.3-opt5: 自然语言→情感向量
+    DIMENSION_NAMES,                          # v0.3.3-opt5: 维度名列表
 )
 from .metrics import (
     METRIC_FUNCTIONS,

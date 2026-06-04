@@ -814,3 +814,79 @@ class ContourBias:
             semitone_res = abs(candidate_interval - new_other) % 12 in (1, 2, 11)
             return 0.15 + (0.10 if semitone_res else 0.0)
         return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  情感色彩 B2 参数联动 (v0.3.3-opt5)
+# ═══════════════════════════════════════════════════════════════
+
+AFFECT_PARAM_MAP: dict[str, dict[str, callable]] = {
+    'brightness': {
+        'major_key_bias':       lambda b: +0.4 * (b - 0.5),
+    },
+    'tension': {
+        'dissonance_tolerance':  lambda t: t,
+        'temperature':           lambda t: 0.8 + 0.4 * t,
+    },
+    'stability': {
+        'tonic_field_strength':  lambda s: 0.3 + 0.7 * s,
+        'modulation_allowance':  lambda s: 1.0 - s,
+    },
+    'energy': {
+        'density_ceiling':       lambda e: 4.0 + 12.0 * e,
+        'rest_penalty':          lambda e: 2.0 - 1.5 * e,
+    },
+    'warmth': {
+        'register_bias_low':     lambda w: +0.5 * (w - 0.5),
+        'register_bias_high':    lambda w: -0.5 * (w - 0.5),
+    },
+    'depth': {
+        'harmonic_rhythm':       lambda d: 0.5 + d * 2.0,
+    },
+    'motion': {
+        'step_bonus':            lambda m: +0.3 * (m - 0.5),
+        'leap_penalty':          lambda m: -0.2 * (m - 0.5),
+    },
+    'closure': {
+        'cadence_strength':      lambda c: c,
+    },
+}
+
+
+@dataclass
+class AffectBias:
+    """B2 情感偏置结果: 8 维映射到具体参数值。
+
+    由 apply_affect_bias() 产生, 采样循环读取对应字段。
+    """
+    major_key_bias: float = 0.0
+    dissonance_tolerance: float = 0.2
+    temperature: float = 1.0
+    tonic_field_strength: float = 0.65
+    modulation_allowance: float = 0.5
+    density_ceiling: float = 10.0
+    rest_penalty: float = 1.25
+    register_bias_low: float = 0.0
+    register_bias_high: float = 0.0
+    harmonic_rhythm: float = 1.0
+    step_bonus: float = 0.0
+    leap_penalty: float = 0.0
+    cadence_strength: float = 0.5
+
+
+def apply_affect_bias(target: 'AffectVector') -> AffectBias:
+    """将目标八维向量映射为 B2 可用的具体参数偏置。
+
+    Args:
+        target: AffectVector, 来自 A1 情绪解析器或用户输入
+
+    Returns:
+        AffectBias, 每个字段可直接用于采样循环调参
+    """
+    result = AffectBias()
+    for dim_name, param_map in AFFECT_PARAM_MAP.items():
+        dim_val = getattr(target, dim_name, 0.5)
+        for param, transform in param_map.items():
+            if hasattr(result, param):
+                setattr(result, param, transform(dim_val))
+    return result
