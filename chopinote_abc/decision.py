@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .database import SectionPlan
@@ -820,7 +821,7 @@ class ContourBias:
 #  情感色彩 B2 参数联动 (v0.3.3-opt5)
 # ═══════════════════════════════════════════════════════════════
 
-AFFECT_PARAM_MAP: dict[str, dict[str, callable]] = {
+AFFECT_PARAM_MAP: dict[str, dict[str, Callable[[float], float]]] = {
     'brightness': {
         'major_key_bias':       lambda b: +0.4 * (b - 0.5),
     },

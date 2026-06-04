@@ -384,15 +384,15 @@ def render_dna_to_tokens(
     # 起始音: 从 scale_degrees[0] 推算 interval
     first_degree = max(1, min(7, dna.scale_degrees[0]))
     semitone_offset = _SCALE_DEGREE_TO_SEMITONE.get(first_degree, 0)
-    start_midi = tonic_midi + semitone_offset + (dna.register_centroid - tonic_midi) // 12 * 12
-    # clamp
+    reg = int(dna.register_centroid)
+    start_midi = tonic_midi + semitone_offset + (reg - tonic_midi) // 12 * 12
     start_midi = max(21, min(108, start_midi))
 
     current_midi = start_midi
     for i, contour_step in enumerate(dna.contour):
         current_midi += contour_step
         current_midi = max(21, min(108, current_midi))
-        interval = current_midi - tonic_midi
+        interval = int(current_midi - tonic_midi)
         interval = max(-60, min(60, interval))
 
         tokens.append(tokenizer.encode_token(f'<Note_ON {interval}>'))
@@ -430,7 +430,8 @@ def render_dna_to_guidance(
 
     first_degree = max(1, min(7, dna.scale_degrees[0]))
     semitone_offset = _SCALE_DEGREE_TO_SEMITONE.get(first_degree, 0)
-    start_midi = tonic_midi + semitone_offset + (dna.register_centroid - tonic_midi) // 12 * 12
+    reg = int(dna.register_centroid)
+    start_midi = tonic_midi + semitone_offset + (reg - tonic_midi) // 12 * 12
     start_midi = max(21, min(108, start_midi))
 
     tokens = []
@@ -438,7 +439,7 @@ def render_dna_to_guidance(
     for contour_step in dna.contour:
         current_midi += contour_step
         current_midi = max(21, min(108, current_midi))
-        interval = current_midi - tonic_midi
+        interval = int(current_midi - tonic_midi)
         interval = max(-60, min(60, interval))
         tokens.append(tokenizer.encode_token(f'<Note_ON {interval}>'))
 
