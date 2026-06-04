@@ -26,10 +26,13 @@ from .motif import (
     identify_landmarks, purify_tokens, extract_dna,
     invert_contour, fragment_tokens, diminish_tokens,
     contour_distance, contour_similarity,
+    MotifTransform, render_dna_to_tokens, render_dna_to_guidance,
 )
 from .decision import (
     BHardBans, apply_zone_temperature,
     BFeedback, InnovationEntry,
+    DevelopmentAction, select_development_action,
+    apply_motif_guidance, build_note_on_range,
 )
 from .metrics import (
     METRIC_FUNCTIONS,

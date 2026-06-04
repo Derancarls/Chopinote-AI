@@ -415,3 +415,191 @@ def _compute_deviation_surprise(
         return 0.0
 
     return _kl_divergence(pc_dist, baseline_pc)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  主题发展引擎 (v0.3.3-opt1)
+# ═══════════════════════════════════════════════════════════════
+
+import random as _random
+
+@dataclass
+class DevelopmentAction:
+    """一次主题发展动作。
+
+    由 B2 的 select_development_action() 产生，
+    告诉采样循环：当前 bar 该用什么变形、移调多少、哪个声部。
+    """
+    transform: str | None = None
+        # 'retrograde' / 'inversion' / 'augmentation' / 'diminution' /
+        # 'retrograde_inversion' / 'fragment' / 'sequence' /
+        # 'interval_expand' / 'rhythmic_vary' / None (=原形)
+    transpose: int = 0                 # 半音移调量
+    voice: int = 0                     # 目标声部 0-3
+    guidance_strength: float = 0.5     # 引导强度 [0, 1]
+
+
+# ── 发展策略表 ────────────────────────────────────────────────
+
+DEVELOPMENT_STRATEGIES: dict[str, dict] = {
+    'statement': {
+        'transform': None,
+        'transpose': 0,
+        'guidance_strength': 0.6,
+        'voice': 0,
+    },
+    'restatement': {
+        'transform': None,
+        'transpose': 7,                # 属调重申
+        'guidance_strength': 0.4,
+        'voice': 0,
+    },
+    'development': {
+        'transform_weights': {
+            'fragment': 0.25,
+            'sequence': 0.25,
+            'inversion': 0.15,
+            'diminution': 0.15,
+            'interval_expand': 0.1,
+            'retrograde': 0.1,
+        },
+        'transpose_range': (-5, 7),
+        'guidance_strength': 0.35,
+    },
+    'climax': {
+        'transform': 'augmentation',
+        'transpose': 0,
+        'guidance_strength': 0.5,
+    },
+    'closing': {
+        'transform': 'fragment',
+        'transpose': 0,
+        'guidance_strength': 0.15,
+    },
+}
+
+# 乐句类型 → 策略映射
+PHRASE_TO_STRATEGY = {
+    'antecedent': 'statement',
+    'consequent': 'restatement',
+    'extension': 'development',
+    'closing': 'closing',
+    'transition': 'development',
+}
+
+
+def select_development_action(
+    section_type: str,
+    phrase_type: str | None = None,
+    bar_in_section: int = 0,
+    total_bars: int = 32,
+) -> DevelopmentAction:
+    """根据段落类型和位置选择发展策略。
+
+    Args:
+        section_type: 段落类型 ('exposition'/'development'/'recapitulation'/...)
+        phrase_type: 乐句类型 ('antecedent'/'consequent'/'extension'/'closing'/...)
+        bar_in_section: 段内 bar 位置
+        total_bars: 段总 bar 数
+
+    Returns:
+        DevelopmentAction
+    """
+    # 1. 乐句类型优先
+    if phrase_type and phrase_type in PHRASE_TO_STRATEGY:
+        strategy_key = PHRASE_TO_STRATEGY[phrase_type]
+    else:
+        # 2. 按段内位置推断
+        progress = bar_in_section / max(1, total_bars)
+        if progress < 0.1:
+            strategy_key = 'statement'
+        elif progress < 0.75:
+            # 发展部用 development 策略，其他段用 restatement
+            strategy_key = 'development' if section_type == 'development' else 'restatement'
+        elif progress < 0.9:
+            strategy_key = 'climax' if section_type == 'development' else 'closing'
+        else:
+            strategy_key = 'closing'
+
+    strat = DEVELOPMENT_STRATEGIES[strategy_key]
+
+    # 确定变形算子
+    transform = strat.get('transform')
+    if transform is None and 'transform_weights' in strat:
+        weights = strat['transform_weights']
+        transform = _random.choices(list(weights.keys()), weights=list(weights.values()), k=1)[0]
+
+    # 确定移调量
+    transpose = strat.get('transpose', 0)
+    if isinstance(transpose, tuple):
+        lo, hi = transpose
+        transpose = _random.randint(lo, hi)
+
+    return DevelopmentAction(
+        transform=transform,
+        transpose=transpose,
+        voice=strat.get('voice', 0),
+        guidance_strength=strat.get('guidance_strength', 0.4),
+    )
+
+
+def apply_motif_guidance(
+    target_tokens: list[int],
+    logits,                        # torch.Tensor or list
+    guidance_strength: float = 0.5,
+    note_on_range: tuple[int, int] | None = None,
+) -> None:
+    """为 logits 添加动机引导偏置（原地修改）。
+
+    不是强制输出目标 token，而是提高目标 token 及其邻域的概率。
+    引导强度控制「写动机」vs「自由发挥」的平衡。
+
+    Args:
+        target_tokens: 从 MotifDNA 渲染的目标 token ID 序列
+        logits: 当前 step 的 logits (torch.Tensor, shape [vocab_size] or [1, vocab_size])
+        guidance_strength: 引导强度 [0, 1]，段首高、段末低
+        note_on_range: Note_ON token 的 ID 范围 (min_id, max_id)，
+                       用于邻域扩展。为 None 时不做邻域扩展。
+    """
+    if not target_tokens or guidance_strength <= 0:
+        return
+
+    try:
+        import torch
+        is_torch = isinstance(logits, torch.Tensor)
+    except ImportError:
+        is_torch = False
+
+    # 取当前该匹配到的目标位置 (按生成步数推进)
+    # 调用者负责维护 position 指针; 这里对单 token 做偏置
+    target_id = target_tokens[0]  # 第一个目标 token
+
+    boost = guidance_strength * 5.0
+
+    if is_torch:
+        logits_flat = logits.view(-1)
+        vocab_size = logits_flat.shape[0]
+
+        # 提高目标 token
+        if 0 <= target_id < vocab_size:
+            logits_flat[target_id] += boost
+
+        # 邻域扩展: 相邻音高也有小幅 boost
+        if note_on_range is not None:
+            lo, hi = note_on_range
+            neighbor_boost = guidance_strength * 2.0
+            for offset in [-2, -1, 1, 2]:
+                neighbor = target_id + offset
+                if lo <= neighbor <= hi:
+                    logits_flat[neighbor] += neighbor_boost
+    else:
+        # plain list
+        if 0 <= target_id < len(logits):
+            logits[target_id] += boost
+
+
+def build_note_on_range(tokenizer) -> tuple[int, int]:
+    """构建 Note_ON token 的 ID 范围，供邻域扩展使用。"""
+    lo = tokenizer.encode_token('<Note_ON -60>')
+    hi = tokenizer.encode_token('<Note_ON 60>')
+    return (lo, hi)

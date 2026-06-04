@@ -3,7 +3,7 @@
 > 已实现功能按版本号记录。Y 增量为大版本（架构/能力升级），Z 增量为小版本（优化/修复）。
 > 每个版本对应的已知问题见 `known_issues_<version>.md`。
 >
-> **当前状态 (2026-06-02)**：v0.2.x 训练已放弃 (step ~51000/166000)。v0.3.x 全部设计方案完成 (11 篇)，代码部分实现 (词表/模型/SSF/Voice/Fig)，数据管线/时值饱和度/终止式感知/框架分离/乐句层/课程训练待实现。全设计一次到位后启动从头训练。
+> **当前状态 (2026-06-04)**：v0.2.x 训练已放弃。v0.3.0~v0.3.2-fix7 全部代码完成 (v0.3.2 含框架分离+乐句层+per-voice Fig)。16 篇设计文档全部完成 (含 v0.3.3 5 篇优化方案)。数据预处理管道 v4 运行中。v0.3.3 五个作曲能力优化点待实现，训练排至 v0.3.4。
 
 ---
 
@@ -590,7 +590,7 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 |---|------|------|
 | 1 | **Converter 四声部拆分**: `_voice_split_piano()` — converter.py + fast_converter.py, 右手高音→Voice0(主), 其余→Voice1(次); 左手低音→Voice3(主), 其余→Voice2(次); 单音不拆分 | ✅ |
 | 2 | **非钢琴数据映射**: 弦乐四重奏 1:1, 钢琴三重奏 Pno→V0/V3, 管弦按音区归类 | ❌ |
-| 3 | **数据重转换**: 全部 1.62M 文件用新 converter 重新生成 tokens_v4 | ❌ |
+| 3 | **数据重转换**: 全部 1.62M 文件用新 converter 重新生成 tokens_v4 | ⏳ 进行中 |
 | 4 | **验证**: 抽样 100 首检查 Voice 分布、和弦密集处四声部全活跃、单音处仅主轨 | ❌ |
 
 #### v0.3.1-data2 — 数据过滤 + 分级
@@ -663,12 +663,12 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | # | 内容 | 状态 |
 |---|------|------|
-| 1 | **A1 build_framework()**: 预插入 Bar/Tonic/TimeSig/Tempo/Clef/Position/Section/Voice/Fig/Cadence | ❌ |
-| 2 | **内容槽采样**: 模型只在 Position 后的内容槽采样; 禁采样框架 token | ❌ |
-| 3 | **B1 禁令精简**: ~570→6 条 (音域+平行+交错+跳跃+DurSat Rule1/2) | ❌ |
-| 4 | **训练-推理 gap**: 框架 token CE loss ×0.1; 训练序列不变 | ❌ |
-| 5 | **generate.py 旧引用清理**: tokenizer.KEY→TONIC, CHORD_FUNCTIONS→移除 等 13 处 | ❌ |
-| 6 | **BarFramework + VoicePlan 集成**: A1 框架含活跃声部 mask | ❌ |
+| 1 | **A1 build_framework()**: 预插入 Bar/Tonic/TimeSig/Tempo/Clef/Position/Section/Voice/Fig/Cadence | ✅ |
+| 2 | **内容槽采样**: 模型只在 Position 后的内容槽采样; 禁采样框架 token | ✅ |
+| 3 | **B1 禁令精简**: ~570→6 条 (音域+平行+交错+跳跃+DurSat Rule1/2) | ✅ |
+| 4 | **训练-推理 gap**: 框架 token CE loss ×0.1; 训练序列不变 | ✅ |
+| 5 | **generate.py 旧引用清理**: tokenizer.KEY→TONIC, CHORD_FUNCTIONS→移除 等 13 处 | ✅ |
+| 6 | **BarFramework + VoicePlan 集成**: A1 框架含活跃声部 mask | ✅ |
 
 #### v0.3.2-gen2 — 声部配置（VoicePlan）
 
@@ -696,18 +696,93 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 | # | 内容 | 状态 |
 |---|------|------|
-| 1 | **PhrasePlan + PhraseState**: A1 规划 + B 运行时追踪 | ❌ |
-| 2 | **终止式趋近 SSF boost**: bar-2→predominant, bar-1→dominant, bar-0→target | ❌ |
-| 3 | **乐句级温度微调**: 开头×0.9, 中段×1.0, 终止×0.7 | ❌ |
-| 4 | **C 乐句评估**: 终止式强度 + 前句-后句匹配 + 连贯性 + 呼吸点 | ❌ |
+| 1 | **PhrasePlan + PhraseState**: A1 规划 + B 运行时追踪 | ✅ |
+| 2 | **终止式趋近 SSF boost**: bar-2→predominant, bar-1→dominant, bar-0→target | ✅ |
+| 3 | **乐句级温度微调**: 开头×0.9, 中段×1.0, 终止×0.7 | ✅ |
+| 4 | **C 乐句评估**: 终止式强度 + 前句-后句匹配 + 连贯性 + 呼吸点 | ✅ |
 
 ---
 
-### 第三阶段：训练（v0.3.3）
+### v0.3.2-fix1~7 — 预处理路径迁移 + 全局硬编码修复 (2026-06-04)
+
+> 预处理管道 v4 运行中发现所有 converter 和训练管线硬编码 `tokens_v3`/`metadata_v3`，
+> 导致 v4 管道产出 0 文件。逐文件审查修复，并补全 CLAUDE.md 提交规范。
+
+| # | 版本 | 内容 |
+|---|------|------|
+| 1 | v0.3.2-fix1 | fast_converter Key→Tonic + 移除 Anticipate |
+| 2 | v0.3.2-fix2 | Tonic 降号规范化 — Bb→A# 等映射到词表升号名 |
+| 3 | v0.3.2-fix3 | MIDI Program 0-127 → 43 保留乐器映射表 |
+| 4 | v0.3.2-fix4 | Tonic token 剥离调式后缀 (Dm→D) |
+| 5 | v0.3.2-fix5 | Dynamic 记号规范化 (ppppp→pppp 等) |
+| 6 | v0.3.2-fix6 | Dynamic fallback — 标准记号直通, 非标准自动映射 |
+| 7 | v0.3.2-fix7 | **预处理路径全局迁移 v3→v4**: processor.py + fast_converter.py + dataset.py + generate_token_lengths.py + launch_control.py 全部 `tokens_v3`→`tokens_v4`; rerun_all_v4.sh 新增 token_lengths 步骤; CLAUDE.md 新增禁止自动提交 + 版本号规范; ROADMAP 新增考虑中的优化方向 |
+
+---
+
+### 第三阶段：作曲家核心能力（v0.3.3）
+
+> 从「生成音符」到「作曲」的结构性升级。五个方向各有独立的设计文档，均可零数据/零重训练实现。
+
+#### v0.3.3-opt1 — 主题发展引擎
+
+> 设计文档: `docs/thematic_development_v0.3.x.md`
+
+| # | 内容 | 难度 |
+|---|------|------|
+| 1 | **MotifTransform 变形算子**: retrograde / inversion / augmentation / diminution / fragmentation / sequence / interval_expand / rhythmic_vary (~150行) | 中 |
+| 2 | **DNA→Token 渲染器**: MotifDNA → token 片段, scale_degrees→interval, 适配 SSF TonicField | 中 |
+| 3 | **B2 发展策略选择器**: 按段类型/乐句类型自动选变形策略 (statement→restatement→development→closing) | 中 |
+| 4 | **引导采样**: apply_motif_guidance() — logit 偏置引导模型写动机, 强度 0.6→0.1 逐渐衰减 | 低 |
+
+#### v0.3.3-opt2 — 功能化和声语法
+
+> 设计文档: `docs/functional_harmony_ssf_v0.3.x.md`
+
+| # | 内容 | 难度 |
+|---|------|------|
+| 1 | **FunctionField 推断**: 从 SSF chroma × 功能模板 × Markov 转移概率 → T/SD/D/SDom 四类标签 (~200行) | 低 |
+| 2 | **`.func.json` 标注脚本**: 在已有 tokens_v4 上扫一遍生成侧文件 (~5分钟, 25 workers) | 低 |
+| 3 | **func_embedding**: nn.Embedding(5, d_model), zero-init, 每 bar 注入 (5×2048=10K params) | 低 |
+| 4 | **DataLoader 加载**: 加载 .func.json, per-token 展开 func_ids, collate_fn 返回 | 低 |
+
+#### v0.3.3-opt3 — 长程张力曲线
+
+> 设计文档: `docs/dramatic_arc_v0.3.x.md`
+
+| # | 内容 | 难度 |
+|---|------|------|
+| 1 | **DramaticCurve**: A1 规划全曲 0→1 曲线, 曲式模板预置 (sonata/theme_variations/rondo/free) (~100行) | 低 |
+| 2 | **B2 沿曲线调参**: temperature/density/dissonance/register/rest_penalty 全改成 tension 连续函数, 替代段级温区退火 (~50行) | 低 |
+| 3 | **乐句联动**: PhrasePlan 参考曲线导数 → 上升段多用 antecedent, 回落段多用 closing | 低 |
+
+#### v0.3.3-opt4 — 对位意识
+
+> 设计文档: `docs/contrapuntal_awareness_v0.3.x.md`
+
+| # | 内容 | 难度 |
+|---|------|------|
+| 1 | **ContourBias**: B2 采样时反向进行 +0.2, 平行 -0.15, 平行五八度 -1.0, 不完全→完全协和解决 +0.15 (~80行) | 低 |
+| 2 | **Voice Independence 评分**: C 层新增声部旋律独立性指标 (级进比/方向变化/音域/节奏同步) | 低 |
+
+#### v0.3.3-opt5 — 情感色彩量化系统
+
+> 设计文档: `docs/affective_profile_v0.3.x.md`
+
+| # | 内容 | 难度 |
+|---|------|------|
+| 1 | **AffectCalculator**: 八维向量实时计算 (Brightness/Tension/Stability/Energy/Warmth/Depth/Motion/Closure), 纯规则零数据 (~200行) | 低 |
+| 2 | **情绪解析器**: 自然语言→八维向量 + 风格预置表 (~100行) | 低 |
+| 3 | **B2 参数联动**: AFFECT_PARAM_MAP — 每维映射到具体参数偏置 (~60行) | 低 |
+| 4 | **affect_proj** (需训练): nn.Linear(8, d_model), zero-init, Transformer 内化层 (~16K params) | 中 |
+
+---
+
+### 第四阶段：训练（v0.3.4）
 
 > 前面所有阶段的产出汇总后启动训练。不设中间训练版本。
 
-#### v0.3.3-train — 课程训练
+#### v0.3.4-train — 课程训练
 
 > 设计文档: `docs/curriculum_training_v0.3.x.md` (第二~五章)
 
@@ -725,23 +800,27 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 ### 版本依赖拓扑
 
 ```
-v0.3.0 (已 tag)        v0.3.1 (数据+模型)       v0.3.2 (生成)           v0.3.3 (训练)
-─────────────────      ─────────────────       ─────────────────      ────────
-SSF + Voice + Fig      Voice Splitting ──→ Framework-C.S. ──→ 课程训练启动
-✅ 已实现                   │                    │
-                           ├→ 数据过滤 F1-F5     VoicePlan
-                           ├→ 五级分类            │
-                           ├→ DurSat             Cadence Zone
-                           └→ Cadence             │
-                                                 Phrase Layer
+v0.3.0 (✅ tag)     v0.3.1 (✅ tag)       v0.3.2 (✅ 已实现)    v0.3.3 (作曲能力)    v0.3.4 (训练)
+─────────────────   ─────────────────    ─────────────────    ─────────────────    ────────
+SSF + Voice + Fig   Voice Splitting ──→ Framework-C.S. ──→ 主题发展引擎 ──→ 课程训练
+                        │                    │               功能和声语法
+                        ├→ 数据过滤 F1-F5     VoicePlan ⏳    长程张力曲线
+                        ├→ 五级分类            │               对位意识
+                        ├→ DurSat             Cadence Zone ⏳  情感色彩量化
+                        └→ Cadence             │
+                        ┌─────────────────────┘
+                        │
+                   v0.3.2-fix1~7 ✅
+                   预处理路径 v3→v4
+                   管道运行中 ⏳
 ```
 
 ### 当前状态
 
-- **设计**: 11 篇设计文档全部完成，已交叉审查修复逻辑矛盾
-- **代码**: v0.3.0 (词表/模型/SSF/Voice/Fig) 已实现并 tag
-- **数据**: v0.2.x 旧 tokens 可用但需重转换（voice splitting + SSF 标注）
-- **训练**: 未启动，等 v0.3.1 + v0.3.2 全部代码实现 + 数据重处理完成后启动 v0.3.3 课程训练
+- **设计**: 16 篇设计文档全部完成（含 5 篇新优化方案: 情感色彩量化/主题发展引擎/功能和声语法/长程张力曲线/对位意识）
+- **代码**: v0.3.0~v0.3.2-fix7 全部实现并 tag
+- **数据**: 预处理管道 v4 运行中 (PDMX+MusicXML 完成, MIDI ~41%), tokens_v4 已有 ~550K 文件
+- **训练**: 未启动，等数据预处理完成 → v0.3.3 优化点实现 → v0.3.4 课程训练
 
 ---
 
@@ -749,10 +828,14 @@ SSF + Voice + Fig      Voice Splitting ──→ Framework-C.S. ──→ 课程
 
 | 方向 | 优先级 | 说明 |
 |------|--------|------|
-| **Figuration per-voice** | P0 | 当前全局 Fig 不支持 per-voice 独立织体；四声部拆分后需升级为 `<Fig Voice0=X Voice2=Y>` |
+| **Figuration per-voice** | P0 | ~~当前全局 Fig 不支持 per-voice 独立织体；四声部拆分后需升级为 `<Fig Voice0=X Voice2=Y>`~~ → ✅ v0.3.2-gen5 |
 | **SSF pairwise bias 备选** | P1 | 如果 SSF per-token 注入后和弦连贯性不足，启用 pairwise 余弦相似度 attention bias |
 | **REMI-z 轨内连续备选** | P1 | 如果旋律连贯性明显不足，converter 排序改为轨内连续 |
-| **动机发展执行器** | P2 | A2 从 seed 提取核心动机，生成时约束模型引用/变形 |
+| **动机发展引擎** | P2 | 已有完整实现方案 `docs/thematic_development_v0.3.x.md` (MotifTransform 10种变形算子 + B2 策略选择 + 引导采样) |
+| **功能和声语法** | P2 | 已有完整实现方案 `docs/functional_harmony_ssf_v0.3.x.md` (方案B: FunctionField 从 SSF 推断 + .func.json 侧文件) |
+| **长程张力曲线** | P2 | 已有完整实现方案 `docs/dramatic_arc_v0.3.x.md` (DramaticCurve + 曲式模板 + B2 沿曲线调参) |
+| **对位意识** | P2 | 已有完整实现方案 `docs/contrapuntal_awareness_v0.3.x.md` (B2 ContourBias + 声部独立性评分) |
+| **情感色彩量化** | P2 | 已有完整实现方案 `docs/affective_profile_v0.3.x.md` (八维空间 + 双通道架构) |
 | **B2 蓝图驱动升级** | P2 | A 给完整 blueprint，B2 主动设定每段理想参数区间 |
 | **Voice-Stream Transformer** | P3 | 声部分流独立架构，共享底层 + 分流上层 + cross-attention |
 | **MuseScore 插件版** | P4 | 轻量版做 MuseScore 插件，一键调用模型续写/生成 |
