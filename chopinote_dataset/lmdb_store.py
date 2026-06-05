@@ -146,11 +146,11 @@ class LMDBStore:
 
     @staticmethod
     def _key(file_id: str, data_type: str, version: int = VERSION) -> bytes:
-        return f"v{version}:{file_id}:{data_type}".encode('ascii')
+        return f"v{version}:{file_id}:{data_type}".encode('utf-8')
 
     @staticmethod
     def _level_idx_key(level: int, file_id: str) -> bytes:
-        return f"L{level}:{file_id}".encode('ascii')
+        return f"L{level}:{file_id}".encode('utf-8')
 
     # ── Read methods (DataLoader + annotation) ─────────────────
 
@@ -308,7 +308,7 @@ class LMDBStore:
                      file_id: str, txn=None):
         """Add a file_id to a reverse index DB."""
         db = self.env.open_db(index_db_name)
-        idx_key = key + b':' + file_id.encode('ascii')
+        idx_key = key + b':' + file_id.encode('utf-8')
         if txn is not None:
             txn.put(idx_key, b'', db=db, overwrite=True)
         else:
@@ -323,7 +323,7 @@ class LMDBStore:
                 ...
         """
         db = self.env.open_db(db_name)
-        prefix_bytes = prefix.encode('ascii')
+        prefix_bytes = prefix.encode('utf-8')
         with self.env.begin(db=db) as txn:
             cursor = txn.cursor(db=db)
             if cursor.set_range(prefix_bytes):
@@ -331,14 +331,14 @@ class LMDBStore:
                     if not key.startswith(prefix_bytes):
                         break
                     # key format: "L3:file_id" → extract file_id
-                    yield key.decode('ascii').split(':', 1)[1]
+                    yield key.decode('utf-8').split(':', 1)[1]
                 cursor.close()
 
     # ── Cursor-based operations ─────────────────────────────────
 
     def count_prefix(self, prefix: str, version: int = VERSION) -> int:
         """Count keys with given prefix."""
-        prefix_bytes = f"v{version}:{prefix}".encode('ascii')
+        prefix_bytes = f"v{version}:{prefix}".encode('utf-8')
         count = 0
         with self.env.begin(db=self.main_db) as txn:
             cursor = txn.cursor()
@@ -353,14 +353,14 @@ class LMDBStore:
     def iter_file_ids(self, version: int = VERSION) -> Iterator[str]:
         """Yield all unique file_ids in the LMDB."""
         seen = set()
-        prefix = f"v{version}:".encode('ascii')
+        prefix = f"v{version}:".encode('utf-8')
         with self.env.begin(db=self.main_db) as txn:
             cursor = txn.cursor()
             if cursor.set_range(prefix):
                 for key, _ in cursor:
                     if not key.startswith(prefix):
                         break
-                    parts = key.decode('ascii').split(':')
+                    parts = key.decode('utf-8').split(':')
                     if len(parts) >= 3:
                         fid = parts[1]
                         if fid not in seen:
@@ -370,7 +370,7 @@ class LMDBStore:
 
     def delete_version(self, version: int):
         """Delete all keys for a given version."""
-        prefix = f"v{version}:".encode('ascii')
+        prefix = f"v{version}:".encode('utf-8')
         with self.env.begin(db=self.main_db, write=True) as txn:
             cursor = txn.cursor()
             if cursor.set_range(prefix):
@@ -427,12 +427,17 @@ class WriteBatch:
                 self.store._txn_put(self._txn, file_id, data_type, value, version)
             self._txn.commit()
         except lmdb.MapFullError:
-            if self._txn:
-                self._txn.abort()
+            self._txn.abort()
+            self._txn = None
             raise RuntimeError(
                 "LMDB map_size exhausted. Re-open with larger map_size "
                 "(e.g. map_size=64*1024**3 for 64 GB)."
             )
-        finally:
+        except Exception:
+            self._txn.abort()
             self._txn = None
+            raise
+        finally:
+            if self._txn is not None:
+                self._txn = None
         self._buffer.clear()
