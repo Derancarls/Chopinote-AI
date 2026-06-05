@@ -135,6 +135,7 @@ def cmd_migrate(args):
     stats = Counter()
     t0 = time.time()
     done = len(already)
+    last_tick = done // 40000  # report every 40K successful writes
 
     with db.batch_write(args.batch_size) as batch:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -161,9 +162,11 @@ def cmd_migrate(args):
                     stats['ok'] += 1
                     done += 1
 
-                if done % 50400 == 0 or done < 1600:
+                tick = done // 40000
+                if tick > last_tick or stats['ok'] < 1600:
+                    last_tick = tick
                     elapsed = time.time() - t0
-                    rate = done / max(1, elapsed)
+                    rate = stats['ok'] / max(1, elapsed)
                     eta = (total - done) / max(1, rate)
                     print(f"  {done}/{total} ({100*done/total:.0f}%) "
                           f"| {rate:.0f} f/s | ETA {eta:.0f}s", flush=True)
