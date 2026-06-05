@@ -163,18 +163,26 @@ class TokenDataset(Dataset):
 
     每次 __getitem__ 随机选一个文件，随机裁剪出 max_seq_len 的片段。
     若存在对应的 .sec.json 文件，额外加载段落标注数据用于段落感知训练。
+
+    LMDB 模式 (use_lmdb=True):
+      用单个 LMDB 文件替代 480 万个 JSON 文件，消除目录 I/O 瓶颈。
+      tokens 走 numpy→torch 快速路径，跳过 json.load 和 Python list 分配。
     """
 
     def __init__(self, split_file: str, data_dir: str = 'data/processed',
-                 max_seq_len: int = 2048):
+                 max_seq_len: int = 2048, use_lmdb: bool = False,
+                 lmdb_path: str | None = None):
         """
         Args:
             split_file: train.txt / val.txt / test.txt 路径
             data_dir: 数据根目录（用于解析相对路径）
             max_seq_len: 每个样本的最大 token 数
+            use_lmdb: 启用 LMDB 模式
+            lmdb_path: LMDB 路径 (默认: {data_dir}/lmdb/chopinote_v4.lmdb)
         """
         self.max_seq_len = max_seq_len
         self.data_dir = Path(data_dir)
+        self.use_lmdb = use_lmdb
 
         # 读取文件列表
         with open(split_file, 'r', encoding='utf-8') as f:
@@ -183,6 +191,41 @@ class TokenDataset(Dataset):
         if not self.file_paths:
             raise ValueError(f'文件列表为空: {split_file}')
 
+        # ── LMDB 模式 ──
+        if use_lmdb:
+            from chopinote_dataset.lmdb_store import LMDBStore
+            if lmdb_path is None:
+                lmdb_path = str(self.data_dir / 'lmdb' / 'chopinote_v4.lmdb')
+            self.lmdb = LMDBStore.open(lmdb_path, readonly=True)
+
+            # file_ids 来自路径 basename 去后缀
+            self.file_ids = [Path(fp).stem for fp in self.file_paths]
+
+            # 长度直接查 LMDB (8 bytes per lookup, 无 300MB 内存峰值)
+            self.file_lengths = [
+                self.lmdb.get_length(fid) for fid in self.file_ids
+            ]
+
+            self.valid_indices = [
+                i for i, l in enumerate(self.file_lengths)
+                if l > self.max_seq_len + 1
+            ]
+            if not self.valid_indices:
+                self.valid_indices = [
+                    i for i, l in enumerate(self.file_lengths) if l > 0
+                ]
+            if not self.valid_indices:
+                raise ValueError('没有可用的训练文件')
+
+            # 小缓存仅存解码后的 sidecar dicts (tokens 用快速路径，不缓存)
+            from collections import OrderedDict
+            self._cache_sec: OrderedDict[int, dict] = OrderedDict()
+            self._cache_ssf: OrderedDict[int, dict] = OrderedDict()
+            self._cache_func: OrderedDict[int, dict] = OrderedDict()
+            self._cache_max = 128
+            return  # LMDB 模式初始化完成
+
+        # ── 文件模式 (原有逻辑) ──
         # 加载 token 长度索引（由预处理生成的 token_lengths.json）
         index_path = self.data_dir / 'token_lengths.json'
         meta_dir = self.data_dir / 'metadata_v4'
@@ -262,7 +305,10 @@ class TokenDataset(Dataset):
         return len(self.valid_indices)
 
     def _load_tokens(self, file_idx: int) -> list[int]:
-        """加载文件 tokens（带 LRU 缓存）。"""
+        """加载文件 tokens（带 LRU 缓存）。LMDB 模式走 numpy→torch 路径。"""
+        if self.use_lmdb:
+            return self.lmdb.get_tokens(self.file_ids[file_idx])
+
         if file_idx in self._cache:
             return self._cache[file_idx]
         path = self._resolve_path(self.file_paths[file_idx])
@@ -276,6 +322,18 @@ class TokenDataset(Dataset):
 
     def _load_section_data(self, file_idx: int) -> Optional[dict]:
         """加载段落标注数据。返回 None 表示无标注。"""
+        if self.use_lmdb:
+            fid = self.file_ids[file_idx]
+            if fid in self._cache_sec:
+                return self._cache_sec[fid]
+            data = self.lmdb.get_sec(fid)
+            if data is not None:
+                self._cache_sec[fid] = data
+                self._cache_sec.move_to_end(fid)
+                if len(self._cache_sec) > self._cache_max:
+                    self._cache_sec.popitem(last=False)
+            return data
+
         path = self._resolve_path(self.file_paths[file_idx])
         sec_path = path.with_suffix('.sec.json')
         if not sec_path.exists():
@@ -290,6 +348,18 @@ class TokenDataset(Dataset):
 
     def _load_ssf_data(self, file_idx: int) -> Optional[dict]:
         """加载 SSF (Sliding Scale Field) 标注 (v0.3.0)。"""
+        if self.use_lmdb:
+            fid = self.file_ids[file_idx]
+            if fid in self._cache_ssf:
+                return self._cache_ssf[fid]
+            data = self.lmdb.get_ssf(fid)
+            if data is not None:
+                self._cache_ssf[fid] = data
+                self._cache_ssf.move_to_end(fid)
+                if len(self._cache_ssf) > self._cache_max:
+                    self._cache_ssf.popitem(last=False)
+            return data
+
         path = self._resolve_path(self.file_paths[file_idx])
         ssf_path = path.with_suffix('.ssf.json')
         if not ssf_path.exists():
@@ -302,6 +372,18 @@ class TokenDataset(Dataset):
 
     def _load_func_data(self, file_idx: int) -> Optional[dict]:
         """加载功能和声标注 (v0.3.3-opt2)。"""
+        if self.use_lmdb:
+            fid = self.file_ids[file_idx]
+            if fid in self._cache_func:
+                return self._cache_func[fid]
+            data = self.lmdb.get_func(fid)
+            if data is not None:
+                self._cache_func[fid] = data
+                self._cache_func.move_to_end(fid)
+                if len(self._cache_func) > self._cache_max:
+                    self._cache_func.popitem(last=False)
+            return data
+
         path = self._resolve_path(self.file_paths[file_idx])
         func_path = path.with_suffix('.func.json')
         if not func_path.exists():
@@ -614,9 +696,16 @@ def collate_fn(batch: list[dict]) -> dict:
 
 def create_dataloader(split_file: str, data_dir: str = 'data/processed',
                       batch_size: int = 2, max_seq_len: int = 2048,
-                      shuffle: bool = True) -> DataLoader:
-    """创建 DataLoader 的快捷函数。"""
-    dataset = TokenDataset(split_file, data_dir, max_seq_len)
+                      shuffle: bool = True, use_lmdb: bool = False,
+                      lmdb_path: str | None = None) -> DataLoader:
+    """创建 DataLoader 的快捷函数。
+
+    Args:
+        use_lmdb: 使用 LMDB 模式 (消除 4 次 open/json.load per sample)
+        lmdb_path: LMDB 路径，默认 {data_dir}/lmdb/chopinote_v4.lmdb
+    """
+    dataset = TokenDataset(split_file, data_dir, max_seq_len,
+                           use_lmdb=use_lmdb, lmdb_path=lmdb_path)
     return DataLoader(
         dataset,
         batch_size=batch_size,

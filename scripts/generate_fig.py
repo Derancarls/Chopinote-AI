@@ -61,10 +61,10 @@ def _init_constants():
     _POS_MAX = max(pos_ids)
 
 
-def classify_window(notes: list[tuple[int, int, int]]) -> int:
+def classify_window(notes: list[tuple[int, int]]) -> int:
     """分类一个窗口内的织体类型。
 
-    notes: [(interval, duration, position), ...]
+    notes: [(interval, position), ...]
     """
     if len(notes) < 4:
         return FIG_NONE
@@ -73,7 +73,7 @@ def classify_window(notes: list[tuple[int, int, int]]) -> int:
     intervals = [pitches[i+1] - pitches[i] for i in range(len(pitches) - 1)]
 
     # 1. 同 position ≥3 音 → Block
-    pos_counts = Counter(n[2] for n in notes)
+    pos_counts = Counter(n[1] for n in notes)
     if max(pos_counts.values()) >= 3:
         return FIG_BLOCK
 
@@ -133,7 +133,7 @@ def _is_alberti(intervals: list[int]) -> bool:
 
 
 def _is_stride(notes: list) -> bool:
-    strong = [n for n in notes if n[2] % 4 == 0]
+    strong = [n for n in notes if n[1] % 4 == 0]
     if len(strong) < 2:
         return False
     strong_pitches = [s[0] for s in strong]
@@ -144,7 +144,7 @@ def _is_stride(notes: list) -> bool:
 def _is_waltz(notes: list) -> bool:
     pos_groups = {}
     for n in notes:
-        pos_groups.setdefault(n[2], []).append(n[0])
+        pos_groups.setdefault(n[1], []).append(n[0])
     if len(pos_groups) < 2:
         return False
     return max(len(v) for v in pos_groups.values()) >= 2
@@ -285,6 +285,32 @@ def _count_bar_until(tokens: list[int]) -> int:
     return count
 
 
+def _scandir_iter(input_dir: str):
+    """用 os.scandir 逐项迭代 .tokens 文件 — 避免 os.walk 列表。"""
+    dirs_to_walk = [input_dir]
+    while dirs_to_walk:
+        d = dirs_to_walk.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs_to_walk.append(os.path.join(d, entry.name))
+                    elif entry.is_file() and entry.name.endswith('.tokens'):
+                        yield os.path.join(d, entry.name)
+        except OSError:
+            continue
+
+
+def _count_tokens_files(input_dir: str) -> int:
+    """用 find 快速计数。"""
+    import subprocess
+    result = subprocess.run(
+        ['find', input_dir, '-name', '*.tokens', '-printf', '.'],
+        capture_output=True, text=True, timeout=300
+    )
+    return len(result.stdout)
+
+
 def main():
     ap = argparse.ArgumentParser(description='Per-voice figuration annotation — v0.3.2 gen5')
     ap.add_argument('command', choices=['annotate'])
@@ -295,13 +321,8 @@ def main():
 
     _init_constants()
 
-    all_files = []
-    for root, dirs, files in os.walk(args.input_dir):
-        for f in files:
-            if f.endswith('.tokens'):
-                all_files.append(os.path.join(root, f))
-
-    print(f"文件总数: {len(all_files)}")
+    total = _count_tokens_files(args.input_dir)
+    print(f"文件总数: {total}")
 
     if args.dry_run:
         print("[dry-run] 不写文件")
@@ -309,9 +330,10 @@ def main():
     stats = Counter()
     total_injected = 0
 
-    tasks = all_files
     with mp.Pool(args.num_workers) as pool:
-        for i, result in enumerate(pool.imap_unordered(process_file, tasks, chunksize=100)):
+        for i, result in enumerate(
+            pool.imap_unordered(process_file, _scandir_iter(args.input_dir), chunksize=100)
+        ):
             if result['status'] == 'ok':
                 stats['ok'] += 1
                 injected = result.get('injected', 0)
@@ -320,8 +342,8 @@ def main():
                 stats[result['status']] += 1
 
             if (i + 1) % 100000 == 0:
-                print(f"  进度: {i+1}/{len(all_files)} "
-                      f"({100*(i+1)/len(all_files):.0f}%), "
+                print(f"  进度: {i+1}/{total} "
+                      f"({100*(i+1)/total:.0f}%), "
                       f"ok={stats['ok']}, inj={total_injected}")
 
     print(f"完成! 成功={stats['ok']}, 错误={stats['error']}, "

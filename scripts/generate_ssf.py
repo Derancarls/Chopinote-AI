@@ -14,6 +14,7 @@ SSF 编码规则 (主音锚定):
       --input-dir /root/autodl-tmp/data/processed/tokens_v4 \
       --num-workers 16
 """
+import threading, gc
 import os, sys, json, argparse, time, multiprocessing as mp
 from collections import Counter
 
@@ -243,49 +244,171 @@ def _init_note_on_range():
 
 # ── CLI ────────────────────────────────────────────────────
 
+def _scandir_iter(input_dir: str):
+    """用 os.scandir 逐项迭代 — 不构建任何列表, 不触 os.walk 的 nondirs 列表。
+
+    os.walk 对平坦目录会先把 326 万文件名全装进 nondirs 列表再 yield,
+    这 ~300MB 被 fork×25 → 7.5GB 物理内存。scandir 直接迭代，零缓存。
+    """
+    dirs_to_walk = [input_dir]
+    while dirs_to_walk:
+        d = dirs_to_walk.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs_to_walk.append(os.path.join(d, entry.name))
+                    elif entry.is_file() and entry.name.endswith('.tokens'):
+                        yield (os.path.join(d, entry.name), input_dir)
+        except OSError:
+            continue
+
+
+def _count_tokens_files(input_dir: str) -> int:
+    """用 find 快速计数 (不占 Python 内存)。"""
+    import subprocess
+    result = subprocess.run(
+        ['find', input_dir, '-name', '*.tokens', '-printf', '.'],
+        capture_output=True, text=True, timeout=300
+    )
+    return len(result.stdout)
+
+
 def main():
     ap = argparse.ArgumentParser(description='SSF annotation for v0.3.3')
     ap.add_argument('command', choices=['annotate'])
     ap.add_argument('--input-dir', default='/root/autodl-tmp/data/processed/tokens_v4')
     ap.add_argument('--num-workers', type=int, default=16)
+    ap.add_argument('--output-dir', default=None, help='SSF 输出目录 (默认与 .tokens 同目录)')
+    ap.add_argument('--lmdb-path', default=None, help='LMDB 路径 (优先于 --output-dir)')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
+    ssf_output_dir = args.output_dir or args.input_dir
 
     _init_note_on_range()
+    # 预暖缓存: 在 fork 前加载 tokenizer, 子进程直接继承 (省 25×50MB)
+    _get_tonic_ids()
+    _get_position_ids()
 
-    all_files = []
-    for root, dirs, files in os.walk(args.input_dir):
-        for f in files:
-            if f.endswith('.tokens'):
-                all_files.append(os.path.join(root, f))
+    # LMDB 模式: 提前打开
+    lmdb_store = None
+    if args.lmdb_path:
+        from chopinote_dataset.lmdb_store import LMDBStore
+        lmdb_store = LMDBStore.open(args.lmdb_path, readonly=False)
+        print(f"LMDB 输出: {args.lmdb_path}")
+    _get_position_ids()
 
-    print(f"文件总数: {len(all_files)}")
+    total = _count_tokens_files(args.input_dir)
+    print(f"文件总数: {total}")
     print(f"工作进程: {args.num_workers}")
 
-    tasks = [(f, args.input_dir) for f in all_files]
     stats = Counter()
     start = time.time()
 
-    with mp.Pool(args.num_workers) as pool:
-        for i, result in enumerate(pool.imap_unordered(process_file, tasks, chunksize=100)):
-            if result['status'] == 'ok':
+    # 阶段 1: 用 find 预生成路径文件 (避免 scandir 与 25 worker I/O 争抢)
+    print("阶段 1: 扫描文件路径...")
+    import subprocess
+    path_file = '/tmp/ssf_paths.txt'
+    with open(path_file, 'wb') as f:
+        subprocess.run(
+            ['find', args.input_dir, '-name', '*.tokens', '-print0'],
+            stdout=f, check=True
+        )
+    print(f"  路径文件就绪 ({os.path.getsize(path_file)//1024//1024} MB)")
+
+    # 阶段 2: 读路径 → 提交 workers
+    print("阶段 2: 启动 workers...")
+    lock = threading.Lock()
+    pending = 0
+    completed = 0
+    submitted = 0
+    MAX_PENDING = args.num_workers * 4
+
+    def _on_done(result):
+        nonlocal pending, completed
+        with lock:
+            pending -= 1
+            completed += 1
+            cur = completed
+
+        if result['status'] == 'ok':
+            with lock:
                 stats['ok'] += 1
-                if not args.dry_run:
-                    data = result['data']
-                    out_path = result['file'].replace('.tokens', '.ssf.json')
-                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            if not args.dry_run:
+                data = result['data']
+                if lmdb_store is not None:
+                    fid = os.path.basename(result['file']).replace('.tokens', '')
+                    with lmdb_store.env.begin(db=lmdb_store.main_db, write=True) as txn:
+                        lmdb_store._txn_put(txn, fid, 'ssf', data)
+                else:
+                    fname = os.path.basename(result['file']).replace('.tokens', '.ssf.json')
+                    out_path = os.path.join(ssf_output_dir, fname)
                     with open(out_path, 'w') as f:
                         json.dump(data, f)
-            else:
+                del data
+        else:
+            with lock:
                 stats[result['status']] += 1
 
-            if (i + 1) % 100000 == 0:
-                elapsed = time.time() - start
-                print(f"  进度: {i+1}/{len(all_files)} "
-                      f"({100*(i+1)/len(all_files):.0f}%), {elapsed:.0f}s, ok={stats['ok']}")
+        del result
+        if cur % 100000 == 0:
+            elapsed = time.time() - start
+            print(f"  进度: {cur}/{total} "
+                  f"({100*cur/total:.0f}%), {elapsed:.0f}s, ok={stats['ok']}")
 
+    pool = mp.Pool(args.num_workers)
+    try:
+        # 从文件批量读路径 (64KB buffer), 避免逐文件争抢目录 dentry
+        buf = b''
+        with open(path_file, 'rb', buffering=65536) as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    if buf:
+                        task = (buf.decode('utf-8'), args.input_dir)
+                        while True:
+                            with lock:
+                                if pending < MAX_PENDING:
+                                    pending += 1
+                                    submitted += 1
+                                    break
+                            time.sleep(0.001)
+                        pool.apply_async(process_file, (task,), callback=_on_done)
+                    break
+                buf += chunk
+                while b'\0' in buf:
+                    path_bytes, buf = buf.split(b'\0', 1)
+                    if not path_bytes:
+                        continue
+                    task = (path_bytes.decode('utf-8'), args.input_dir)
+                    while True:
+                        with lock:
+                            if pending < MAX_PENDING:
+                                pending += 1
+                                submitted += 1
+                                break
+                        time.sleep(0.001)
+                    pool.apply_async(process_file, (task,), callback=_on_done)
+
+        pool.close()
+        # 等待全部回调完成
+        while True:
+            with lock:
+                if completed >= submitted:
+                    break
+            time.sleep(0.5)
+            gc.collect()
+        pool.join()
+    finally:
+        pool.terminate()
+        pool.join()
+
+    gc.collect()
+    os.unlink(path_file)
+    if lmdb_store is not None:
+        lmdb_store.close()
     elapsed = time.time() - start
-    print(f"完成! {elapsed:.0f}s")
+    print(f"完成! {elapsed:.0f}s, total={submitted}")
     print(f"  成功: {stats['ok']}")
     print(f"  错误: {stats['error']}")
     print(f"  跳过: {stats['skip']}")

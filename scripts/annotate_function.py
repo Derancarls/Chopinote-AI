@@ -222,6 +222,15 @@ def _annotate_one(args: tuple[str, str]) -> tuple[str, bool, str]:
         return (token_path, False, str(e))
 
 
+def _task_generator(input_dir: str):
+    """惰性生成待标注任务, 不构建全量列表。"""
+    token_dir = Path(input_dir)
+    for sp in token_dir.glob('*.ssf.json'):
+        tp = sp.with_name(sp.name.replace('.ssf.json', '.tokens'))
+        if not tp.with_suffix('.func.json').exists():
+            yield (str(tp), str(token_dir))
+
+
 def annotate_all(input_dir: str, num_workers: int = 25):
     """扫描已有 .ssf.json 文件, 并行标注功能和声。"""
     token_dir = Path(input_dir)
@@ -229,48 +238,33 @@ def annotate_all(input_dir: str, num_workers: int = 25):
         logger.error(f"目录不存在: {input_dir}")
         return
 
-    ssf_files = list(token_dir.glob('*.ssf.json'))
-    logger.info(f"找到 {len(ssf_files)} 个 .ssf.json 文件")
-
-    tasks = []
-    skipped = 0
-    for sp in ssf_files:
-        tp = sp.with_suffix('.tokens')
-        func_path = tp.with_suffix('.func.json')
-        if func_path.exists():
-            skipped += 1
-        else:
-            tasks.append((str(tp), str(token_dir)))
-
-    logger.info(f"已标注: {skipped}, 待标注: {len(tasks)}")
-    if not tasks:
-        logger.info("全部已标注")
-        return
+    # 先快速统计 (不存全量路径)
+    ssf_count = sum(1 for _ in token_dir.glob('*.ssf.json'))
+    logger.info(f"找到 {ssf_count} 个 .ssf.json 文件")
+    del ssf_count  # 不持有计数外的任何数据
 
     t0 = time.time()
     completed = 0
     failed = 0
+    skipped = 0  # 在 generator 里已经跳过了, 这里仅用于最终统计
 
     with Pool(processes=num_workers) as pool:
-        for path, ok, err in pool.imap_unordered(_annotate_one, tasks, chunksize=50):
+        for path, ok, err in pool.imap_unordered(_annotate_one, _task_generator(input_dir), chunksize=50):
             completed += 1
             if not ok:
                 failed += 1
             if completed % 5000 == 0:
                 elapsed = time.time() - t0
                 rate = completed / max(1, elapsed)
-                eta = (len(tasks) - completed) / max(1, rate)
                 logger.info(
-                    f"  进度 {completed}/{len(tasks)} "
-                    f"({completed / len(tasks) * 100:.1f}%) "
-                    f"| {rate:.0f} f/s | ETA {eta:.0f}s "
+                    f"  进度 {completed} "
+                    f"| {rate:.0f} f/s "
                     f"| 失败 {failed}"
                 )
 
     elapsed = time.time() - t0
     logger.info(
-        f"功能和声标注完成: {completed} 标注, {failed} 失败, "
-        f"{skipped} 跳过 ({elapsed:.0f}s)"
+        f"功能和声标注完成: {completed} 标注, {failed} 失败 ({elapsed:.0f}s)"
     )
 
 
