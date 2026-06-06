@@ -1,47 +1,65 @@
 #!/usr/bin/env python3
-"""功能和声标注脚本 — 从 .ssf.json 的 SSF 向量分类 T/SD/D/SDom。
-
-不重复解析 .tokens，直接读 SSF 标注结果：
-  - 段落级 TonicField    → section_funcs
-  - 小节级 LocalField    → bar_funcs
-  - 节拍级 BeatField     → beat_funcs
-
-超过余弦相似度阈值才标注，未达标的标记为 none (func_id=0)。
-
-Usage:
-    python scripts/annotate_function.py annotate \
-        --input-dir /root/autodl-tmp/data/processed/tokens_v4 \
-        --num-workers 25
 """
-import sys, os, time, json, logging, math, argparse
-from pathlib import Path
-from multiprocessing import Pool
+功能和声标注脚本 — v0.3.3 LMDB 版 (v3 模板 rewrite)。
+从 LMDB 读 SSF 数据，用尖锐模板 + ratio test 分类 T/SD/D/SDom。
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger(__name__)
+核心改进 (v3):
+  - 模板按和弦音设计 (I=pos0,4,7 / IV=pos5,9,0 / V=pos7,11,2 / iv=pos5,8,0)
+  - ratio test (best_sim / second_best) 替代 sum-based confidence
+  - 节拍级精细标注: 每拍独立分类
+  - 非功能拍标记为 "non-func" (不是 "none"), 保留 SSF 原始向量
 
-# ── 功能 PC 模板 (主音锚定, 12 维) ──────────────────────────────
+三粒度:
+  - section_funcs: 段落级 (从 TonicField 分类)
+  - bar_funcs:     小节级 (TonicField + LocalField + Markov)
+  - beat_funcs:    节拍级 (BeatField + 局部 Markov) ← 主粒度
+
+输出格式 (LMDB key: v4:<file_id>:func):
+  {
+    "version": 3,
+    "section_funcs": [{"section": i, "func": "T"|"SD"|"D"|"SDom"|"non-func", "ratio": 0.X}, ...],
+    "bar_funcs": [...],
+    "beat_funcs": [{"bar": b, "pos": p, "func": ..., "ratio": 0.X}, ...]
+  }
+
+用法:
+  python scripts/annotate_function.py annotate \
+      --lmdb-path /root/autodl-tmp/data/processed/lmdb/chopinote_v4.lmdb \
+      --num-workers 25
+"""
+import sys, os, time, json, math, argparse, gc, multiprocessing as mp
+from collections import Counter
+
+
+# ── 功能模板 (v3: 按和弦音设计, 主音锚定, 12 维) ─────────────
+# pos 0 = tonic PC. 和弦音强峰, 非和弦音接近 0.
+#   T(I):    1,3,5 → pos 0, 4, 7
+#   SD(IV):  4,6,1 → pos 5, 9, 0
+#   D(V):    5,7,2 → pos 7,11, 2
+#   SDom(iv): 4,b6,1 → pos 5, 8, 0
 FUNCTION_TEMPLATES = {
-    'T':  [1.0, 0.1, 0.2, 0.1, 0.7, 0.1, 0.1, 0.7, 0.1, 0.3, 0.1, 0.2],
-    'SD': [0.5, 0.1, 0.3, 0.1, 0.3, 0.8, 0.1, 0.3, 0.6, 0.2, 0.2, 0.1],
-    'D':  [0.5, 0.1, 0.4, 0.1, 0.3, 0.3, 0.1, 0.9, 0.1, 0.2, 0.6, 0.4],
-    'SDom': [0.3, 0.1, 0.8, 0.1, 0.2, 0.3, 0.7, 0.3, 0.1, 0.1, 0.1, 0.1],
+    'T':    [1.0, 0.0, 0.1, 0.0, 0.8, 0.0, 0.0, 0.8, 0.0, 0.1, 0.0, 0.0],
+    'SD':   [0.6, 0.0, 0.1, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.1],
+    'D':    [0.1, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.0, 0.7],
+    'SDom': [0.5, 0.0, 0.1, 0.0, 0.1, 1.0, 0.0, 0.0, 0.7, 0.1, 0.0, 0.0],
 }
 
 FUNC_NAMES = ['T', 'SD', 'D', 'SDom']
-FUNC_TO_ID = {'T': 1, 'SD': 2, 'D': 3, 'SDom': 4}
 
-# ── 分类阈值 ────────────────────────────────────────────────
-CLASSIFY_THRESHOLD = 0.50       # cosine similarity 最低阈值
-CONFIDENCE_FLOOR = 0.55         # 归一化后验最低置信度
+# ── Ratio test 阈值 ────────────────────────────────────────
+SIM_THRESHOLD = 0.35     # best_sim 下限 (低于此 → non-func)
+RATIO_THRESHOLD = 1.20   # best_sim / second_best 下限 (低于此 → ambiguous)
 
-# ── Markov 转移概率 ────────────────────────────────────────────
+# ── 模板间相似度 (用于调整 Markov 权重) ─────────────────────
+# SD vs SDom = 0.735 (共享 pos5), 其他 <0.45
+_MARKOV_WEIGHT = 0.2  # Markov prior 权重 (降低以避免过强偏置)
+
+# ── Markov 转移概率 ────────────────────────────────────────
 MARKOV_TRANSITION = {
-    'T':    {'T': 0.3, 'SD': 0.4, 'D': 0.25, 'SDom': 0.05},
-    'SD':   {'T': 0.15, 'SD': 0.2, 'D': 0.55, 'SDom': 0.1},
-    'D':    {'T': 0.7, 'SD': 0.1, 'D': 0.15, 'SDom': 0.05},
-    'SDom': {'T': 0.15, 'SD': 0.0, 'D': 0.8, 'SDom': 0.05},
+    'T':    {'T': 0.25, 'SD': 0.40, 'D': 0.30, 'SDom': 0.05},
+    'SD':   {'T': 0.15, 'SD': 0.20, 'D': 0.55, 'SDom': 0.10},
+    'D':    {'T': 0.65, 'SD': 0.10, 'D': 0.15, 'SDom': 0.10},
+    'SDom': {'T': 0.10, 'SD': 0.00, 'D': 0.80, 'SDom': 0.10},
 }
 
 
@@ -57,247 +75,333 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 def classify_ssf_vector(
     ssf_vec: list[float],
     prev_func: str | None = None,
-    use_markov: bool = True,
-) -> tuple[str | None, float]:
-    """对单个 SSF 向量分类为功能标签。
-
-    Args:
-        ssf_vec: 12 维 SSF chroma 向量
-        prev_func: 前一个功能标签 (用于 Markov 先验)
-        use_markov: 是否使用 Markov 转移先验
+) -> dict:
+    """对单个 SSF 向量做 ratio-test 分类。
 
     Returns:
-        (func_name, confidence) 或 (None, 0.0)
+        {"func": "T"|"SD"|"D"|"SDom"|"non-func",
+         "ratio": float,        # best_sim / second_best
+         "best_sim": float,
+         "reason": str | None}  # non-func 原因: "empty" | "low_sim" | "ambiguous"
     """
-    if all(v == 0.5 for v in ssf_vec):
-        return (None, 0.0)
+    # 空向量 (无音符)
+    if all(v == 0.5 for v in ssf_vec) or all(v == 0.0 for v in ssf_vec):
+        return {'func': 'non-func', 'ratio': 0.0, 'best_sim': 0.0, 'reason': 'empty'}
 
-    # Cosine similarity
-    sim_scores = {}
-    for fname in FUNC_NAMES:
-        sim_scores[fname] = cosine_similarity(ssf_vec, FUNCTION_TEMPLATES[fname])
+    # 对所有模板计算余弦相似度
+    sim_scores = {f: cosine_similarity(ssf_vec, FUNCTION_TEMPLATES[f]) for f in FUNC_NAMES}
 
-    best_func = max(sim_scores, key=sim_scores.get)
+    # 按相似度降序排列
+    sorted_funcs = sorted(sim_scores, key=sim_scores.get, reverse=True)
+    best_func = sorted_funcs[0]
+    second_func = sorted_funcs[1]
     best_sim = sim_scores[best_func]
+    second_sim = sim_scores[second_func]
 
-    # 低于阈值 → 不标注
-    if best_sim < CLASSIFY_THRESHOLD:
-        return (None, 0.0)
+    # Check 1: 最高相似度太低
+    if best_sim < SIM_THRESHOLD:
+        return {'func': 'non-func', 'ratio': round(best_sim / max(second_sim, 0.01), 3),
+                'best_sim': round(best_sim, 3), 'reason': 'low_sim'}
 
-    # Markov prior (仅对有时间顺序的级别使用)
-    if use_markov and prev_func is not None:
-        posterior = {}
-        for fname in FUNC_NAMES:
-            prior = MARKOV_TRANSITION.get(prev_func, {}).get(fname, 0.25)
-            posterior[fname] = sim_scores[fname] * (0.3 + 0.7 * prior)
-        best_func = max(posterior, key=posterior.get)
-        best_score = posterior[best_func]
-        total = sum(posterior.values())
-        confidence = best_score / total if total > 0 else 0.0
-    else:
-        total = sum(sim_scores.values())
-        confidence = best_sim / total if total > 0 else 0.0
+    # 有 Markov 先验时: 对 scores 做微调
+    if prev_func is not None and prev_func in MARKOV_TRANSITION:
+        adjusted = {}
+        for f in FUNC_NAMES:
+            prior = MARKOV_TRANSITION.get(prev_func, {}).get(f, 0.25)
+            adjusted[f] = sim_scores[f] * (1.0 + _MARKOV_WEIGHT * prior)
+        # 重新排序
+        sorted_funcs = sorted(adjusted, key=adjusted.get, reverse=True)
+        best_func = sorted_funcs[0]
+        second_func = sorted_funcs[1]
+        best_sim = sim_scores[best_func]      # ratio 仍用原始 score
+        second_sim = sim_scores[second_func]
 
-    if confidence < CONFIDENCE_FLOOR:
-        return (None, 0.0)
+    # Check 2: ratio test — 第一名必须显著优于第二名
+    ratio = best_sim / max(second_sim, 0.01)
+    if ratio < RATIO_THRESHOLD:
+        return {'func': 'non-func', 'ratio': round(ratio, 3),
+                'best_sim': round(best_sim, 3), 'reason': 'ambiguous'}
 
-    return (best_func, round(confidence, 3))
+    return {'func': best_func, 'ratio': round(ratio, 3),
+            'best_sim': round(best_sim, 3), 'reason': None}
 
-
-# ═══════════════════════════════════════════════════════════════
-#  标注逻辑
-# ═══════════════════════════════════════════════════════════════
 
 def annotate_from_ssf(ssf_data: dict) -> dict:
-    """从 SSF 数据标注三粒度功能和声。
-
-    Returns:
-        {
-            "version": 2,
-            "section_funcs": [...],
-            "bar_funcs": [...],
-            "beat_funcs": [...]
-        }
-    """
+    """从 SSF 数据标注三粒度功能和声 (v3)。"""
     tonic_fields = ssf_data.get('tonic_fields', [])
     local_fields = ssf_data.get('local_fields', {})
     beat_fields = ssf_data.get('beat_fields', {})
 
-    # ── 段落级: 不使用 Markov (段落间独立) ──
+    # ── 段落级: 无 Markov ──
     section_funcs = []
     for i, tf in enumerate(tonic_fields):
-        func, conf = classify_ssf_vector(tf, prev_func=None, use_markov=False)
-        section_funcs.append({
-            'section': i,
-            'func': func or 'none',
-            'confidence': conf,
-        })
+        result = classify_ssf_vector(tf, prev_func=None)
+        result['section'] = i
+        section_funcs.append(result)
 
-    # ── 小节级: 使用 Markov 链 ──
+    # ── 小节级: 带 Markov ──
     bar_funcs = []
-    prev_bar_func = 'T'
-    # 需要知道总 bar 数 → 从 beat_fields 推断
+    prev_bar_func = 'T'  # 初始假设
+
     if beat_fields:
         num_bars = max(int(k) for k in beat_fields.keys()) + 1
     elif local_fields:
         num_bars = max(int(k) for k in local_fields.keys()) + 1
     else:
-        num_bars = len(tonic_fields) * 8  # 粗略估计
+        num_bars = max(1, len(tonic_fields) * 8)
+
+    boundaries = ssf_data.get('section_boundaries', [0])
 
     for b in range(num_bars):
-        # 找到该 bar 所属 section
+        # 找该 bar 所属 section 的 TonicField
         sec_idx = 0
-        boundaries = ssf_data.get('section_boundaries', [0])
         for i in range(len(boundaries)):
             if b >= boundaries[i]:
                 sec_idx = i
-
-        # 从 section TonicField + bar LocalField 合成 bar 级 SSF
         base_tf = tonic_fields[sec_idx] if sec_idx < len(tonic_fields) else [0.5] * 12
-        bar_ssf = list(base_tf)  # copy
+
+        # 合成 bar 级 SSF = TonicField + LocalField delta
+        bar_ssf = list(base_tf)
         b_str = str(b)
         if b_str in local_fields:
             delta = local_fields[b_str]
             for j in range(12):
                 bar_ssf[j] = max(0.0, min(1.0, bar_ssf[j] + delta[j]))
 
-        func, conf = classify_ssf_vector(bar_ssf, prev_func=prev_bar_func, use_markov=True)
-        bar_funcs.append({
-            'bar': b,
-            'func': func or 'none',
-            'confidence': conf,
-        })
-        if func is not None:
-            prev_bar_func = func
+        # 如果该 bar 有 BeatField, 优先用 BeatField 的聚合 (更精确)
+        if b_str in beat_fields:
+            beats = beat_fields[b_str]
+            if beats:
+                # 聚合所有 beat 的 SSF
+                agg = [0.0] * 12
+                n = 0
+                for pos_str, bf in beats.items():
+                    for j in range(12):
+                        agg[j] += bf[j]
+                    n += 1
+                bar_ssf = [v / n for v in agg]
 
-    # ── 节拍级: 使用局部 Markov 链 ──
+        result = classify_ssf_vector(bar_ssf, prev_func=prev_bar_func)
+        result['bar'] = b
+        bar_funcs.append(result)
+        if result['func'] != 'non-func':
+            prev_bar_func = result['func']
+
+    # ── 节拍级: 主粒度, 局部 Markov ──
     beat_funcs = []
     for b_str, beats in sorted(beat_fields.items(), key=lambda x: int(x[0])):
         b = int(b_str)
         prev_beat_func = 'T'
         for pos_str, bf in sorted(beats.items(), key=lambda x: int(x[0])):
             pos = int(pos_str)
-            func, conf = classify_ssf_vector(bf, prev_func=prev_beat_func, use_markov=True)
-            beat_funcs.append({
-                'bar': b,
-                'pos': pos,
-                'func': func or 'none',
-                'confidence': conf,
-            })
-            if func is not None:
-                prev_beat_func = func
+            result = classify_ssf_vector(bf, prev_func=prev_beat_func)
+            result['bar'] = b
+            result['pos'] = pos
+            beat_funcs.append(result)
+            if result['func'] != 'non-func':
+                prev_beat_func = result['func']
 
     return {
-        'version': 2,
+        'version': 3,
         'section_funcs': section_funcs,
         'bar_funcs': bar_funcs,
         'beat_funcs': beat_funcs,
     }
 
 
-# ═══════════════════════════════════════════════════════════════
-#  并行标注入口
-# ═══════════════════════════════════════════════════════════════
+# ── Worker ───────────────────────────────────────────────
 
-def _annotate_one(args: tuple[str, str]) -> tuple[str, bool, str]:
-    """单个文件标注。"""
-    token_path, output_dir = args
+_worker_store = None
+
+
+def _worker_init(lmdb_path: str):
+    """Pool initializer: 每个 worker 进程打开一次只读 LMDB。"""
+    global _worker_store
+    from chopinote_dataset.lmdb_store import LMDBStore
+    _worker_store = LMDBStore.open(lmdb_path, readonly=True, map_size=350 * 1024**3)
+
+
+def _process_one(file_id: str) -> dict:
+    """Worker: 从 LMDB 读 SSF → 分类功能和声。"""
+    global _worker_store
+    store = _worker_store
+    if store is None:
+        return {'status': 'error', 'file_id': file_id, 'reason': 'store not initialized'}
+
     try:
-        # 读 SSF (不是 tokens)
-        ssf_path = Path(token_path).with_suffix('.ssf.json')
-        if not ssf_path.exists():
-            return (token_path, False, 'no_ssf')
-
-        with open(ssf_path, 'r') as f:
-            ssf_data = json.load(f)
-
-        result = annotate_from_ssf(ssf_data)
-
-        out_path = Path(token_path).with_suffix('.func.json')
-        with open(out_path, 'w') as f:
-            json.dump(result, f, separators=(',', ':'))
-
-        return (token_path, True, '')
+        ssf_data = store.get_ssf(file_id)
     except Exception as e:
-        return (token_path, False, str(e))
+        return {'status': 'error', 'file_id': file_id, 'reason': str(e)}
+
+    if ssf_data is None:
+        return {'status': 'skip', 'file_id': file_id, 'reason': 'no_ssf'}
+
+    try:
+        data = annotate_from_ssf(ssf_data)
+    except Exception as e:
+        return {'status': 'error', 'file_id': file_id, 'reason': str(e)}
+
+    return {'status': 'ok', 'file_id': file_id, 'data': data}
 
 
-def _task_generator(input_dir: str):
-    """惰性生成待标注任务, 不构建全量列表。"""
-    token_dir = Path(input_dir)
-    for sp in token_dir.glob('*.ssf.json'):
-        tp = sp.with_name(sp.name.replace('.ssf.json', '.tokens'))
-        if not tp.with_suffix('.func.json').exists():
-            yield (str(tp), str(token_dir))
-
-
-def annotate_all(input_dir: str, num_workers: int = 25):
-    """扫描已有 .ssf.json 文件, 并行标注功能和声。"""
-    token_dir = Path(input_dir)
-    if not token_dir.is_dir():
-        logger.error(f"目录不存在: {input_dir}")
-        return
-
-    # 先快速统计 (不存全量路径)
-    ssf_count = sum(1 for _ in token_dir.glob('*.ssf.json'))
-    logger.info(f"找到 {ssf_count} 个 .ssf.json 文件")
-    del ssf_count  # 不持有计数外的任何数据
-
-    t0 = time.time()
-    completed = 0
-    failed = 0
-    skipped = 0  # 在 generator 里已经跳过了, 这里仅用于最终统计
-
-    with Pool(processes=num_workers) as pool:
-        for path, ok, err in pool.imap_unordered(_annotate_one, _task_generator(input_dir), chunksize=50):
-            completed += 1
-            if not ok:
-                failed += 1
-            if completed % 5000 == 0:
-                elapsed = time.time() - t0
-                rate = completed / max(1, elapsed)
-                logger.info(
-                    f"  进度 {completed} "
-                    f"| {rate:.0f} f/s "
-                    f"| 失败 {failed}"
-                )
-
-    elapsed = time.time() - t0
-    logger.info(
-        f"功能和声标注完成: {completed} 标注, {failed} 失败 ({elapsed:.0f}s)"
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
-#  CLI
-# ═══════════════════════════════════════════════════════════════
+# ── CLI ────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='功能和声标注 (读 SSF)')
-    sub = parser.add_subparsers(dest='cmd')
+    ap = argparse.ArgumentParser(description='功能和声标注 (LMDB, 读 SSF)')
+    ap.add_argument('command', choices=['annotate'])
+    ap.add_argument('--lmdb-path', required=True, help='LMDB 路径 (读写)')
+    ap.add_argument('--num-workers', type=int, default=25)
+    args = ap.parse_args()
 
-    annotate_p = sub.add_parser('annotate', help='标注 .ssf.json → .func.json')
-    annotate_p.add_argument('--input-dir', required=True, help='tokens_v4 目录')
-    annotate_p.add_argument('--num-workers', type=int, default=25)
+    from chopinote_dataset.lmdb_store import LMDBStore
 
-    test_p = sub.add_parser('test', help='对单个文件测试')
-    test_p.add_argument('--input', required=True, help='.tokens 文件路径 (自动找 .ssf.json)')
+    PENDING_FILE = '/root/autodl-tmp/func_pending.txt'
+    DONE_FILE = '/root/autodl-tmp/func_done.txt'
 
-    args = parser.parse_args()
+    # ── Phase 1: 获取待处理列表 ──
+    print("[Phase 1] 获取待处理列表...", flush=True)
+    t0 = time.time()
 
-    if args.cmd == 'annotate':
-        annotate_all(args.input_dir, args.num_workers)
-    elif args.cmd == 'test':
-        ssf_path = Path(args.input).with_suffix('.ssf.json')
-        if not ssf_path.exists():
-            print(f"SSF 文件不存在: {ssf_path}")
-            sys.exit(1)
-        with open(ssf_path, 'r') as f:
-            ssf_data = json.load(f)
-        result = annotate_from_ssf(ssf_data)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+    done_ids = set()
+    if os.path.exists(DONE_FILE):
+        with open(DONE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    done_ids.add(line)
+        print(f"  已完成 (from file): {len(done_ids)}", flush=True)
+
+    if os.path.exists(PENDING_FILE):
+        # 快速路径: 从进度文件恢复
+        print("  从进度文件恢复...", flush=True)
+        pending_ids = []
+        with open(PENDING_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and line not in done_ids:
+                    pending_ids.append(line)
+        print(f"  待标注: {len(pending_ids)} ({time.time() - t0:.1f}s)", flush=True)
     else:
-        parser.print_help()
+        # 首次: 全量 LMDB 扫描 — 所有有 SSF 的文件都处理 (覆盖 v2)
+        print("  首次运行, 扫描 LMDB (仅此一次)...", flush=True)
+        ro_store = LMDBStore.open(args.lmdb_path, readonly=True, map_size=350 * 1024**3)
+        try:
+            has_ssf = set()
+            with ro_store.env.begin(db=ro_store.main_db) as txn:
+                cursor = txn.cursor()
+                if cursor.set_range(b'v4:'):
+                    for key, _ in cursor:
+                        if not key.startswith(b'v4:'):
+                            break
+                        parts = key.decode('utf-8').split(':')
+                        if len(parts) >= 3 and parts[2] == 'ssf':
+                            has_ssf.add(parts[1])
+                    cursor.close()
+        finally:
+            ro_store.close()
+
+        pending_ids = sorted(has_ssf)
+        if done_ids:
+            pending_ids = [f for f in pending_ids if f not in done_ids]
+
+        print(f"  有 SSF: {len(has_ssf)}")
+        print(f"  待标注: {len(pending_ids)}")
+        print(f"  扫描耗时: {time.time() - t0:.1f}s", flush=True)
+
+        with open(PENDING_FILE, 'w') as f:
+            for fid in pending_ids:
+                f.write(fid + '\n')
+        print(f"  进度文件已保存: {PENDING_FILE}", flush=True)
+
+    if not pending_ids:
+        print("无需标注，全部完成。")
+        return
+
+    # ── Phase 2: 并行标注 ──
+    print(f"\n[Phase 2] 启动 {args.num_workers} workers...", flush=True)
+    stats = Counter()
+    start = time.time()
+    completed = 0
+    error_samples = []
+    skip_reasons = Counter()
+    total_pending = len(pending_ids)
+    BATCH_SIZE = 2000
+    WRITE_CHUNK = 100000
+
+    done_fh = open(DONE_FILE, 'a')
+    pool = mp.Pool(args.num_workers, initializer=_worker_init,
+                   initargs=(args.lmdb_path,))
+    write_store = LMDBStore.open(args.lmdb_path, readonly=False, map_size=350 * 1024**3)
+
+    try:
+        for chunk_start in range(0, len(pending_ids), WRITE_CHUNK):
+            chunk = pending_ids[chunk_start:chunk_start + WRITE_CHUNK]
+            batch = []
+
+            for result in pool.imap_unordered(_process_one, chunk, chunksize=50):
+                completed += 1
+                status = result['status']
+                stats[status] += 1
+
+                if status == 'ok':
+                    fid = result['file_id']
+                    batch.append((fid, 'func', result['data']))
+                    del result['data']
+                elif status == 'error' and len(error_samples) < 5:
+                    error_samples.append(f"{result['file_id']}: {result.get('reason', '?')}")
+                elif status == 'skip':
+                    skip_reasons[result.get('reason', '?')] += 1
+
+                if len(batch) >= BATCH_SIZE:
+                    _flush_batch(write_store, batch)
+                    for fid, _, _ in batch:
+                        done_fh.write(fid + '\n')
+                    batch.clear()
+
+                del result
+
+                if completed % 50000 == 0:
+                    elapsed = time.time() - start
+                    rate = completed / max(1, elapsed)
+                    eta = (total_pending - completed) / max(1, rate)
+                    print(f"  进度: {completed}/{total_pending} "
+                          f"({100*completed/total_pending:.0f}%), "
+                          f"{rate:.0f} f/s, ETA {eta:.0f}s, "
+                          f"ok={stats['ok']}, err={stats['error']}, skip={stats['skip']}",
+                          flush=True)
+                    if error_samples:
+                        print(f"  错误样本: {error_samples[:3]}", flush=True)
+                    if skip_reasons:
+                        print(f"  跳过原因: {dict(skip_reasons.most_common(3))}", flush=True)
+                    gc.collect()
+
+            if batch:
+                _flush_batch(write_store, batch)
+                for fid, _, _ in batch:
+                    done_fh.write(fid + '\n')
+                batch.clear()
+            done_fh.flush()
+            gc.collect()
+
+    finally:
+        pool.terminate()
+        pool.join()
+        done_fh.close()
+        write_store.close()
+
+    elapsed = time.time() - start
+    print(f"\n完成! {elapsed:.0f}s")
+    print(f"  成功: {stats['ok']}")
+    print(f"  错误: {stats['error']}")
+    print(f"  跳过: {stats['skip']}")
+
+
+def _flush_batch(store, batch: list):
+    if not batch:
+        return
+    with store.env.begin(db=store.main_db, write=True) as txn:
+        for fid, dtype, data in batch:
+            store._txn_put(txn, fid, dtype, data)
 
 
 if __name__ == '__main__':

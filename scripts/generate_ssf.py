@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SSF (Sliding Scale Field) 标注脚本 — v0.3.0 → v0.3.3 升级。
-从 .tokens 文件生成 .ssf.json 侧边文件。
+SSF (Sliding Scale Field) 标注脚本 — v0.3.3 LMDB 版。
+从 LMDB 读 token 数据，计算 SSF 三粒度 chroma 场，写回 LMDB。
 
 SSF 编码规则 (主音锚定):
   - 12 维向量, 位置 0 = 主音, 位置 i = 距主音 i 个半音
@@ -11,11 +11,10 @@ SSF 编码规则 (主音锚定):
 
 用法:
   python scripts/generate_ssf.py annotate \
-      --input-dir /root/autodl-tmp/data/processed/tokens_v4 \
-      --num-workers 16
+      --lmdb-path /root/autodl-tmp/data/processed/lmdb/chopinote_v4.lmdb \
+      --num-workers 25
 """
-import threading, gc
-import os, sys, json, argparse, time, multiprocessing as mp
+import gc, os, sys, json, argparse, time, multiprocessing as mp
 from collections import Counter
 
 
@@ -74,34 +73,15 @@ def compute_beat_field(note_intervals: list[int], tonic_name: str) -> list[float
     return compute_tonic_field(note_intervals, tonic_name)
 
 
-def process_file(args: tuple) -> dict:
-    """处理单个 .tokens 文件。"""
-    fpath, secio_dir = args
-
-    try:
-        with open(fpath) as f:
-            ids = json.load(f)
-    except Exception as e:
-        return {'status': 'error', 'file': fpath, 'reason': str(e)}
-
-    if not isinstance(ids, list) or len(ids) < 10:
-        return {'status': 'skip', 'file': fpath, 'reason': 'too_short'}
-
-    # 加载 .sec.json (段落边界)
-    sec_path = fpath.replace('.tokens', '.sec.json')
-    section_boundaries = []
-    try:
-        with open(sec_path) as f:
-            sec_data = json.load(f)
-        section_boundaries = sec_data.get('section_token_positions', [])
-    except Exception:
-        pass
-
+def compute_ssf_from_tokens(ids: list[int], sec_data: dict | None,
+                             TONIC_IDS: dict, POSITION_IDS: dict) -> dict:
+    """从 token ID 列表计算 SSF 三粒度场。纯计算，不涉及 I/O。"""
+    # ── 段落边界 ──
+    section_boundaries = [0]
+    if sec_data:
+        section_boundaries = sec_data.get('section_token_positions', [0])
     if not section_boundaries:
         section_boundaries = [0]
-
-    TONIC_IDS = _get_tonic_ids()
-    POSITION_IDS = _get_position_ids()
 
     # ── 扫描 token 序列 ──
     bar_idx = -1
@@ -129,7 +109,6 @@ def process_file(args: tuple) -> dict:
 
     # ── 组织数据: bar_notes[bar] = list of intervals ──
     bar_notes: dict[int, list[int]] = {b: [] for b in range(bar_idx + 1)}
-    # beat_notes[bar][position] = list of intervals
     beat_notes: dict[int, dict[int, list[int]]] = {b: {} for b in range(bar_idx + 1)}
 
     for bar, pos_in_bar, interval in note_intervals:
@@ -150,14 +129,14 @@ def process_file(args: tuple) -> dict:
         for b in range(sec_start, min(sec_end, bar_idx + 1)):
             sec_intervals.extend(bar_notes.get(b, []))
         tonic_fields.append(compute_tonic_field(sec_intervals, current_tonic))
-    # 最后一段 (sec_boundaries[-1] → end)
+    # 最后一段
     last_start = section_boundaries[-1]
     sec_intervals = []
     for b in range(last_start, bar_idx + 1):
         sec_intervals.extend(bar_notes.get(b, []))
     tonic_fields.append(compute_tonic_field(sec_intervals, current_tonic))
 
-    # ── 小节级 LocalField (delta from section TonicField) ──
+    # ── 小节级 LocalField ──
     local_fields: dict[str, list[float]] = {}
     for b in range(bar_idx + 1):
         if b in bar_notes and bar_notes[b]:
@@ -183,14 +162,10 @@ def process_file(args: tuple) -> dict:
                 beat_fields[str(b)] = bar_beats
 
     return {
-        'status': 'ok',
-        'file': fpath,
-        'data': {
-            'tonic_fields': tonic_fields,
-            'section_boundaries': section_boundaries,
-            'local_fields': local_fields,
-            'beat_fields': beat_fields,
-        },
+        'tonic_fields': tonic_fields,
+        'section_boundaries': section_boundaries,
+        'local_fields': local_fields,
+        'beat_fields': beat_fields,
     }
 
 
@@ -218,7 +193,6 @@ def _get_tonic_ids() -> dict[int, str]:
 
 
 def _get_position_ids() -> dict[int, int]:
-    """Position token ID → position value (0-15) 映射。"""
     global _position_ids_cache
     if _position_ids_cache is not None:
         return _position_ids_cache
@@ -242,196 +216,223 @@ def _init_note_on_range():
     _NOTE_ON_ZERO = t.encode_token('<Note_ON 0>')
 
 
+# ── Worker ───────────────────────────────────────────────
+
+_worker_store = None  # 全局: 每个 worker 进程的只读 LMDB 句柄
+
+
+def _worker_init(lmdb_path: str):
+    """Pool initializer: 每个 worker 进程打开一次只读 LMDB。"""
+    global _worker_store
+    from chopinote_dataset.lmdb_store import LMDBStore
+    _worker_store = LMDBStore.open(lmdb_path, readonly=True, map_size=250 * 1024**3)
+
+
+def _process_one(file_id: str) -> dict:
+    """Worker: 从 LMDB 读 token → 计算 SSF。"""
+    global _worker_store
+    store = _worker_store
+    if store is None:
+        return {'status': 'error', 'file_id': file_id, 'reason': 'store not initialized'}
+
+    try:
+        tokens = store.get_tokens(file_id)
+        sec_data = store.get_sec(file_id)
+    except Exception as e:
+        return {'status': 'error', 'file_id': file_id, 'reason': str(e)}
+
+    if not isinstance(tokens, list) or len(tokens) < 10:
+        return {'status': 'skip', 'file_id': file_id, 'reason': 'too_short'}
+
+    tonic_ids = _get_tonic_ids()
+    pos_ids = _get_position_ids()
+
+    try:
+        data = compute_ssf_from_tokens(tokens, sec_data, tonic_ids, pos_ids)
+    except Exception as e:
+        return {'status': 'error', 'file_id': file_id, 'reason': str(e)}
+
+    return {'status': 'ok', 'file_id': file_id, 'data': data}
+
+
 # ── CLI ────────────────────────────────────────────────────
 
-def _scandir_iter(input_dir: str):
-    """用 os.scandir 逐项迭代 — 不构建任何列表, 不触 os.walk 的 nondirs 列表。
-
-    os.walk 对平坦目录会先把 326 万文件名全装进 nondirs 列表再 yield,
-    这 ~300MB 被 fork×25 → 7.5GB 物理内存。scandir 直接迭代，零缓存。
-    """
-    dirs_to_walk = [input_dir]
-    while dirs_to_walk:
-        d = dirs_to_walk.pop()
-        try:
-            with os.scandir(d) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        dirs_to_walk.append(os.path.join(d, entry.name))
-                    elif entry.is_file() and entry.name.endswith('.tokens'):
-                        yield (os.path.join(d, entry.name), input_dir)
-        except OSError:
-            continue
-
-
-def _count_tokens_files(input_dir: str) -> int:
-    """用 find 快速计数 (不占 Python 内存)。"""
-    import subprocess
-    result = subprocess.run(
-        ['find', input_dir, '-name', '*.tokens', '-printf', '.'],
-        capture_output=True, text=True, timeout=300
-    )
-    return len(result.stdout)
-
-
 def main():
-    ap = argparse.ArgumentParser(description='SSF annotation for v0.3.3')
+    ap = argparse.ArgumentParser(description='SSF annotation for v0.3.3 (LMDB)')
     ap.add_argument('command', choices=['annotate'])
-    ap.add_argument('--input-dir', default='/root/autodl-tmp/data/processed/tokens_v4')
+    ap.add_argument('--lmdb-path', required=True, help='LMDB 路径 (读写)')
     ap.add_argument('--num-workers', type=int, default=16)
-    ap.add_argument('--output-dir', default=None, help='SSF 输出目录 (默认与 .tokens 同目录)')
-    ap.add_argument('--lmdb-path', default=None, help='LMDB 路径 (优先于 --output-dir)')
-    ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
-    ssf_output_dir = args.output_dir or args.input_dir
 
     _init_note_on_range()
-    # 预暖缓存: 在 fork 前加载 tokenizer, 子进程直接继承 (省 25×50MB)
+    # 预暖缓存: fork 前加载 tokenizer
     _get_tonic_ids()
     _get_position_ids()
 
-    # LMDB 模式: 提前打开
-    lmdb_store = None
-    if args.lmdb_path:
-        from chopinote_dataset.lmdb_store import LMDBStore
-        lmdb_store = LMDBStore.open(args.lmdb_path, readonly=False)
-        print(f"LMDB 输出: {args.lmdb_path}")
-        # 预扫描: 收集已有 SSF 的 file_id
-        print("  扫描已有 SSF...", flush=True)
-        already_ssf = set()
-        for fid in lmdb_store.iter_file_ids():
-            if lmdb_store.has(fid, 'ssf'):
-                already_ssf.add(fid)
-        print(f"  已标注: {len(already_ssf)}, 待标注: ~{total - len(already_ssf)}", flush=True)
+    from chopinote_dataset.lmdb_store import LMDBStore
+
+    PENDING_FILE = '/root/autodl-tmp/ssf_pending.txt'
+    DONE_FILE = '/root/autodl-tmp/ssf_done.txt'
+
+    # ── Phase 1: 获取待处理列表 (进度文件优先, 避免重复扫描 LMDB) ──
+    print("[Phase 1] 获取待处理列表...", flush=True)
+    t0 = time.time()
+
+    # 读取断点续跑记录
+    done_ids = set()
+    if os.path.exists(DONE_FILE):
+        with open(DONE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    done_ids.add(line)
+        print(f"  已完成 (from file): {len(done_ids)}", flush=True)
+
+    if os.path.exists(PENDING_FILE):
+        # ── 快速路径: 从进度文件恢复 ──
+        print("  从进度文件恢复...", flush=True)
+        pending_ids = []
+        with open(PENDING_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and line not in done_ids:
+                    pending_ids.append(line)
+        print(f"  待标注: {len(pending_ids)} ({time.time() - t0:.1f}s)", flush=True)
     else:
-        already_ssf = set()
-    _get_position_ids()
+        # ── 首次: 全量 LMDB 扫描 ──
+        print("  首次运行, 扫描 LMDB (仅此一次)...", flush=True)
+        ro_store = LMDBStore.open(args.lmdb_path, readonly=True, map_size=250 * 1024**3)
+        try:
+            # 合并两次扫描为一次: 收集 :ssf 和 :tokens 的 file_id
+            has_ssf = set()
+            tokens_fids = []
+            seen = set()
+            with ro_store.env.begin(db=ro_store.main_db) as txn:
+                cursor = txn.cursor()
+                if cursor.set_range(b'v4:'):
+                    for key, _ in cursor:
+                        if not key.startswith(b'v4:'):
+                            break
+                        parts = key.decode('utf-8').split(':')
+                        if len(parts) >= 3:
+                            fid = parts[1]
+                            dtype = parts[2]
+                            if dtype == 'ssf':
+                                has_ssf.add(fid)
+                            elif dtype == 'tokens' and fid not in seen:
+                                seen.add(fid)
+                                if fid not in has_ssf:
+                                    tokens_fids.append(fid)
+                    cursor.close()
+        finally:
+            ro_store.close()
 
-    total = _count_tokens_files(args.input_dir)
-    print(f"文件总数: {total}")
-    print(f"工作进程: {args.num_workers}")
+        # 过滤出待处理 (tokens 有但 ssf 无)
+        pending_ids = [f for f in tokens_fids if f not in has_ssf]
+        # 排除已完成的
+        if done_ids:
+            pending_ids = [f for f in pending_ids if f not in done_ids]
 
+        print(f"  已有 SSF: {len(has_ssf)}")
+        print(f"  总 tokens: {len(seen)}")
+        print(f"  待标注: {len(pending_ids)}")
+        print(f"  扫描耗时: {time.time() - t0:.1f}s", flush=True)
+
+        # 保存进度文件供后续恢复
+        with open(PENDING_FILE, 'w') as f:
+            for fid in pending_ids:
+                f.write(fid + '\n')
+        print(f"  进度文件已保存: {PENDING_FILE}", flush=True)
+
+    if not pending_ids:
+        print("无需标注，全部完成。")
+        return
+
+    # ── Phase 2: 并行标注 ──
+    # 关键 1: 先 fork pool, 再开 write_store (避免 LMDB fork 冲突)
+    # 关键 2: 分块提交 imap, 每块 100K, 防止内部队列无限膨胀导致 CPU 暴涨
+    print(f"\n[Phase 2] 启动 {args.num_workers} workers...", flush=True)
     stats = Counter()
     start = time.time()
-
-    # 阶段 1: 用 find 预生成路径文件 (避免 scandir 与 25 worker I/O 争抢)
-    print("阶段 1: 扫描文件路径...")
-    import subprocess
-    path_file = '/tmp/ssf_paths.txt'
-    with open(path_file, 'wb') as f:
-        subprocess.run(
-            ['find', args.input_dir, '-name', '*.tokens', '-print0'],
-            stdout=f, check=True
-        )
-    print(f"  路径文件就绪 ({os.path.getsize(path_file)//1024//1024} MB)")
-
-    # 阶段 2: 读路径 → 提交 workers
-    print("阶段 2: 启动 workers...")
-    lock = threading.Lock()
-    pending = 0
     completed = 0
-    submitted = 0
-    MAX_PENDING = args.num_workers * 4
+    error_samples = []
+    total_pending = len(pending_ids)
+    BATCH_SIZE = 2000
+    WRITE_CHUNK = 100000  # 每次最多提交 10 万条到 imap 队列
 
-    def _on_done(result):
-        nonlocal pending, completed
-        with lock:
-            pending -= 1
-            completed += 1
-            cur = completed
+    done_fh = open(DONE_FILE, 'a')
+    pool = mp.Pool(args.num_workers, initializer=_worker_init,
+                   initargs=(args.lmdb_path,))
+    write_store = LMDBStore.open(args.lmdb_path, readonly=False, map_size=250 * 1024**3)
 
-        if result['status'] == 'ok':
-            with lock:
-                stats['ok'] += 1
-            if not args.dry_run:
-                data = result['data']
-                if lmdb_store is not None:
-                    fid = os.path.basename(result['file']).replace('.tokens', '')
-                    with lmdb_store.env.begin(db=lmdb_store.main_db, write=True) as txn:
-                        lmdb_store._txn_put(txn, fid, 'ssf', data)
-                else:
-                    fname = os.path.basename(result['file']).replace('.tokens', '.ssf.json')
-                    out_path = os.path.join(ssf_output_dir, fname)
-                    with open(out_path, 'w') as f:
-                        json.dump(data, f)
-                del data
-        else:
-            with lock:
-                stats[result['status']] += 1
-
-        del result
-        if cur % 100000 == 0:
-            elapsed = time.time() - start
-            print(f"  进度: {cur}/{total} "
-                  f"({100*cur/total:.0f}%), {elapsed:.0f}s, ok={stats['ok']}")
-
-    pool = mp.Pool(args.num_workers)
     try:
-        # 从文件批量读路径 (64KB buffer), 避免逐文件争抢目录 dentry
-        buf = b''
-        with open(path_file, 'rb', buffering=65536) as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    if buf:
-                        fname = buf.decode('utf-8')
-                        if not already_ssf or os.path.basename(fname).replace('.tokens', '') not in already_ssf:
-                            task = (fname, args.input_dir)
-                            while True:
-                                with lock:
-                                    if pending < MAX_PENDING:
-                                        pending += 1
-                                        submitted += 1
-                                        break
-                                time.sleep(0.001)
-                            pool.apply_async(process_file, (task,), callback=_on_done)
-                    break
-                buf += chunk
-                while b'\0' in buf:
-                    path_bytes, buf = buf.split(b'\0', 1)
-                    if not path_bytes:
-                        continue
-                    fname = path_bytes.decode('utf-8')
-                    # LMDB 模式: 跳过已有 SSF
-                    if already_ssf:
-                        fid = os.path.basename(fname).replace('.tokens', '')
-                        if fid in already_ssf:
-                            with lock:
-                                stats['skip'] += 1
-                                completed += 1
-                            continue
-                    task = (fname, args.input_dir)
-                    while True:
-                        with lock:
-                            if pending < MAX_PENDING:
-                                pending += 1
-                                submitted += 1
-                                break
-                        time.sleep(0.001)
-                    pool.apply_async(process_file, (task,), callback=_on_done)
+        # 分块处理: 避免 pool.imap_unordered 内部队列爆炸
+        for chunk_start in range(0, len(pending_ids), WRITE_CHUNK):
+            chunk = pending_ids[chunk_start:chunk_start + WRITE_CHUNK]
+            batch = []
 
-        pool.close()
-        # 等待全部回调完成
-        while True:
-            with lock:
-                if completed >= submitted:
-                    break
-            time.sleep(0.5)
+            for result in pool.imap_unordered(_process_one, chunk, chunksize=20):
+                completed += 1
+                status = result['status']
+                stats[status] += 1
+
+                if status == 'ok':
+                    fid = result['file_id']
+                    batch.append((fid, 'ssf', result['data']))
+                    del result['data']
+                elif len(error_samples) < 5:
+                    error_samples.append(f"{result['file_id']}: {result.get('reason', '?')}")
+
+                if len(batch) >= BATCH_SIZE:
+                    _flush_batch(write_store, batch)
+                    for fid, _, _ in batch:
+                        done_fh.write(fid + '\n')
+                    batch.clear()
+
+                del result
+
+                if completed % 50000 == 0:
+                    elapsed = time.time() - start
+                    rate = completed / max(1, elapsed)
+                    eta = (total_pending - completed) / max(1, rate)
+                    print(f"  进度: {completed}/{total_pending} "
+                          f"({100*completed/total_pending:.0f}%), "
+                          f"{rate:.0f} f/s, ETA {eta:.0f}s, "
+                          f"ok={stats['ok']}, err={stats['error']}, skip={stats['skip']}",
+                          flush=True)
+                    if error_samples:
+                        print(f"  错误样本: {error_samples[:3]}", flush=True)
+                    gc.collect()
+
+            # 每块结束刷盘 + 释放 imap 内部缓冲
+            if batch:
+                _flush_batch(write_store, batch)
+                for fid, _, _ in batch:
+                    done_fh.write(fid + '\n')
+                batch.clear()
+            done_fh.flush()
             gc.collect()
-        pool.join()
+
     finally:
         pool.terminate()
         pool.join()
+        done_fh.close()
+        write_store.close()
 
-    gc.collect()
-    os.unlink(path_file)
-    if lmdb_store is not None:
-        lmdb_store.close()
     elapsed = time.time() - start
-    print(f"完成! {elapsed:.0f}s, total={submitted}")
+    print(f"\n完成! {elapsed:.0f}s")
     print(f"  成功: {stats['ok']}")
     print(f"  错误: {stats['error']}")
     print(f"  跳过: {stats['skip']}")
+
+
+def _flush_batch(store, batch: list):
+    """批量写入 LMDB。"""
+    if not batch:
+        return
+    with store.env.begin(db=store.main_db, write=True) as txn:
+        for fid, dtype, data in batch:
+            store._txn_put(txn, fid, dtype, data)
 
 
 if __name__ == '__main__':

@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Figuration 标注脚本 — v0.3.2 gen5。
-从 .tokens 文件按 Voice 拆分，每 4-bar 窗口分类织体模式，
-直接将 <FigV V X> token 注入 .tokens 序列（改写原文件）。
+Figuration 标注脚本 — v0.3.3 LMDB 版。
+从 LMDB 读 token 数据，按 Voice 拆分 4-bar 窗口分类织体模式，
+写回 LMDB (fig 数据类型)。
 
 织体类型 (11 种):
-  0=none(不写token), 1=block, 2=alberti, 3=arpeggio, 4=stride,
+  0=none, 1=block, 2=alberti, 3=arpeggio, 4=stride,
   5=octave_tremolo, 6=walking_bass, 7=countermelody, 8=pedal,
   9=waltz, 10=broken_octave, 11=tremolo
 
+输出格式 (LMDB key: v4:<file_id>:fig):
+  {
+    "version": 1,
+    "bar_figs": {"<bar>": {"<voice>": <fig_type>, ...}, ...}
+  }
+
 用法:
   python scripts/generate_fig.py annotate \
-      --input-dir /root/autodl-tmp/data/processed/tokens_v4 \
-      --num-workers 8
+      --lmdb-path /root/autodl-tmp/data/processed/lmdb/chopinote_v4.lmdb \
+      --num-workers 16
 """
-import os, sys, json, argparse, multiprocessing as mp
+import gc, os, sys, json, argparse, time, multiprocessing as mp
 from collections import Counter
 
 FIG_NONE = 0
@@ -38,7 +44,7 @@ FIG_IDX_TO_NAME = {
 
 WINDOW_BARS = 4
 
-# 全局常量，由 _init_constants() 设置
+# 全局常量，fork 前初始化
 _VOICE_IDS = None
 _BAR_ID = 4
 _POS_MIN = _POS_MAX = -1
@@ -62,10 +68,7 @@ def _init_constants():
 
 
 def classify_window(notes: list[tuple[int, int]]) -> int:
-    """分类一个窗口内的织体类型。
-
-    notes: [(interval, position), ...]
-    """
+    """分类一个窗口内的织体类型。"""
     if len(notes) < 4:
         return FIG_NONE
 
@@ -155,29 +158,21 @@ def _pitch_variance(pitches: list[int]) -> float:
     return sum((p - mean) ** 2 for p in pitches) / len(pitches)
 
 
-def process_file(args: tuple) -> dict:
-    """处理单个 .tokens 文件: 读取→分类→注入 FigV token→写回。"""
-    fpath = args
-    try:
-        with open(fpath) as f:
-            ids = json.load(f)
-    except Exception as e:
-        return {'status': 'error', 'file': fpath, 'reason': str(e)}
+def classify_tokens(ids: list[int]) -> dict:
+    """从 token ID 列表分类织体 (per-bar per-voice)。
 
-    if not isinstance(ids, list) or len(ids) < 10:
-        return {'status': 'skip', 'file': fpath}
-
+    Returns:
+        {"bar_figs": {"<bar>": {"<voice>": <fig_type>, ...}, ...}}
+    """
     # ── 第一遍: 按 bar 和 voice 收集 Note_ON 事件 ──
-    # per_bar_voice[bar][voice] = [(interval, position), ...]
     per_bar_voice: dict[int, dict[int, list]] = {}
     bar_idx = -1
     current_voice = 0
-    bar_positions: list[int] = []  # token 序列中每个 <Bar> 的位置
+    current_pos = 0
 
-    for pos, tid in enumerate(ids):
+    for tid in ids:
         if tid == _BAR_ID:
             bar_idx += 1
-            bar_positions.append(pos)
             per_bar_voice.setdefault(bar_idx, {})
             continue
         if tid in _VOICE_IDS:
@@ -192,10 +187,9 @@ def process_file(args: tuple) -> dict:
                 (interval, current_pos))
 
     if bar_idx < 0:
-        return {'status': 'ok', 'file': fpath, 'injected': 0}
+        return {'bar_figs': {}}
 
-    # ── 第二遍: per-voice 分类 (每个 voice 独立滑动窗口) ──
-    # bar_figs[bar][voice] = fig_type_idx (1-11), 0=none 不写
+    # ── 第二遍: per-voice 分类 (滑动窗口) ──
     bar_figs: dict[int, dict[int, int]] = {}
 
     all_voices = set()
@@ -203,7 +197,6 @@ def process_file(args: tuple) -> dict:
         all_voices.update(bar.keys())
 
     for voice in all_voices:
-        # 收集该 voice 的 per-bar notes
         voice_bars: dict[int, list] = {}
         for b in range(bar_idx + 1):
             notes = per_bar_voice.get(b, {}).get(voice, [])
@@ -215,7 +208,6 @@ def process_file(args: tuple) -> dict:
 
         sorted_bars = sorted(voice_bars.keys())
 
-        # 滑动窗口分类
         for i in range(0, len(sorted_bars) - WINDOW_BARS + 1, max(1, WINDOW_BARS // 2)):
             window_bars = sorted_bars[i:i+WINDOW_BARS]
             window_notes = []
@@ -229,125 +221,229 @@ def process_file(args: tuple) -> dict:
             if fig == FIG_NONE:
                 continue
 
-            # 标注写回该窗口的每个 bar
             for b in window_bars:
                 bar_figs.setdefault(b, {})[voice] = fig
 
-    # ── 第三遍: 注入 <FigV V X> token 到序列中 ──
-    # 在每 bar 的 <Bar> token 之后插入
-    injected = 0
-    new_ids = []
-    # bar 号 → <FigV V X> token ID 列表
-    figv_tokens_per_bar: dict[int, list[int]] = {}
-    for b, voice_figs in bar_figs.items():
-        figv_tokens_per_bar[b] = _build_figv_tokens(voice_figs)
+    # 转换为字符串键 (JSON 兼容)
+    str_bar_figs = {}
+    for b, vf in bar_figs.items():
+        str_bar_figs[str(b)] = {str(v): f for v, f in vf.items()}
 
-    for pos, tid in enumerate(ids):
-        new_ids.append(tid)
-        if tid == _BAR_ID:
-            bar_num = _count_bar_until(new_ids) - 1
-            if bar_num in figv_tokens_per_bar:
-                for fvtid in figv_tokens_per_bar[bar_num]:
-                    new_ids.append(fvtid)
-                    injected += 1
-
-    # ── 写回 ──
-    with open(fpath, 'w') as f:
-        json.dump(new_ids, f)
-
-    return {'status': 'ok', 'file': fpath, 'injected': injected}
+    return {
+        'version': 1,
+        'bar_figs': str_bar_figs,
+    }
 
 
-def _build_figv_tokens(voice_figs: dict[int, int]) -> list[int]:
-    """构建单个 bar 的 <FigV V X> token ID 列表 (按 voice 排序)。
+# ── Worker ───────────────────────────────────────────────
 
-    voice_figs: {voice_idx: fig_type_idx}, 不包含 'none' (值不会是 0)
-    """
-    from chopinote_dataset.tokenizer import REMITokenizer
-    tk = REMITokenizer(16, 8)
-    tokens = []
-    for v in sorted(voice_figs.keys()):
-        fi = voice_figs[v]
-        if fi == FIG_NONE:
-            continue
-        fname = FIG_IDX_TO_NAME.get(fi)
-        if fname:
-            tokens.append(tk.get_figv_id(v, fname))
-    return tokens
+_worker_store = None
 
 
-def _count_bar_until(tokens: list[int]) -> int:
-    """统计 tokens 中的 <Bar> 数量。"""
-    count = 0
-    for tid in tokens:
-        if tid == _BAR_ID:
-            count += 1
-    return count
+def _worker_init(lmdb_path: str):
+    """Pool initializer: 每个 worker 进程打开一次只读 LMDB。"""
+    global _worker_store
+    from chopinote_dataset.lmdb_store import LMDBStore
+    _worker_store = LMDBStore.open(lmdb_path, readonly=True, map_size=250 * 1024**3)
 
 
-def _scandir_iter(input_dir: str):
-    """用 os.scandir 逐项迭代 .tokens 文件 — 避免 os.walk 列表。"""
-    dirs_to_walk = [input_dir]
-    while dirs_to_walk:
-        d = dirs_to_walk.pop()
-        try:
-            with os.scandir(d) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        dirs_to_walk.append(os.path.join(d, entry.name))
-                    elif entry.is_file() and entry.name.endswith('.tokens'):
-                        yield os.path.join(d, entry.name)
-        except OSError:
-            continue
+def _process_one(file_id: str) -> dict:
+    """Worker: 从 LMDB 读 token → 分类织体。"""
+    global _worker_store
+    store = _worker_store
+    if store is None:
+        return {'status': 'error', 'file_id': file_id, 'reason': 'store not initialized'}
+
+    try:
+        tokens = store.get_tokens(file_id)
+    except Exception as e:
+        return {'status': 'error', 'file_id': file_id, 'reason': str(e)}
+
+    if not isinstance(tokens, list) or len(tokens) < 10:
+        return {'status': 'skip', 'file_id': file_id, 'reason': 'too_short'}
+
+    try:
+        data = classify_tokens(tokens)
+    except Exception as e:
+        return {'status': 'error', 'file_id': file_id, 'reason': str(e)}
+
+    # 跳过无织体标注的文件
+    if not data.get('bar_figs'):
+        return {'status': 'skip', 'file_id': file_id, 'reason': 'no_figuration'}
+
+    return {'status': 'ok', 'file_id': file_id, 'data': data}
 
 
-def _count_tokens_files(input_dir: str) -> int:
-    """用 find 快速计数。"""
-    import subprocess
-    result = subprocess.run(
-        ['find', input_dir, '-name', '*.tokens', '-printf', '.'],
-        capture_output=True, text=True, timeout=300
-    )
-    return len(result.stdout)
-
+# ── CLI ────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description='Per-voice figuration annotation — v0.3.2 gen5')
+    ap = argparse.ArgumentParser(description='Figuration annotation (LMDB)')
     ap.add_argument('command', choices=['annotate'])
-    ap.add_argument('--input-dir', default='/root/autodl-tmp/data/processed/tokens_v4')
-    ap.add_argument('--num-workers', type=int, default=8)
-    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--lmdb-path', required=True, help='LMDB 路径 (读写)')
+    ap.add_argument('--num-workers', type=int, default=16)
     args = ap.parse_args()
 
     _init_constants()
 
-    total = _count_tokens_files(args.input_dir)
-    print(f"文件总数: {total}")
+    from chopinote_dataset.lmdb_store import LMDBStore
 
-    if args.dry_run:
-        print("[dry-run] 不写文件")
+    PENDING_FILE = '/root/autodl-tmp/fig_pending.txt'
+    DONE_FILE = '/root/autodl-tmp/fig_done.txt'
 
+    # ── Phase 1: 获取待处理列表 ──
+    print("[Phase 1] 获取待处理列表...", flush=True)
+    t0 = time.time()
+
+    done_ids = set()
+    if os.path.exists(DONE_FILE):
+        with open(DONE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    done_ids.add(line)
+        print(f"  已完成 (from file): {len(done_ids)}", flush=True)
+
+    if os.path.exists(PENDING_FILE):
+        # 快速路径: 从进度文件恢复
+        print("  从进度文件恢复...", flush=True)
+        pending_ids = []
+        with open(PENDING_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and line not in done_ids:
+                    pending_ids.append(line)
+        print(f"  待标注: {len(pending_ids)} ({time.time() - t0:.1f}s)", flush=True)
+    else:
+        # 首次: 全量 LMDB 扫描
+        print("  首次运行, 扫描 LMDB (仅此一次)...", flush=True)
+        ro_store = LMDBStore.open(args.lmdb_path, readonly=True, map_size=250 * 1024**3)
+        try:
+            already_fig = set()
+            tokens_fids = []
+            seen = set()
+            with ro_store.env.begin(db=ro_store.main_db) as txn:
+                cursor = txn.cursor()
+                if cursor.set_range(b'v4:'):
+                    for key, _ in cursor:
+                        if not key.startswith(b'v4:'):
+                            break
+                        parts = key.decode('utf-8').split(':')
+                        if len(parts) >= 3:
+                            fid = parts[1]
+                            dtype = parts[2]
+                            if dtype == 'fig':
+                                already_fig.add(fid)
+                            elif dtype == 'tokens' and fid not in seen:
+                                seen.add(fid)
+                                if fid not in already_fig:
+                                    tokens_fids.append(fid)
+                    cursor.close()
+        finally:
+            ro_store.close()
+
+        pending_ids = [f for f in tokens_fids if f not in already_fig]
+        if done_ids:
+            pending_ids = [f for f in pending_ids if f not in done_ids]
+
+        print(f"  已有 Fig: {len(already_fig)}")
+        print(f"  总 tokens: {len(seen)}")
+        print(f"  待标注: {len(pending_ids)}")
+        print(f"  扫描耗时: {time.time() - t0:.1f}s", flush=True)
+
+        with open(PENDING_FILE, 'w') as f:
+            for fid in pending_ids:
+                f.write(fid + '\n')
+        print(f"  进度文件已保存: {PENDING_FILE}", flush=True)
+
+    if not pending_ids:
+        print("无需标注，全部完成。")
+        return
+
+    # ── Phase 2: 并行标注 ──
+    print(f"\n[Phase 2] 启动 {args.num_workers} workers...", flush=True)
     stats = Counter()
-    total_injected = 0
+    start = time.time()
+    completed = 0
+    error_samples = []
+    skip_reasons = Counter()
+    total_pending = len(pending_ids)
+    BATCH_SIZE = 2000
+    WRITE_CHUNK = 100000
 
-    with mp.Pool(args.num_workers) as pool:
-        for i, result in enumerate(
-            pool.imap_unordered(process_file, _scandir_iter(args.input_dir), chunksize=100)
-        ):
-            if result['status'] == 'ok':
-                stats['ok'] += 1
-                injected = result.get('injected', 0)
-                total_injected += injected
-            else:
-                stats[result['status']] += 1
+    done_fh = open(DONE_FILE, 'a')
+    pool = mp.Pool(args.num_workers, initializer=_worker_init,
+                   initargs=(args.lmdb_path,))
+    write_store = LMDBStore.open(args.lmdb_path, readonly=False, map_size=250 * 1024**3)
 
-            if (i + 1) % 100000 == 0:
-                print(f"  进度: {i+1}/{total} "
-                      f"({100*(i+1)/total:.0f}%), "
-                      f"ok={stats['ok']}, inj={total_injected}")
+    try:
+        for chunk_start in range(0, len(pending_ids), WRITE_CHUNK):
+            chunk = pending_ids[chunk_start:chunk_start + WRITE_CHUNK]
+            batch = []
 
-    print(f"完成! 成功={stats['ok']}, 错误={stats['error']}, "
-          f"跳过={stats['skip']}, 注入={total_injected} tokens")
+            for result in pool.imap_unordered(_process_one, chunk, chunksize=20):
+                completed += 1
+                status = result['status']
+                stats[status] += 1
+
+                if status == 'ok':
+                    fid = result['file_id']
+                    batch.append((fid, 'fig', result['data']))
+                    del result['data']
+                elif status == 'error' and len(error_samples) < 5:
+                    error_samples.append(f"{result['file_id']}: {result.get('reason', '?')}")
+                elif status == 'skip':
+                    skip_reasons[result.get('reason', '?')] += 1
+
+                if len(batch) >= BATCH_SIZE:
+                    _flush_batch(write_store, batch)
+                    for fid, _, _ in batch:
+                        done_fh.write(fid + '\n')
+                    batch.clear()
+
+                del result
+
+                if completed % 50000 == 0:
+                    elapsed = time.time() - start
+                    rate = completed / max(1, elapsed)
+                    eta = (total_pending - completed) / max(1, rate)
+                    print(f"  进度: {completed}/{total_pending} "
+                          f"({100*completed/total_pending:.0f}%), "
+                          f"{rate:.0f} f/s, ETA {eta:.0f}s, "
+                          f"ok={stats['ok']}, err={stats['error']}, skip={stats['skip']}",
+                          flush=True)
+                    if error_samples:
+                        print(f"  错误样本: {error_samples[:3]}", flush=True)
+                    if skip_reasons:
+                        print(f"  跳过原因: {dict(skip_reasons.most_common(3))}", flush=True)
+                    gc.collect()
+
+            if batch:
+                _flush_batch(write_store, batch)
+                for fid, _, _ in batch:
+                    done_fh.write(fid + '\n')
+                batch.clear()
+            done_fh.flush()
+            gc.collect()
+
+    finally:
+        pool.terminate()
+        pool.join()
+        done_fh.close()
+        write_store.close()
+
+    elapsed = time.time() - start
+    print(f"\n完成! {elapsed:.0f}s")
+    print(f"  成功: {stats['ok']}")
+    print(f"  错误: {stats['error']}")
+    print(f"  跳过: {stats['skip']}")
+
+
+def _flush_batch(store, batch: list):
+    if not batch:
+        return
+    with store.env.begin(db=store.main_db, write=True) as txn:
+        for fid, dtype, data in batch:
+            store._txn_put(txn, fid, dtype, data)
 
 
 if __name__ == '__main__':
