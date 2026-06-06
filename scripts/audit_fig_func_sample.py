@@ -242,77 +242,78 @@ def audit_fig(file_id, tokens, stored_fig, C):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Func 独立重算
+# Func v3 独立重算
 # ═══════════════════════════════════════════════════════════════
 
 FUNCTION_TEMPLATES = {
-    'T':  [1.0, 0.1, 0.2, 0.1, 0.7, 0.1, 0.1, 0.7, 0.1, 0.3, 0.1, 0.2],
-    'SD': [0.5, 0.1, 0.3, 0.1, 0.3, 0.8, 0.1, 0.3, 0.6, 0.2, 0.2, 0.1],
-    'D':  [0.5, 0.1, 0.4, 0.1, 0.3, 0.3, 0.1, 0.9, 0.1, 0.2, 0.6, 0.4],
-    'SDom': [0.3, 0.1, 0.8, 0.1, 0.2, 0.3, 0.7, 0.3, 0.1, 0.1, 0.1, 0.1],
+    'T':    [1.0, 0.0, 0.1, 0.0, 0.8, 0.0, 0.0, 0.8, 0.0, 0.1, 0.0, 0.0],
+    'SD':   [0.6, 0.0, 0.1, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.1],
+    'D':    [0.1, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.0, 0.7],
+    'SDom': [0.5, 0.0, 0.1, 0.0, 0.1, 1.0, 0.0, 0.0, 0.7, 0.1, 0.0, 0.0],
 }
 FUNC_NAMES = ['T', 'SD', 'D', 'SDom']
-CLASSIFY_THRESHOLD = 0.50
-CONFIDENCE_FLOOR = 0.55
+SIM_THRESHOLD = 0.35
+RATIO_THRESHOLD = 1.20
+_MARKOV_WEIGHT = 0.2
 MARKOV_TRANSITION = {
-    'T':    {'T': 0.3, 'SD': 0.4, 'D': 0.25, 'SDom': 0.05},
-    'SD':   {'T': 0.15, 'SD': 0.2, 'D': 0.55, 'SDom': 0.1},
-    'D':    {'T': 0.7, 'SD': 0.1, 'D': 0.15, 'SDom': 0.05},
-    'SDom': {'T': 0.15, 'SD': 0.0, 'D': 0.8, 'SDom': 0.05},
+    'T':    {'T': 0.25, 'SD': 0.40, 'D': 0.30, 'SDom': 0.05},
+    'SD':   {'T': 0.15, 'SD': 0.20, 'D': 0.55, 'SDom': 0.10},
+    'D':    {'T': 0.65, 'SD': 0.10, 'D': 0.15, 'SDom': 0.10},
+    'SDom': {'T': 0.10, 'SD': 0.00, 'D': 0.80, 'SDom': 0.10},
 }
 
 
-def cosine_sim(a, b):
+def _cos(a, b):
     dot = sum(x*y for x,y in zip(a,b))
     na = math.sqrt(sum(x*x for x in a))
     nb = math.sqrt(sum(y*y for y in b))
     return dot/(na*nb) if na and nb else 0.0
 
 
-def classify_ssf_vector(ssf_vec, prev_func=None, use_markov=True):
-    """与 annotate_function.py 完全一致。"""
-    if all(v == 0.5 for v in ssf_vec):
-        return (None, 0.0)
+def classify_ssf_vector_v3(ssf_vec, prev_func=None):
+    """与 annotate_function.py v3 完全一致。"""
+    if all(v == 0.5 for v in ssf_vec) or all(v == 0.0 for v in ssf_vec):
+        return {'func': 'non-func', 'ratio': 0.0, 'best_sim': 0.0, 'reason': 'empty'}
 
-    sim_scores = {f: cosine_sim(ssf_vec, FUNCTION_TEMPLATES[f]) for f in FUNC_NAMES}
-    best_func = max(sim_scores, key=sim_scores.get)
-    best_sim = sim_scores[best_func]
+    sim_scores = {f: _cos(ssf_vec, FUNCTION_TEMPLATES[f]) for f in FUNC_NAMES}
+    sorted_funcs = sorted(sim_scores, key=sim_scores.get, reverse=True)
+    best_f, second_f = sorted_funcs[0], sorted_funcs[1]
+    best_sim, second_sim = sim_scores[best_f], sim_scores[second_f]
 
-    if best_sim < CLASSIFY_THRESHOLD:
-        return (None, 0.0)
+    if best_sim < SIM_THRESHOLD:
+        return {'func': 'non-func', 'ratio': round(best_sim / max(second_sim, 0.01), 3),
+                'best_sim': round(best_sim, 3), 'reason': 'low_sim'}
 
-    if use_markov and prev_func is not None:
-        posterior = {}
+    if prev_func and prev_func in MARKOV_TRANSITION:
+        adjusted = {}
         for f in FUNC_NAMES:
             prior = MARKOV_TRANSITION.get(prev_func, {}).get(f, 0.25)
-            posterior[f] = sim_scores[f] * (0.3 + 0.7 * prior)
-        best_func = max(posterior, key=posterior.get)
-        best_score = posterior[best_func]
-        total = sum(posterior.values())
-        confidence = best_score / total if total > 0 else 0.0
-    else:
-        total = sum(sim_scores.values())
-        confidence = best_sim / total if total > 0 else 0.0
+            adjusted[f] = sim_scores[f] * (1.0 + _MARKOV_WEIGHT * prior)
+        sorted_funcs = sorted(adjusted, key=adjusted.get, reverse=True)
+        best_f, second_f = sorted_funcs[0], sorted_funcs[1]
+        best_sim, second_sim = sim_scores[best_f], sim_scores[second_f]
 
-    if confidence < CONFIDENCE_FLOOR:
-        return (None, 0.0)
-    return (best_func, round(confidence, 3))
+    ratio = best_sim / max(second_sim, 0.01)
+    if ratio < RATIO_THRESHOLD:
+        return {'func': 'non-func', 'ratio': round(ratio, 3),
+                'best_sim': round(best_sim, 3), 'reason': 'ambiguous'}
+
+    return {'func': best_f, 'ratio': round(ratio, 3),
+            'best_sim': round(best_sim, 3), 'reason': None}
 
 
 def recompute_func(ssf_data):
-    """独立重算 func，与 annotate_function.py 完全一致。"""
+    """独立重算 func v3。"""
     tonic_fields = ssf_data.get('tonic_fields', [])
     local_fields = ssf_data.get('local_fields', {})
     beat_fields = ssf_data.get('beat_fields', {})
     section_boundaries = ssf_data.get('section_boundaries', [0])
 
-    # Section-level
     section_funcs = []
     for i, tf in enumerate(tonic_fields):
-        func, conf = classify_ssf_vector(tf, prev_func=None, use_markov=False)
-        section_funcs.append({'section': i, 'func': func or 'none', 'confidence': conf})
+        r = classify_ssf_vector_v3(tf) ; r['section'] = i
+        section_funcs.append(r)
 
-    # Bar-level
     bar_funcs = []
     prev = 'T'
     if beat_fields:
@@ -320,42 +321,44 @@ def recompute_func(ssf_data):
     elif local_fields:
         num_bars = max(int(k) for k in local_fields.keys()) + 1
     else:
-        num_bars = len(tonic_fields) * 8
+        num_bars = max(1, len(tonic_fields) * 8)
 
     for b in range(num_bars):
         sec_idx = 0
         for i in range(len(section_boundaries)):
-            if b >= section_boundaries[i]:
-                sec_idx = i
+            if b >= section_boundaries[i]: sec_idx = i
         base_tf = tonic_fields[sec_idx] if sec_idx < len(tonic_fields) else [0.5]*12
         bar_ssf = list(base_tf)
         b_str = str(b)
         if b_str in local_fields:
             delta = local_fields[b_str]
-            for j in range(12):
-                bar_ssf[j] = max(0.0, min(1.0, bar_ssf[j] + delta[j]))
-        func, conf = classify_ssf_vector(bar_ssf, prev_func=prev, use_markov=True)
-        bar_funcs.append({'bar': b, 'func': func or 'none', 'confidence': conf})
-        if func is not None:
-            prev = func
+            for j in range(12): bar_ssf[j] = max(0.0, min(1.0, bar_ssf[j] + delta[j]))
+        if b_str in beat_fields and beat_fields[b_str]:
+            beats = beat_fields[b_str]
+            agg = [0.0]*12 ; n = 0
+            for pos_str, bf in beats.items():
+                for j in range(12): agg[j] += bf[j]
+                n += 1
+            bar_ssf = [v/n for v in agg]
+        r = classify_ssf_vector_v3(bar_ssf, prev_func=prev) ; r['bar'] = b
+        bar_funcs.append(r)
+        if r['func'] != 'non-func': prev = r['func']
 
-    # Beat-level
     beat_funcs = []
     for b_str, beats in sorted(beat_fields.items(), key=lambda x: int(x[0])):
-        b = int(b_str)
-        prev_beat = 'T'
+        b = int(b_str) ; prev_beat = 'T'
         for pos_str, bf in sorted(beats.items(), key=lambda x: int(x[0])):
             pos = int(pos_str)
-            func, conf = classify_ssf_vector(bf, prev_func=prev_beat, use_markov=True)
-            beat_funcs.append({'bar': b, 'pos': pos, 'func': func or 'none', 'confidence': conf})
-            if func is not None:
-                prev_beat = func
+            r = classify_ssf_vector_v3(bf, prev_func=prev_beat)
+            r['bar'] = b ; r['pos'] = pos
+            beat_funcs.append(r)
+            if r['func'] != 'non-func': prev_beat = r['func']
 
     return {'section_funcs': section_funcs, 'bar_funcs': bar_funcs, 'beat_funcs': beat_funcs}
 
 
 def audit_func(file_id, ssf_data, stored_func):
-    """对比存储的 func 与独立重算结果。"""
+    """对比存储的 func v3 与独立重算结果。"""
     if ssf_data is None:
         return {'status': 'skip', 'reason': 'no_ssf', 'issues': []}
 
@@ -366,7 +369,7 @@ def audit_func(file_id, ssf_data, stored_func):
     r_secs = {(e['section'], e['func']) for e in recomputed['section_funcs']}
     sec_match = len(s_secs & r_secs) / max(1, len(s_secs | r_secs))
 
-    # 对比 bar_funcs (只看 func 标签)
+    # 对比 bar_funcs
     s_bars = {e['bar']: e['func'] for e in stored_func.get('bar_funcs', [])}
     r_bars = {e['bar']: e['func'] for e in recomputed['bar_funcs']}
     bar_matches = sum(1 for b in s_bars if s_bars.get(b) == r_bars.get(b))
@@ -386,18 +389,23 @@ def audit_func(file_id, ssf_data, stored_func):
     if beat_match_rate < 0.9:
         issues.append(f"Beat func mismatch: {beat_matches}/{beat_total} ({beat_match_rate:.1%})")
 
-    # 检查 func 分布是否合理
+    # v3 统计
+    beat_func_dist = Counter(e['func'] for e in stored_func.get('beat_funcs', []))
     bar_func_dist = Counter(e['func'] for e in stored_func.get('bar_funcs', []))
-    all_none = bar_func_dist.get('none', 0) / max(1, bar_total)
+    beat_func_pct = (beat_total - beat_func_dist.get('non-func', 0)) / max(1, beat_total)
 
-    # 检查 Markov 合理性 (T→SD→D→T 循环应最常见)
+    # ratio 分布
+    ratios = [e.get('ratio', 0) for e in stored_func.get('beat_funcs', [])
+              if e['func'] != 'non-func']
+    avg_ratio = sum(ratios) / len(ratios) if ratios else 0
+
+    # Markov transitions
     transitions = Counter()
-    bar_list = stored_func.get('bar_funcs', [])
-    for i in range(len(bar_list)-1):
-        f1 = bar_list[i]['func']
-        f2 = bar_list[i+1]['func']
-        if f1 != 'none' and f2 != 'none':
-            transitions[f'{f1}→{f2}'] += 1
+    for i in range(len(stored_func.get('beat_funcs', [])) - 1):
+        f1 = stored_func['beat_funcs'][i]['func']
+        f2 = stored_func['beat_funcs'][i+1]['func']
+        if f1 != 'non-func' and f2 != 'non-func':
+            transitions[f'{f1}->{f2}'] += 1
 
     return {
         'status': 'ok',
@@ -406,7 +414,9 @@ def audit_func(file_id, ssf_data, stored_func):
         'beat_match_rate': round(beat_match_rate, 3),
         'bar_total': bar_total,
         'beat_total': beat_total,
-        'all_none_rate': round(all_none, 3),
+        'beat_func_pct': round(beat_func_pct, 3),
+        'avg_ratio': round(avg_ratio, 2),
+        'beat_func_distribution': dict(beat_func_dist.most_common()),
         'bar_func_distribution': dict(bar_func_dist.most_common()),
         'top_transitions': dict(transitions.most_common(5)),
         'issues': issues,
@@ -518,24 +528,39 @@ def main():
     # Func
     func_bar_rates = [r.get('bar_match_rate', 0) for r in func_results]
     func_beat_rates = [r.get('beat_match_rate', 0) for r in func_results]
-    all_none_rates = [r.get('all_none_rate', 0) for r in func_results]
+    beat_func_pcts = [r.get('beat_func_pct', 0) for r in func_results]
 
-    print(f"\n📊 Func 功能和声标注:")
-    print(f"   平均 bar 匹配率:  {sum(func_bar_rates)/len(func_bar_rates):.1%}")
-    print(f"   完全一致 (100%):   {sum(1 for r in func_bar_rates if r >= 0.99)}/{len(func_results)}")
-    print(f"   高一致 (≥95%):    {sum(1 for r in func_bar_rates if r >= 0.95)}/{len(func_results)}")
-    print(f"   平均 beat 匹配率: {sum(func_beat_rates)/len(func_beat_rates):.1%}")
-    print(f"   平均 'none' 比例: {sum(all_none_rates)/len(all_none_rates):.1%}")
+    print(f"\n📊 Func 功能和声标注 (v3):")
+    print(f"   平均 bar 匹配率:   {sum(func_bar_rates)/len(func_bar_rates):.1%}")
+    print(f"   完全一致 (100%):    {sum(1 for r in func_bar_rates if r >= 0.99)}/{len(func_results)}")
+    print(f"   高一致 (≥95%):     {sum(1 for r in func_bar_rates if r >= 0.95)}/{len(func_results)}")
+    print(f"   平均 beat 匹配率:  {sum(func_beat_rates)/len(func_beat_rates):.1%}")
+    print(f"   平均功能拍比例:     {sum(beat_func_pcts)/len(beat_func_pcts):.1%}")
+
+    # 汇总分布
+    all_beat_dist = Counter()
+    all_bar_dist = Counter()
+    all_trans = Counter()
+    for r in func_results:
+        for k, v in r.get('beat_func_distribution', {}).items():
+            all_beat_dist[k] += v
+        for k, v in r.get('bar_func_distribution', {}).items():
+            all_bar_dist[k] += v
+        for k, v in r.get('top_transitions', {}).items():
+            all_trans[k] += v
+    print(f"   功能拍分布: {dict(all_beat_dist.most_common())}")
+    print(f"   最常见转移: {dict(all_trans.most_common(5))}")
 
     # 打印第一首详细信息
     if func_results:
         print(f"\n{'='*60}")
-        print("[样本详情] 第一首 Func 详细信息")
+        print("[样本详情] 第一首")
         print("=" * 60)
         r = func_results[0]
-        print(f"  bar_match: {r['bar_match_rate']}, beat_match: {r['beat_match_rate']}")
-        print(f"  func distribution: {r['bar_func_distribution']}")
-        print(f"  top transitions: {r['top_transitions']}")
+        print(f"  bar_match={r['bar_match_rate']}, beat_match={r['beat_match_rate']}")
+        print(f"  beat func pct={r['beat_func_pct']}, avg_ratio={r['avg_ratio']}")
+        print(f"  beat dist: {r['beat_func_distribution']}")
+        print(f"  transitions: {r['top_transitions']}")
 
     print("\n✅ 审计完成")
 

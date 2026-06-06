@@ -3,7 +3,7 @@
 > 已实现功能按版本号记录。Y 增量为大版本（架构/能力升级），Z 增量为小版本（优化/修复）。
 > 每个版本对应的已知问题见 `known_issues_<version>.md`。
 >
-> **当前状态 (2026-06-04)**：v0.2.x 训练已放弃。v0.3.0~v0.3.2-fix7 全部代码完成 (v0.3.2 含框架分离+乐句层+per-voice Fig)。16 篇设计文档全部完成 (含 v0.3.3 5 篇优化方案)。数据预处理管道 v4 运行中。v0.3.3 五个作曲能力优化点待实现，训练排至 v0.3.4。
+> **当前状态 (2026-06-07)**：v0.2.x 训练已放弃。v0.3.0~v0.3.3-annotate1 全部代码完成。LMDB 数据管线全面完成 (1.6M 文件, 11.2M keys)。SSF/Fig/Func v3 三类标注通过审计。v0.3.3 opt1~opt5 五个作曲能力模块全部代码完成 (主题发展/功能和声/张力曲线/对位/情感, 零训练)。训练排至 v0.3.4。剩余缺口: VoicePlan/Cadence Zone 生成侧、课程训练、DPO 闭环。
 
 ---
 
@@ -720,61 +720,85 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 
 ---
 
-### 第三阶段：作曲家核心能力（v0.3.3）
+### 第三阶段：作曲家核心能力（v0.3.3） ✅ 代码全部完成
 
-> 从「生成音符」到「作曲」的结构性升级。五个方向各有独立的设计文档，均可零数据/零重训练实现。
+> 从「生成音符」到「作曲」的结构性升级。opt1~opt5 五个方向 + 标注管线全部代码完成，零训练。
 
-#### v0.3.3-opt1 — 主题发展引擎
+#### v0.3.3-annotate1 — SSF/Fig/Func v3 标注管线 LMDB 化 (2026-06-06)
+
+> 从文件系统 JSON → LMDB 集中存储, 三类标注全量完成并通过审计。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | **generate_ssf.py LMDB 化**: 读 tokens 从 LMDB, SSF 三粒度写回 LMDB, 进度文件断点续跑, WRITE_CHUNK=100K 防 OOM, 250GB map_size | ✅ |
+| 2 | **generate_fig.py LMDB 化**: 同上分块机制, 11 类织体 per-voice 分类, 99.8% 覆盖 (skip 无织体) | ✅ |
+| 3 | **annotate_function.py v3 重写**: 尖锐和弦音模板 (互似度 0.07~0.45), ratio test (best/second_best), 节拍级精细标注, non-func 退化标签 | ✅ |
+| 4 | **审计脚本**: audit_ssf_sample.py (TonicField/BeatField/LocalField/旋转验证), audit_fig_func_sample.py (独立重算对比) | ✅ |
+| 5 | **审计结果**: SSF TonicField 100% / BeatField 100% / LocalField 100%; Fig 100%; Func v3 100% 算法一致性, 功能拍 65% | ✅ |
+| 6 | **数据统计**: LMDB 350GB, 1.6M 文件, 11.2M keys (tokens/sec/ssf/fig/func/meta/len), 磁盘 105GB 余量 | ✅ |
+
+#### v0.3.3-opt1 — 主题发展引擎 ✅
 
 > 设计文档: `docs/thematic_development_v0.3.x.md`
 
-| # | 内容 | 难度 |
-|---|------|------|
-| 1 | **MotifTransform 变形算子**: retrograde / inversion / augmentation / diminution / fragmentation / sequence / interval_expand / rhythmic_vary (~150行) | 中 |
-| 2 | **DNA→Token 渲染器**: MotifDNA → token 片段, scale_degrees→interval, 适配 SSF TonicField | 中 |
-| 3 | **B2 发展策略选择器**: 按段类型/乐句类型自动选变形策略 (statement→restatement→development→closing) | 中 |
-| 4 | **引导采样**: apply_motif_guidance() — logit 偏置引导模型写动机, 强度 0.6→0.1 逐渐衰减 | 低 |
+| # | 内容 | 难度 | 状态 |
+|---|------|------|------|
+| 1 | **MotifTransform 变形算子**: retrograde / inversion / augmentation / diminution / fragmentation / sequence / interval_expand / rhythmic_vary | 中 | ✅ |
+| 2 | **DNA→Token 渲染器**: MotifDNA → token 片段, scale_degrees→interval, 适配 SSF TonicField | 中 | ✅ |
+| 3 | **B2 发展策略选择器**: 按段类型/乐句类型自动选变形策略 (statement→restatement→development→closing) | 中 | ✅ |
+| 4 | **引导采样**: apply_motif_guidance() — logit 偏置引导模型写动机, 强度 0.6→0.1 逐渐衰减 | 低 | ✅ |
 
-#### v0.3.3-opt2 — 功能化和声语法
+实现文件: `chopinote_abc/motif.py`, `chopinote_abc/decision.py`
+
+#### v0.3.3-opt2 — 功能化和声语法 ✅
 
 > 设计文档: `docs/functional_harmony_ssf_v0.3.x.md`
 
-| # | 内容 | 难度 |
-|---|------|------|
-| 1 | **FunctionField 推断**: 从 SSF chroma × 功能模板 × Markov 转移概率 → T/SD/D/SDom 四类标签 (~200行) | 低 |
-| 2 | **`.func.json` 标注脚本**: 在已有 tokens_v4 上扫一遍生成侧文件 (~5分钟, 25 workers) | 低 |
-| 3 | **func_embedding**: nn.Embedding(5, d_model), zero-init, 每 bar 注入 (5×2048=10K params) | 低 |
-| 4 | **DataLoader 加载**: 加载 .func.json, per-token 展开 func_ids, collate_fn 返回 | 低 |
+| # | 内容 | 难度 | 状态 |
+|---|------|------|------|
+| 1 | **FunctionField 推断**: 从 SSF chroma × 尖锐和弦音模板 × ratio test → T/SD/D/SDom + non-func 标签 | 低 | ✅ v0.3.3-annotate1 |
+| 2 | **`.func` LMDB 标注 (v3)** : 节拍级精细标注, ratio test 替代 sum-based confidence, 功能覆盖率 0.5%→65% | 低 | ✅ v0.3.3-annotate1 |
+| 3 | **func_embedding**: nn.Embedding(5, d_model), zero-init, 每拍注入 | 低 | ❌ 待训练阶段 |
+| 4 | **DataLoader 加载**: 从 LMDB 加载 func, per-token 展开 func_ids | 低 | ❌ 待训练阶段 |
 
-#### v0.3.3-opt3 — 长程张力曲线
+**v3 模板设计**: 按和弦音 (I=pos0,4,7 / IV=pos5,9,0 / V=pos7,11,2 / iv=pos5,8,0), 尖锐稀疏, 模板间相似度 0.07~0.45 (v2 为 0.55~0.80)。
+**审计结果**: 10 首抽样 bar/beat/section 100% 匹配独立重算, 功能拍分布 D 22%/T 17%/SD 12%/SDom 5%/non-func 37%。 |
+
+#### v0.3.3-opt3 — 长程张力曲线 ✅
 
 > 设计文档: `docs/dramatic_arc_v0.3.x.md`
 
-| # | 内容 | 难度 |
-|---|------|------|
-| 1 | **DramaticCurve**: A1 规划全曲 0→1 曲线, 曲式模板预置 (sonata/theme_variations/rondo/free) (~100行) | 低 |
-| 2 | **B2 沿曲线调参**: temperature/density/dissonance/register/rest_penalty 全改成 tension 连续函数, 替代段级温区退火 (~50行) | 低 |
-| 3 | **乐句联动**: PhrasePlan 参考曲线导数 → 上升段多用 antecedent, 回落段多用 closing | 低 |
+| # | 内容 | 难度 | 状态 |
+|---|------|------|------|
+| 1 | **DramaticCurve**: A1 规划全曲 0→1 曲线, 曲式模板预置 (sonata/theme_variations/rondo/free) | 低 | ✅ |
+| 2 | **B2 沿曲线调参**: temperature/density/dissonance/register/rest_penalty 全改成 tension 连续函数, 替代段级温区退火 | 低 | ✅ |
+| 3 | **乐句联动**: PhrasePlan 参考曲线导数 → 上升段多用 antecedent, 回落段多用 closing | 低 | ✅ |
 
-#### v0.3.3-opt4 — 对位意识
+实现文件: `chopinote_abc/planner.py`, `chopinote_abc/decision.py`, `chopinote_abc/database.py`
+
+#### v0.3.3-opt4 — 对位意识 ✅
 
 > 设计文档: `docs/contrapuntal_awareness_v0.3.x.md`
 
-| # | 内容 | 难度 |
-|---|------|------|
-| 1 | **ContourBias**: B2 采样时反向进行 +0.2, 平行 -0.15, 平行五八度 -1.0, 不完全→完全协和解决 +0.15 (~80行) | 低 |
-| 2 | **Voice Independence 评分**: C 层新增声部旋律独立性指标 (级进比/方向变化/音域/节奏同步) | 低 |
+| # | 内容 | 难度 | 状态 |
+|---|------|------|------|
+| 1 | **ContourBias**: B2 采样时反向进行 +0.2, 平行 -0.15, 平行五八度 -1.0, 不完全→完全协和解决 +0.15 | 低 | ✅ |
+| 2 | **Voice Independence 评分**: C 层新增声部旋律独立性指标 (级进比/方向变化/音域/节奏同步) | 低 | ✅ |
 
-#### v0.3.3-opt5 — 情感色彩量化系统
+实现文件: `chopinote_abc/decision.py`, `chopinote_abc/constraints.py`, `chopinote_abc/metrics.py`
+
+#### v0.3.3-opt5 — 情感色彩量化系统 ✅
 
 > 设计文档: `docs/affective_profile_v0.3.x.md`
 
-| # | 内容 | 难度 |
-|---|------|------|
-| 1 | **AffectCalculator**: 八维向量实时计算 (Brightness/Tension/Stability/Energy/Warmth/Depth/Motion/Closure), 纯规则零数据 (~200行) | 低 |
-| 2 | **情绪解析器**: 自然语言→八维向量 + 风格预置表 (~100行) | 低 |
-| 3 | **B2 参数联动**: AFFECT_PARAM_MAP — 每维映射到具体参数偏置 (~60行) | 低 |
-| 4 | **affect_proj** (需训练): nn.Linear(8, d_model), zero-init, Transformer 内化层 (~16K params) | 中 |
+| # | 内容 | 难度 | 状态 |
+|---|------|------|------|
+| 1 | **AffectCalculator**: 八维向量实时计算 (Brightness/Tension/Stability/Energy/Warmth/Depth/Motion/Closure), 纯规则零数据 | 低 | ✅ |
+| 2 | **情绪解析器**: 自然语言→八维向量 + 风格预置表 | 低 | ✅ |
+| 3 | **B2 参数联动**: AFFECT_PARAM_MAP — 每维映射到具体参数偏置 | 低 | ✅ |
+| 4 | **affect_proj** (需训练): nn.Linear(8, d_model), zero-init, Transformer 内化层 | 中 | ❌ 待训练 |
+
+实现文件: `chopinote_abc/affect.py`, `chopinote_abc/decision.py`, `chopinote_abc/planner.py`
 
 ---
 
@@ -800,27 +824,29 @@ chopin best.pt input.musicxml --random-seed            # 随机种子
 ### 版本依赖拓扑
 
 ```
-v0.3.0 (✅ tag)     v0.3.1 (✅ tag)       v0.3.2 (✅ 已实现)    v0.3.3 (作曲能力)    v0.3.4 (训练)
-─────────────────   ─────────────────    ─────────────────    ─────────────────    ────────
-SSF + Voice + Fig   Voice Splitting ──→ Framework-C.S. ──→ 主题发展引擎 ──→ 课程训练
-                        │                    │               功能和声语法
-                        ├→ 数据过滤 F1-F5     VoicePlan ⏳    长程张力曲线
-                        ├→ 五级分类            │               对位意识
-                        ├→ DurSat             Cadence Zone ⏳  情感色彩量化
-                        └→ Cadence             │
+v0.3.0 (✅ tag)     v0.3.1 (✅ tag)       v0.3.2 (✅ 已实现)    v0.3.3 (✅ 代码完成)    v0.3.4 (训练)
+─────────────────   ─────────────────    ─────────────────    ───────────────────    ────────
+SSF + Voice + Fig   Voice Splitting ──→ Framework-C.S. ──→ 标注管线 LMDB ✅ ──→ 课程训练
+                        │                    │               opt1 主题发展 ✅
+                        ├→ 数据过滤 F1-F5     VoicePlan ⏳    opt2 功能和声 ✅
+                        ├→ 五级分类            │               opt3 张力曲线 ✅
+                        ├→ DurSat             Cadence Zone ⏳  opt4 对位 ✅
+                        └→ Cadence             │               opt5 情感 ✅
                         ┌─────────────────────┘
                         │
                    v0.3.2-fix1~7 ✅
-                   预处理路径 v3→v4
-                   管道运行中 ⏳
+                   v0.3.3-annotate1 ✅
+                   标注+作曲能力全完成
 ```
 
 ### 当前状态
 
-- **设计**: 16 篇设计文档全部完成（含 5 篇新优化方案: 情感色彩量化/主题发展引擎/功能和声语法/长程张力曲线/对位意识）
-- **代码**: v0.3.0~v0.3.2-fix7 全部实现并 tag
-- **数据**: 预处理管道 v4 运行中 (PDMX+MusicXML 完成, MIDI ~41%), tokens_v4 已有 ~550K 文件
-- **训练**: 未启动，等数据预处理完成 → v0.3.3 优化点实现 → v0.3.4 课程训练
+- **设计**: 16 篇设计文档全部完成
+- **代码**: v0.3.0~v0.3.3 全部实现 (标注管线 + 五个作曲能力模块)
+- **数据**: LMDB 全面完成 — 1.6M 文件, 11.2M keys, tokens/sec/ssf/fig/func v3/meta/len 七类, 350GB
+- **标注审计**: SSF/Fig/Func v3 三类全部通过 10 首抽样审计
+- **训练**: 未启动，数据+模型+推理全部就绪 → v0.3.4 课程训练
+- **剩余代码缺口**: VoicePlan 生成侧、Cadence Zone 生成侧、层次化生成、Inpainting
 
 ---
 
@@ -828,14 +854,8 @@ SSF + Voice + Fig   Voice Splitting ──→ Framework-C.S. ──→ 主题发
 
 | 方向 | 优先级 | 说明 |
 |------|--------|------|
-| **Figuration per-voice** | P0 | ~~当前全局 Fig 不支持 per-voice 独立织体；四声部拆分后需升级为 `<Fig Voice0=X Voice2=Y>`~~ → ✅ v0.3.2-gen5 |
 | **SSF pairwise bias 备选** | P1 | 如果 SSF per-token 注入后和弦连贯性不足，启用 pairwise 余弦相似度 attention bias |
 | **REMI-z 轨内连续备选** | P1 | 如果旋律连贯性明显不足，converter 排序改为轨内连续 |
-| **动机发展引擎** | P2 | 已有完整实现方案 `docs/thematic_development_v0.3.x.md` (MotifTransform 10种变形算子 + B2 策略选择 + 引导采样) |
-| **功能和声语法** | P2 | 已有完整实现方案 `docs/functional_harmony_ssf_v0.3.x.md` (方案B: FunctionField 从 SSF 推断 + .func.json 侧文件) |
-| **长程张力曲线** | P2 | 已有完整实现方案 `docs/dramatic_arc_v0.3.x.md` (DramaticCurve + 曲式模板 + B2 沿曲线调参) |
-| **对位意识** | P2 | 已有完整实现方案 `docs/contrapuntal_awareness_v0.3.x.md` (B2 ContourBias + 声部独立性评分) |
-| **情感色彩量化** | P2 | 已有完整实现方案 `docs/affective_profile_v0.3.x.md` (八维空间 + 双通道架构) |
 | **B2 蓝图驱动升级** | P2 | A 给完整 blueprint，B2 主动设定每段理想参数区间 |
 | **Voice-Stream Transformer** | P3 | 声部分流独立架构，共享底层 + 分流上层 + cross-attention |
 | **MuseScore 插件版** | P4 | 轻量版做 MuseScore 插件，一键调用模型续写/生成 |
@@ -852,33 +872,33 @@ SSF + Voice + Fig   Voice Splitting ──→ Framework-C.S. ──→ 主题发
 > 核心差距在主题发展、和声句法、戏剧结构、层次化生成四个维度。
 > 以下按优先级排列，尚未排入具体版本。
 
-### P0 — 决定性能力
+### P0 — 决定性能力 (全部 ✅)
 
-| 方向 | 说明 | 难度 |
-|------|------|------|
-| **主题发展引擎** | A2 目前只能提取动机 DNA，没有变形能力。真正的作曲家会逆行/倒影/增值/减值/碎片化/模进动机。需要 A2 增加 `MotifTransform` 算子（retrograde/inversion/augmentation/diminution/fragmentation/sequence），B2 增加发展策略选择（「下个乐句用主题A的倒影，属调开始」），生成时从变形后的动机 token 片段拼接而非从零采样 | 高 |
-| **功能化和声语法** | SSF 12 维连续 chroma 场优雅但丢掉了功能和声的离散句法（T→SD→D→T 方向性、终止式的期待-解决）。A1 规划了和弦进行但模型只看到 SSF 向量看不到功能标签。建议增加轻量 `FunctionField`（3-4 维 T/SD/D/T embedding）或把 chord function 作为框架 token 由 A1 预插入 | 中 |
+| 方向 | 说明 | 难度 | 状态 |
+|------|------|------|------|
+| **主题发展引擎** | A2 MotifTransform 10 种变形算子 (retrograde/inversion/augmentation/diminution/fragmentation/sequence), B2 发展策略选择, 引导采样 | 高 | ✅ v0.3.3-opt1 |
+| **功能化和声语法** | Func v3 尖锐模板 + ratio test 从 SSF 推断功能标签, 65% 拍有明确功能, 待训练阶段加入 func_embedding | 中 | ✅ v0.3.3-annotate1 |
 
 ### P1 — 结构性提升
 
-| 方向 | 说明 | 难度 |
-|------|------|------|
-| **长程张力曲线** | 当前 B2 温区退火是段级独立的。一首奏鸣曲的戏剧弧线跨全部乐章：呈示部低→发展部高→再现部下降。没有组件追踪全曲紧张度。建议 A1 增加 `DramaticCurve`（全局 0~1 标量曲线），B2 沿曲线调温度/密度/音域/不协和度 | 低 |
-| **粗到细层次化生成** | 当前是单次自回归采样 4096 token。作曲家工作方式是先定骨架再填细节。建议三 pass 生成：(1) 骨架 pass — 结构+终止式+调性框架，(2) 外声部 pass — Soprano+Bass Note_ON，其他 mask，(3) 填充 pass — Alto/Tenor+织体+力度+表情 | 高 |
-| **风格 conditioning** | 当前无差别学习所有 MIDI 数据。建议预训练时加入 composer/style embedding（从 metadata 提取），推理时指定风格自动切换和声偏好/织体选择/终止式频率。类似 voice_embedding 的注入方式 | 中 |
+| 方向 | 说明 | 难度 | 状态 |
+|------|------|------|------|
+| **长程张力曲线** | A1 DramaticCurve 全曲 0→1 标量曲线, B2 沿曲线调 temperature/density/register/不协和度 | 低 | ✅ v0.3.3-opt3 |
+| **粗到细层次化生成** | 当前是单次自回归采样 4096 token。作曲家工作方式是先定骨架再填细节。建议三 pass 生成：(1) 骨架 pass — 结构+终止式+调性框架，(2) 外声部 pass — Soprano+Bass Note_ON，其他 mask，(3) 填充 pass — Alto/Tenor+织体+力度+表情 | 高 | ❌ |
+| **风格 conditioning** | 当前无差别学习所有 MIDI 数据。建议预训练时加入 composer/style embedding（从 metadata 提取），推理时指定风格自动切换和声偏好/织体选择/终止式频率。类似 voice_embedding 的注入方式 | 中 | ❌ |
 
 ### P2 — 质量与可用性
 
-| 方向 | 说明 | 难度 |
-|------|------|------|
-| **对位意识** | 四个声部各自生成，B1 禁止了声部交错和平行五八度，但没有正向鼓励反向进行/不完全→完全协和解决/声部旋律独立性。建议 B2 增加 `ContourBias`：相邻声部反向进行 bonus，平行进行 penalty，~10 行代码无需新 embedding | 低 |
-| **迭代修改 (Inpainting)** | DPO 做偏好微调（权重级），但作曲家工作方式是局部修改——「这个乐句不好，重写它」。建议 C 产出结构化诊断（「bar 24-28 密度下降太快」），A1 局部重规划，B 在指定区间重新采样。局部 inpainting 而非全局 regenerate | 中 |
+| 方向 | 说明 | 难度 | 状态 |
+|------|------|------|------|
+| **对位意识** | B2 ContourBias: 反向进行 +0.2, 平行 -0.15, 平行五八度 -1.0; C 层声部独立性评分 | 低 | ✅ v0.3.3-opt4 |
+| **迭代修改 (Inpainting)** | DPO 做偏好微调（权重级），但作曲家工作方式是局部修改——「这个乐句不好，重写它」。建议 C 产出结构化诊断（「bar 24-28 密度下降太快」），A1 局部重规划，B 在指定区间重新采样。局部 inpainting 而非全局 regenerate | 中 | ❌ |
 
 ### P3 — 锦上添花
 
-| 方向 | 说明 | 难度 |
-|------|------|------|
-| **情感/美学意图** | 无情感模型。建议可选 conditioning token（sad/joyful/mysterious/majestic 等），通过速度+调式+力度启发式标注或 metadata 推断，作为全局 embedding 注入 | 低 |
+| 方向 | 说明 | 难度 | 状态 |
+|------|------|------|------|
+| **情感/美学意图** | AffectCalculator 八维向量 (Brightness/Tension/Stability/Energy/Warmth/Depth/Motion/Closure) + 情绪解析器 + B2 AFFECT_PARAM_MAP 参数联动 | 低 | ✅ v0.3.3-opt5 |
 
 ### 已完成
 
@@ -898,4 +918,13 @@ SSF + Voice + Fig   Voice Splitting ──→ Framework-C.S. ──→ 主题发
 | ✅ Z-loss + EMA + dropout 调度 | v0.2.5-dev2 | Z-loss 1e-4, EMA β=0.999, dropout 0.15→0.10→0.08 |
 | ✅ ABC Engine v2 Phase 1 | v0.2.6-abc1 | A1/A2/A3 数据库 + 规则规划器 + 动机提取 + B 硬约束 + Stage 3 迭代生成 |
 | ✅ DPO 自动闭环 + C 增强 + 日志 | v0.2.6-abc2 | DPO auto-trigger/训练/合并, MusicXML审查, Token↔XML对比, C→B反馈, 六层日志 |
+| ✅ Figuration per-voice | v0.3.2-gen5 | 四声部拆分后 per-voice 独立织体 `<Fig Voice0=X Voice2=Y>` |
+| ✅ 功能和声标注 Func v3 | v0.3.3-annotate1 | 尖锐和弦音模板 + ratio test, 节拍级标注, 功能覆盖率 0.5%→65%, LMDB 全管线 |
+| ✅ SSF 标注 LMDB 化 | v0.3.3-annotate1 | TonicField/LocalField/BeatField 三粒度, 250GB map, 审计 100% |
+| ✅ Fig 标注 LMDB 化 | v0.3.3-annotate1 | 11 类织体 per-voice 4-bar 滑动窗口, 99.8% 覆盖 |
+| ✅ 标注精度审计 | v0.3.3-annotate1 | SSF/Fig/Func v3 三类独立重算对比, 10 首抽样全部通过 |
+| ✅ 主题发展引擎 | v0.3.3-opt1 | MotifTransform 10 种变形算子 + DNA→Token 渲染 + B2 策略选择 + 引导采样 |
+| ✅ 长程张力曲线 | v0.3.3-opt3 | DramaticCurve 全曲 0→1 曲线 + B2 沿曲线调参 + 乐句联动 |
+| ✅ 对位意识 | v0.3.3-opt4 | ContourBias 反向/平行/五八度偏置 + 声部独立性评分 |
+| ✅ 情感色彩量化 | v0.3.3-opt5 | AffectCalculator 八维向量 + 情绪解析器 + B2 AFFECT_PARAM_MAP |
 | ✅ 渲染器重写 + 日志重构 + 禁令调优 | v0.2.6-abc3 | ElementTree渲染(54000x), 双Formatter+异步写, Token级日志, FP8推理, 密度92→24.3 |
