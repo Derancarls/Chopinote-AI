@@ -296,6 +296,15 @@ def main():
         from chopinote_dataset.lmdb_store import LMDBStore
         lmdb_store = LMDBStore.open(args.lmdb_path, readonly=False)
         print(f"LMDB 输出: {args.lmdb_path}")
+        # 预扫描: 收集已有 SSF 的 file_id
+        print("  扫描已有 SSF...", flush=True)
+        already_ssf = set()
+        for fid in lmdb_store.iter_file_ids():
+            if lmdb_store.has(fid, 'ssf'):
+                already_ssf.add(fid)
+        print(f"  已标注: {len(already_ssf)}, 待标注: ~{total - len(already_ssf)}", flush=True)
+    else:
+        already_ssf = set()
     _get_position_ids()
 
     total = _count_tokens_files(args.input_dir)
@@ -365,22 +374,33 @@ def main():
                 chunk = f.read(65536)
                 if not chunk:
                     if buf:
-                        task = (buf.decode('utf-8'), args.input_dir)
-                        while True:
-                            with lock:
-                                if pending < MAX_PENDING:
-                                    pending += 1
-                                    submitted += 1
-                                    break
-                            time.sleep(0.001)
-                        pool.apply_async(process_file, (task,), callback=_on_done)
+                        fname = buf.decode('utf-8')
+                        if not already_ssf or os.path.basename(fname).replace('.tokens', '') not in already_ssf:
+                            task = (fname, args.input_dir)
+                            while True:
+                                with lock:
+                                    if pending < MAX_PENDING:
+                                        pending += 1
+                                        submitted += 1
+                                        break
+                                time.sleep(0.001)
+                            pool.apply_async(process_file, (task,), callback=_on_done)
                     break
                 buf += chunk
                 while b'\0' in buf:
                     path_bytes, buf = buf.split(b'\0', 1)
                     if not path_bytes:
                         continue
-                    task = (path_bytes.decode('utf-8'), args.input_dir)
+                    fname = path_bytes.decode('utf-8')
+                    # LMDB 模式: 跳过已有 SSF
+                    if already_ssf:
+                        fid = os.path.basename(fname).replace('.tokens', '')
+                        if fid in already_ssf:
+                            with lock:
+                                stats['skip'] += 1
+                                completed += 1
+                            continue
+                    task = (fname, args.input_dir)
                     while True:
                         with lock:
                             if pending < MAX_PENDING:

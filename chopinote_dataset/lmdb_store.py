@@ -389,10 +389,14 @@ class LMDBStore:
     def stats(self) -> dict:
         """Return LMDB environment statistics."""
         stat = self.env.stat()
+        with self.env.begin(db=self.main_db) as txn:
+            main_entries = txn.stat(self.main_db)['entries']
+        with self.env.begin(db=self.level_db) as txn:
+            level_entries = txn.stat(self.level_db)['entries']
         return {
             'page_size': stat['psize'],
-            'num_entries_main': self.env.stat(db=self.main_db)['entries'],
-            'num_entries_level': self.env.stat(db=self.level_db)['entries'],
+            'num_entries_main': main_entries,
+            'num_entries_level': level_entries,
             'map_size': self.env.info()['map_size'],
             'last_txn_id': self.env.info()['last_txnid'],
         }
